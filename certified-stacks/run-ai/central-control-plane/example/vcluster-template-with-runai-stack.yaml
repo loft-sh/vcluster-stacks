@@ -1,0 +1,227 @@
+# This template creates a tenant cluster, its NVIDIA Run:ai registration, and its NVIDIA Run:ai StackInstance.
+#
+# Before you use this template:
+#   1. Apply Apps and StackTemplates.
+#   2. Apply `stacktemplate-host.yaml`, `stacktemplate-registration.yaml`, and `stacktemplate.yaml`.
+#   3. Install `example/stackinstance-host.yaml` once.
+#
+# `spaceTemplate` creates a registration named after the tenant cluster.
+# The Secret mappings provide the control-plane address, client secret, registry credential, and CA.
+# The tenant Stack takes no tenant-supplied values.
+#
+# Set `tenantSlug` only for a tenant with an existing registration under a different name.
+# It disables the template registration and selects that registration's facts Secret.
+# Do not set it when the cluster-name registration exists. Two registrations can deregister the same cluster.
+#
+# The shared host Stack installs the control plane and GPU Operator once.
+# This tenant installs neither.
+apiVersion: management.loft.sh/v1
+kind: VirtualClusterTemplate
+metadata:
+  name: runai-tenant-central-control-plane
+spec:
+  displayName: NVIDIA Run:ai central-control-plane tenant
+  description: >-
+    Apply host and registration StackTemplates first. This template creates a tenant cluster,
+    registers it with the shared NVIDIA Run:ai control plane, and deploys the NVIDIA Run:ai cluster agent through
+    deploy.stacks. This is not a one-shot host installation: it reuses
+    shared host infrastructure. Before creation, platform operators must install the shared host
+    foundation, provide ingress-nginx with IngressClass `nginx` and its LoadBalancer IPv4 address,
+    and label the GPU nodes this tenant may use. Operate and delete shared host infrastructure
+    outside this tenant lifecycle.
+  owner:
+    user: admin
+  parameters:
+    - variable: nodeSelectorValue
+      label: "Node selector value"
+      # Use one value for one tenant.
+      # Each tenant scheduler assumes it owns all visible GPU capacity.
+      # A tenant without matching nodes cannot schedule workloads.
+      description: Node label value for tenant GPU nodes.
+      type: string
+      required: true
+    - variable: nodeSelectorLabel
+      label: "Node selector label"
+      description: Host node label key that assigns nodes to tenants. Set by host foundation policy.
+      type: string
+      required: true
+      defaultValue: runai.vcluster.com/tenant
+    - variable: tenantImagePullSecret
+      label: "Tenant image pull Secret name"
+      # This Secret supplies tenant workload ServiceAccount and registration hook Jobs.
+      description: If the vCluster Platform image requires a pull secret, specify the Secret name here; otherwise leave blank.
+      type: string
+      defaultValue: ""
+      validation: '^$|^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$'
+    - variable: controlPlaneClusterName
+      label: "Control plane cluster name"
+      # Change only when Platform connected cluster is not named loft-cluster.
+      description: Name of Platform control-plane cluster.
+      type: string
+      defaultValue: loft-cluster
+      validation: '^[a-z0-9]([-a-z0-9]*[a-z0-9])?$'
+    # This chooses render-time tenant-domain derivation. TLS mode comes from host endpoint data.
+    - variable: ingressProvider
+      label: "Shared host ingress provider."
+      description: Use standard for an IPv4 address. Use aws for an ELB or NLB hostname.
+      type: string
+      defaultValue: standard
+      options:
+        - standard
+        - aws
+    - variable: ingressControllerNamespace
+      label: "Ingress controller namespace"
+      description: Host namespace that contains ingress-nginx controller Pods.
+      type: string
+      defaultValue: ingress-nginx
+      validation: '^[a-z0-9]([-a-z0-9]*[a-z0-9])?$'
+    - variable: tenantClusterDomain
+      label: "Tenant cluster domain"
+      description: Optional tenant domain. Required for AWS ingress without a usable nip.io address.
+      type: string
+      defaultValue: ""
+      validation: '^$|^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$'
+    - variable: tenantSlug
+      label: "Tenant registration name"
+      # Set this only for an existing registration.
+      # An empty value creates a registration with the cluster name.
+      # A missing registration leaves the tenant waiting for its facts Secret.
+      description: The name of a pre-existing NVIDIA Run:ai cluster.  Otherwise, leave this field blank.
+      type: string
+      defaultValue: ""
+      validation: '^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?$'
+    # Keep this input name for callers that already disable the former CronJob.
+    - variable: createCustomLinkCronJob
+      label: Create NVIDIA Run:ai custom-link Job
+      description: Create one temporary Job that fills this VCI's RunAI_UI link after ingress is ready.
+      type: boolean
+      defaultValue: "true"
+  template:
+    # Each tenant cluster uses one NVIDIA Run:ai cluster.
+    # Set `tenantSlug` to adopt an existing registration.
+    # An empty value creates a registration with the tenant cluster name.
+    spaceTemplate:
+      objects: |-
+        {{- if not .Values.tenantSlug }}
+        apiVersion: management.loft.sh/v1
+        kind: StackInstance
+        metadata:
+          name: runai-reg-{{ .Values.loft.virtualClusterName }}
+          namespace: {{ .Values.loft.projectNamespace }}
+        spec:
+          displayName: "NVIDIA Run:ai registration for {{ .Values.loft.virtualClusterName }}"
+          owner:
+            user: admin
+          destination:
+            cluster:
+              name: {{ .Values.controlPlaneClusterName }}
+          templateRef:
+            name: run-ai-central-control-plane-registration
+          parameters:
+            tenantSlug: {{ .Values.loft.virtualClusterName }}
+            hookImagePullSecret: "{{ .Values.tenantImagePullSecret }}"
+            ingressProvider: "{{ .Values.ingressProvider }}"
+            tenantClusterDomain: "{{ .Values.tenantClusterDomain }}"
+        {{- end }}
+      apps:
+        - name: runai-custom-link-central-control-plane
+          parameters: |
+            createCustomLinkJob: {{ .Values.createCustomLinkCronJob }}
+            controlPlaneClusterName: "{{ .Values.controlPlaneClusterName }}"
+            tenantImagePullSecret: "{{ .Values.tenantImagePullSecret }}"
+    instanceTemplate:
+      metadata:
+        labels:
+          loft.sh/stacks-sync: "true"
+          runai.loft.sh/tenancy-model: central-control-plane
+    helmRelease:
+      chart:
+        version: "0.37.0-rc.3"
+      values: |-
+        {{ if .Values.tenantImagePullSecret }}
+        controlPlane:
+          advanced:
+            workloadServiceAccount:
+              imagePullSecrets:
+                - name: {{ .Values.tenantImagePullSecret }}
+          distro:
+            k8s:
+              scheduler:
+                enabled: true
+        {{ else }}
+        controlPlane:
+          distro:
+            k8s:
+              scheduler:
+                enabled: true
+        {{ end }}
+        policies:
+          networkPolicy:
+            enabled: true
+            workload:
+              egress:
+                - to:
+                    - namespaceSelector:
+                        matchLabels:
+                          kubernetes.io/metadata.name: {{ .Values.ingressControllerNamespace }}
+                      podSelector:
+                        matchLabels:
+                          app.kubernetes.io/component: controller
+                  ports:
+                    - protocol: TCP
+                      port: 443
+        sync:
+          fromHost:
+            nodes:
+              enabled: true
+              selector:
+                labels:
+                  {{ .Values.nodeSelectorLabel }}: "{{ .Values.nodeSelectorValue }}"
+            runtimeClasses:
+              enabled: true
+            ingressClasses:
+              enabled: true
+            # The NVIDIA Run:ai engine watches `nvidia.com/v1` ClusterPolicy. GPU Operator installs that
+            # CRD, and under this tenancy model it runs only on the Control Plane Cluster, so the CRD
+            # is absent from the tenant API server and `engine-operator` crash-loops on
+            # `no matches for kind "ClusterPolicy"`.
+            #
+            # This mirrors the CRD and the host's ClusterPolicy into the tenant, read-only. It installs
+            # no GPU Operator here: the tenant reads the host's policy and cannot change it.
+            customResources:
+              clusterpolicies.nvidia.com/v1:
+                enabled: true
+                scope: Cluster
+            # These three Secrets provide tenant configuration.
+            # Do not copy the UID, client secret, or CA into parameters. Secret sync updates rotated values.
+            secrets:
+              enabled: true
+              mappings:
+                byName:
+                  # Trust the shared control plane without anyone handling a certificate.
+                  "runai/runai-ca-cert": "runai/runai-ca-cert"
+                  # This Secret holds tenant registration facts.
+                  # `tenantSlug` selects an existing registration. Otherwise the template creates one.
+                  # The tenant Stack reads this fixed name.
+                  "runai-backend/runai-tenant-facts-{{ if .Values.tenantSlug }}{{ .Values.tenantSlug }}{{ else }}{{ .Values.loft.virtualClusterName }}{{ end }}": "runai/runai-tenant-facts"
+                  # This is the JFrog credential from the Control Plane Cluster.
+                  # The tenant Stack creates `runai-reg-creds`. The synced Secret is read-only.
+                  "runai/runai-reg-creds": "runai/runai-reg-creds-host"
+          toHost:
+            ingresses:
+              enabled: true
+            persistentVolumes:
+              enabled: true
+            persistentVolumeClaims:
+              enabled: true
+        networking:
+          advanced:
+            proxyKubelets:
+              byIP: true
+        deploy:
+          ingressNginx:
+            enabled: false
+          stacks:
+            - name: runai
+              templateRef:
+                name: run-ai-central-control-plane

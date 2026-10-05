@@ -1,0 +1,33 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended"
+  ],
+  "labels": ["dependencies"],
+  "ignorePaths": [
+    "**/.terraform/**"
+  ],
+  "packageRules": [
+    {
+      "description": "Group all GitHub Actions updates into a single PR",
+      "matchManagers": ["github-actions"],
+      "groupName": "github-actions"
+    },
+    {
+      "description": "Group OpenTofu provider updates into a single PR",
+      "matchManagers": ["terraform"],
+      "matchDepTypes": ["provider"],
+      "groupName": "terraform-providers"
+    }
+  ],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Pinned tool versions in CI workflows",
+      "fileMatch": ["^\\.github/workflows/.+\\.yml$"],
+      "matchStrings": [
+        "# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+)(?: extractVersion=(?<extractVersion>\\S+))?\\s+[^\\n]*?'(?<currentValue>[^']+)'"
+      ]
+    }
+  ]
+}

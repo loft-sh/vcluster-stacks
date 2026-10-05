@@ -1,0 +1,38 @@
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfstate.backup
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# Secrets - never commit
+terraform.tfvars
+*.auto.tfvars
+.env*
+
+# Generated credentials
+*-kubeconfig.yaml
+.eks-kubeconfig
+**/rendered/
+**/generated/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+graphify-out
+.pi-subagents
+issues
+scripts

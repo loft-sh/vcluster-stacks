@@ -1,0 +1,41 @@
+# Use this file only to pre-register a tenant or use a registration name different from its cluster name.
+# The tenant cluster template normally creates the registration.
+# Set the cluster template `tenantSlug` to use this registration.
+#
+# Name each instance `runai-reg-<tenantSlug>`.
+# `tenantSlug` must be unique. Duplicate registrations can deregister the same NVIDIA Run:ai cluster.
+#
+# Keep this instance for the tenant lifetime. Its pre-delete hook deregisters the tenant cluster.
+# Delete the tenant cluster before this instance.
+#
+# This Stack reads credentials from `runai-control-plane-admin` in `runai-backend`.
+# It reads the FQDN, ingress address, and CA setting from the endpoint ConfigMap.
+#
+# It writes `runai-backend/runai-tenant-facts-<tenantSlug>`.
+# The tenant cluster template syncs that Secret for the tenant Stack.
+apiVersion: management.loft.sh/v1
+kind: StackInstance
+metadata:
+  name: runai-reg-tenant-a
+spec:
+  displayName: "NVIDIA Run:ai registration for tenant-a"
+  owner:
+    user: admin
+  destination:
+    cluster:
+      name: loft-cluster
+  templateRef:
+    name: run-ai-central-control-plane-registration
+  parameters:
+    tenantSlug: tenant-a
+    # Optional. Empty derives `tenant-a.<host ingress address>.nip.io` from the address the host
+    # Stack published, and the tenant reads the result back out of the facts Secret, so there is no
+    # second value to keep in step. Set it only for a real domain you control.
+    # tenantClusterDomain: tenant-a.runai.example.com
+    # Keep equal to the chart versions the Apps pin. Only this Stack takes the value.
+    runaiVersion: "2.26"
+    # Optional, and only when the vCluster Platform image is from a private registry or an
+    # air-gapped mirror. Name a dockerconfigjson Secret you create in namespace `runai-backend` on
+    # this cluster BEFORE applying. Set the same value on the host StackInstance, which needs the
+    # Secret in `runai` instead. See README section "Pulling the job image".
+    # hookImagePullSecret: platform-reg-creds
