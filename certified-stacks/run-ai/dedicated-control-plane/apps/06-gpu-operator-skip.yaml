@@ -1,0 +1,59 @@
+# This App is step 6 for `gpuProvider: gke`.
+# The `gpu` task selects this App through `templateRef.name`.
+# A StackTemplate task cannot be skipped. This App skips the GPU Operator.
+#
+# GKE manages the GPU stack on its default GPU node pools.
+# GKE installs the driver, configures containerd, and runs `nvidia-gpu-device-plugin` in `kube-system`.
+# Do not run NVIDIA GPU Operator with this GKE stack.
+#
+# The operator searches `/run/nvidia/driver`, but GKE stores its driver in `/home/kubernetes/bin/nvidia`.
+# GKE containerd has no `nvidia` handler. GPU Operator pods cannot start.
+# The two device plugins also contend for the same GPUs.
+#
+# Use GPU capacity and metrics from the GKE stack.
+#
+# Use this App for default COS pools with Google-managed drivers.
+# For a GKE Ubuntu pool with `gpu-driver-version=disabled`, use `gpuProvider: standard`.
+# Step 0 creates the required system-critical pod quota for that configuration.
+apiVersion: management.loft.sh/v1
+kind: App
+metadata:
+  name: runai-step-06-gpu-operator-skip
+  labels:
+    runai.loft.sh/infra: "true"
+spec:
+  displayName: '[NVIDIA Run:ai Step - 6] NVIDIA GPU Operator (skipped, provider-managed)'
+  description: Installs no GPU Operator. Used when the cloud provider manages the node-level GPU stack.
+  defaultNamespace: gpu-operator
+  config:
+    # A marker instead of an empty release, so `kubectl -n gpu-operator get cm` answers "where is
+    # my GPU Operator" without anyone reading the Stack. The task's parameters are declared below
+    # and deliberately unused. The gpu task passes the same set to either App.
+    manifests: |-
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: runai-gpu-operator-skipped
+      data:
+        reason: |
+          The NVIDIA GPU Operator was intentionally not installed: this Stack was applied with
+          gpuProvider=gke, so the node-level GPU stack is managed by the cloud provider.
+          GPU capacity and metrics come from the provider's own driver and device plugin.
+        gpuProvider: gke
+  parameters:
+    # Declared only so the gpu task can pass one parameter set to either App. Nothing reads them.
+    - variable: driverEnabled
+      label: Install the NVIDIA driver
+      description: Ignored. The provider manages the driver.
+      type: boolean
+      defaultValue: "false"
+    - variable: devicePluginEnabled
+      label: Enable the device plugin
+      description: Ignored. The provider runs its own device plugin.
+      type: boolean
+      defaultValue: "true"
+    - variable: driverInstallDir
+      label: Driver install directory
+      description: Ignored. The provider chooses where its driver lives.
+      type: string
+      defaultValue: /run/nvidia/driver

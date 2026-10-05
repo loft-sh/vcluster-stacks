@@ -1,0 +1,188 @@
+# Shared host foundation for central control-plane tenancy. Apply this ONCE per Control Plane Cluster.
+#
+# This Stack installs the shared NVIDIA Run:ai control plane and NVIDIA GPU Operator.
+# Tenant clusters install neither. They read host GPU capacity through vCluster node sync.
+#
+# Name the StackInstance `runai`. The control-plane chart requires release `runai-backend`.
+# The release name is `<instance>-<task>`.
+#
+# Use GPU nodes. Configure the `nvidia` RuntimeClass and tenant node labels before you apply this.
+# Install ingress-nginx first. Pass its LoadBalancer address as `hostIngressAddress`, and set
+# `ingressProvider: aws` when that address is an ELB/NLB hostname rather than an IPv4 address.
+apiVersion: management.loft.sh/v1
+kind: StackTemplate
+metadata:
+  name: run-ai-central-control-plane-host
+  annotations:
+    vcluster.com/certified: "true"
+spec:
+  displayName: "NVIDIA Run:ai shared host foundation (control plane + GPU Operator)"
+  description: >-
+    Administrator-only. Installs registry credentials, TLS and CA bootstrap, the NVIDIA GPU
+    Operator, and the NVIDIA Run:ai self-hosted control plane once on the Control Plane Cluster. Central control-plane
+    tenant clusters share all of it. Reuses an existing host ingress-nginx.
+  parameters:
+    # Do not use `tenant`. A shared control plane is not a tenant.
+    - { variable: controlPlaneName, type: string, required: true, defaultValue: runai, validation: '^[a-z0-9]([-a-z0-9]*[a-z0-9])?$', label: "Control plane name" }
+    # How the existing host ingress-nginx LoadBalancer publishes itself. GCP and Azure hand out an
+    # IPv4 address; AWS hands out an ELB/NLB hostname and never an address, so the `nip.io`
+    # derivation below has nothing to build on. This mirrors `ingressProvider` on the dedicated
+    # Stack, except that here the ingress is a prerequisite, so the value is supplied rather than
+    # read back from a Service this Stack created.
+    - variable: ingressProvider
+      label: "Ingress provider"
+      type: string
+      required: true
+      defaultValue: standard
+      options:
+        - standard
+        - aws
+    # External address of the existing host ingress-nginx LoadBalancer: an IPv4 address under
+    # `standard`, a hostname under `aws`. One parameter cannot vary its own validation by the value
+    # of another, so the pattern admits both and `ingressProvider` decides how it is used.
+    - { variable: hostIngressAddress, type: string, required: true, validation: '^(25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})(\.(25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})){3}$|^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$', label: "Host ingress address" }
+    # Optional real FQDN. Under `standard` an empty value derives
+    # `<controlPlaneName>.<hostIngressAddress>.nip.io`; under `aws` it uses the LoadBalancer
+    # hostname as-is.
+    # Strongly recommended in production: a nip.io name shared by every tenant can never carry a
+    # publicly trusted certificate.
+    - { variable: domain, type: string, validation: '^$|^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$', label: "Control plane domain" }
+    - { variable: ingressClass, type: string, required: true, defaultValue: nginx, validation: '^[a-z0-9]([-a-z0-9]*[a-z0-9])?$', label: "Ingress class" }
+    - { variable: storageClass, type: string, required: true, validation: '^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$', label: "Storage class" }
+    # Control-plane administrator credentials. These live here and nowhere else: no tenant Stack and
+    # no tenant cluster ever receives them.
+    - { variable: adminUsername, type: string, required: true, validation: '^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+$', defaultValue: "admin@run.ai", label: "Control plane admin username" }
+    # Run:ai password requirements:
+    # https://run-ai-docs.nvidia.com/self-hosted/getting-started/installation/install-using-helm/install-control-plane
+    - { variable: adminPassword, type: password, required: true, validation: '^(?=.{8,}$)(?=.*[A-Z])(?=.*[a-z])(?=.*[0-9])(?=.*[^A-Za-z0-9]).*$', label: "Control plane admin password", description: "At least 8 characters. Include uppercase and lowercase letters, a number, and a special character." }
+    - { variable: dockerServer, type: string, required: true, defaultValue: "https://runai.jfrog.io", label: "Image registry server" }
+    - { variable: dockerUsername, type: string, required: true, defaultValue: "self-hosted-image-puller-prod", label: "Image registry username", description: "The username must match the subject of the image registry credentials JWT." }
+    - { variable: runaiRegistryCredentials, type: password, required: true, label: "Image registry credentials JWT",
+        description: "See: https://run-ai-docs.nvidia.com/self-hosted/getting-started/installation/install-using-helm/preparations#kubernetes" }
+    - { variable: dockerEmail, type: string, required: true, defaultValue: "support@run.ai", label: "Image registry email" }
+    # Name a `runai` dockerconfigjson Secret that pulls the vCluster Platform image.
+    # Bootstrap Jobs run directly on the Control Plane Cluster.
+    # Leave this empty when nodes can pull the image without credentials.
+    # Do not use `runai-reg-creds`. Pull secrets match the registry host.
+    - { variable: hookImagePullSecret, type: string, validation: '^$|^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$', label: "Hook image pull Secret",
+        description: "If the vCluster Platform image requires a pull secret, specify the Secret name here; otherwise leave blank." }
+    # TLS. The default issues a self-signed CA and leaf in-cluster and reuses them across upgrades.
+    # Supply a trusted certificate before production use: set `tlsMode: user-provided` plus either
+    # `userTlsSecretName` (preferred) or the inline PEM inputs, then set `customCAEnabled: false`
+    # if that certificate is publicly trusted.
+    - variable: tlsMode
+      label: "TLS mode"
+      type: string
+      defaultValue: self-signed
+      options:
+        - self-signed
+        - user-provided
+    - { variable: userTlsSecretName, type: string, label: "TLS Secret name" }
+    - { variable: userTlsCert, type: multiline, label: "TLS certificate" }
+    - { variable: userTlsKey, type: password, label: "TLS private key" }
+    - { variable: userCaCert, type: multiline, label: "CA certificate" }
+    - { variable: customCAEnabled, type: boolean, defaultValue: "true", label: "Trust bootstrap CA" }
+    # Select the node GPU stack owner.
+    # `gke` uses the Google driver, containerd configuration, and device plugin.
+    # Do not use `standard` on a default GKE GPU pool. The `gpu` task will time out.
+    # Use `standard` on a GKE Ubuntu pool with `gpu-driver-version=disabled`.
+    # See `apps/06-gpu-operator-skip.yaml`.
+    - variable: gpuProvider
+      label: "GPU provider"
+      type: string
+      required: true
+      defaultValue: standard
+      options:
+        - standard
+        - gke
+    # Set `gpuDriverEnabled: true` for nodes without NVIDIA drivers.
+    - { variable: gpuDriverEnabled, type: boolean, defaultValue: "false", label: "Install GPU driver" }
+    - { variable: gpuDevicePluginEnabled, type: boolean, defaultValue: "true", label: "Install GPU device plugin" }
+    - { variable: gpuDriverInstallDir, type: string, defaultValue: /run/nvidia/driver, label: "GPU driver install directory" }
+
+  tasks:
+
+    # Helm executes bootstrap's pre-install hook before its regular manifests. Create this namespace
+    # first because that hook writes the control-plane admin Secret and RBAC into it.
+    - name: namespace
+      timeout: 5m
+      app:
+        templateRef: { name: runai-step-00-runai-backend-namespace }
+
+    - name: registry
+      dependsOn: [namespace]
+      timeout: 5m
+      app:
+        templateRef: { name: runai-step-01-registry-secret }
+        parameters:
+          registrySecretName: runai-reg-creds
+          # Control-plane chart expects this pre-created Secret in runai-backend.
+          copyToControlPlaneNamespace: "true"
+          dockerServer: "{{ .Values.dockerServer }}"
+          dockerUsername: "{{ .Values.dockerUsername }}"
+          runaiRegistryCredentials: "{{ .Values.runaiRegistryCredentials }}"
+          dockerEmail: "{{ .Values.dockerEmail }}"
+
+    - name: bootstrap
+      dependsOn: [registry, namespace]
+      timeout: 15m
+      app:
+        templateRef: { name: runai-step-04-bootstrap-host }
+        parameters:
+          fqdn: "{{ if .Values.domain }}{{ .Values.domain }}{{ else if eq .Values.ingressProvider \"aws\" }}{{ .Values.hostIngressAddress }}{{ else }}{{ .Values.controlPlaneName }}.{{ .Values.hostIngressAddress }}.nip.io{{ end }}"
+          additionalDnsName: "{{ if eq .Values.ingressProvider \"aws\" }}{{ else }}*.{{ .Values.hostIngressAddress }}.nip.io{{ end }}"
+          loadBalancerAddress: "{{ .Values.hostIngressAddress }}"
+          ingressProvider: "{{ .Values.ingressProvider }}"
+          adminUsername: "{{ .Values.adminUsername }}"
+          adminPassword: "{{ .Values.adminPassword }}"
+          customCAEnabled: "{{ .Values.customCAEnabled }}"
+          tlsMode: "{{ .Values.tlsMode }}"
+          userTlsSecretName: "{{ .Values.userTlsSecretName }}"
+          userTlsCert: "{{ .Values.userTlsCert }}"
+          userTlsKey: "{{ .Values.userTlsKey }}"
+          userCaCert: "{{ .Values.userCaCert }}"
+          hookImagePullSecret: "{{ .Values.hookImagePullSecret }}"
+      outputs:
+        - name: fqdn
+          fromResource:
+            apiVersion: v1
+            kind: ConfigMap
+            namespace: runai
+            name: runai-control-plane-endpoint
+            jsonPath: "{.data.fqdn}"
+
+    # Use GPU nodes for this task. This Stack installs GPU Operator once.
+    # The control-plane chart does not use Prometheus CRDs. This task can run in parallel.
+    #
+    # Keep `namespace` in `dependsOn`.
+    # It creates the gpu-operator namespace and its GKE PriorityClass quota.
+    # GKE requires that quota before it admits a `system-node-critical` pod.
+    - name: gpu
+      dependsOn: [namespace]
+      timeout: 25m
+      app:
+        # A StackTemplate task cannot be conditionally skipped.
+        # `gpuProvider: gke` selects the `-skip` App. That App does not install GPU Operator.
+        # See `apps/06-gpu-operator-skip.yaml`.
+        templateRef: { name: "runai-step-06-gpu-operator{{ if eq .Values.gpuProvider \"gke\" }}-skip{{ end }}" }
+        parameters:
+          driverEnabled: "{{ .Values.gpuDriverEnabled }}"
+          devicePluginEnabled: "{{ .Values.gpuDevicePluginEnabled }}"
+          driverInstallDir: "{{ .Values.gpuDriverInstallDir }}"
+
+    # Keep task name `backend`. Chart requires release `runai-backend`.
+    - name: backend
+      dependsOn: [registry, bootstrap]
+      timeout: 30m
+      app:
+        templateRef: { name: runai-step-07-control-plane }
+        parameters:
+          fqdn: "{{ if .Values.domain }}{{ .Values.domain }}{{ else if eq .Values.ingressProvider \"aws\" }}{{ .Values.hostIngressAddress }}{{ else }}{{ .Values.controlPlaneName }}.{{ .Values.hostIngressAddress }}.nip.io{{ end }}"
+          ingressClass: "{{ .Values.ingressClass }}"
+          storageClass: "{{ .Values.storageClass }}"
+          customCAEnabled: "{{ .Values.customCAEnabled }}"
+          adminUsername: "{{ .Values.adminUsername }}"
+
+  publishedOutputs:
+    - name: controlPlaneFqdn
+      fromTask: { task: bootstrap, output: fqdn }

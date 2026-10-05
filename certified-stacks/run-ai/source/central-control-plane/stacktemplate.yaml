@@ -1,0 +1,132 @@
+# This Stack runs in one central-control-plane tenant cluster.
+# The cluster template normally deploys it through `deploy.stacks`.
+#
+# This Stack does not install the control plane or GPU Operator.
+# `stacktemplate-host.yaml` installs those shared components once.
+# vCluster node sync provides host GPU capacity and NFD/GFD labels.
+# `stacktemplate-registration.yaml` provides the shared control-plane values.
+#
+# The tenant cluster template syncs these Secrets from the Control Plane Cluster.
+# `discover` exports their keys as task outputs.
+#
+#   runai/runai-tenant-facts     Control-plane FQDN, tenant cluster URL, UID, client secret, and CA setting.
+#   runai/runai-reg-creds-host   JFrog credential from the Control Plane Cluster.
+#   runai/runai-ca-cert          Control-plane CA.
+#
+# These names must match `sync.fromHost.secrets.mappings` in the cluster template.
+#
+# Apply the host Stack before this Stack. The cluster template creates the registration.
+# `discover` waits until the registration publishes the tenant facts Secret.
+#
+# This Stack has no control-plane administrator credentials or cluster-wide node permissions.
+apiVersion: management.loft.sh/v1
+kind: StackTemplate
+metadata:
+  name: run-ai-central-control-plane
+  annotations:
+    vcluster.com/certified: "true"
+spec:
+  displayName: "NVIDIA Run:ai central-control-plane tenant (shared control plane and GPU Operator)"
+  description: >-
+    NVIDIA Run:ai cluster components for one central-control-plane tenant. Consumes a control plane and an NVIDIA GPU
+    Operator that already exist on the Control Plane Cluster, plus a cluster registration performed
+    by an administrator. Installs registry credentials, the Prometheus operator, and the NVIDIA Run:ai
+    cluster agent, taking every value from Secrets synced in from the host.
+  parameters:
+    - { variable: ingressClass, type: string, required: true, defaultValue: nginx, validation: '^[a-z0-9]([-a-z0-9]*[a-z0-9])?$', label: "Ingress class" }
+    # Wait for the control-plane CA Secret.
+    # Set false only for a publicly trusted certificate. The host Stack creates no CA Secret then.
+    # This must equal the host Stack's `customCAEnabled`. It cannot be derived: it decides what
+    # `discover` waits for, and the host's value only arrives in the facts Secret that `discover` is
+    # waiting on. So `discover` checks it against that Secret first and fails naming both values.
+    # The facts Secret controls the CA mount.
+    - { variable: requireControlPlaneCA, type: boolean, defaultValue: "true", label: "Require control plane CA" }
+
+  tasks:
+
+    # Export the synced Secret keys as task outputs.
+    # Wait until every Secret exists. This prevents a race with vCluster sync.
+    # The wait also covers tenant registration. That Stack may still write the facts Secret.
+    # `awaitTimeoutSeconds` is less than `timeout` so the task names a missing Secret.
+    - name: discover
+      timeout: 12m
+      app:
+        templateRef: { name: runai-step-02-discover }
+        parameters:
+          awaitSecrets: "runai-tenant-facts,runai-reg-creds-host{{ if .Values.requireControlPlaneCA }},runai-ca-cert{{ end }}"
+          awaitTimeoutSeconds: "600"
+          assertSecret: runai-tenant-facts
+          assertSecretKey: customcaenabled
+          assertSecretValue: "{{ .Values.requireControlPlaneCA }}"
+      outputs:
+        - name: controlplanefqdn
+          fromSecret: { namespace: runai, name: runai-tenant-facts, key: fqdn }
+        - name: clusterdomain
+          fromSecret: { namespace: runai, name: runai-tenant-facts, key: clusterdomain }
+        - name: clusteruid
+          fromSecret: { namespace: runai, name: runai-tenant-facts, key: uid }
+        - name: clientsecret
+          fromSecret: { namespace: runai, name: runai-tenant-facts, key: clientsecret }
+        - name: customcaenabled
+          fromSecret: { namespace: runai, name: runai-tenant-facts, key: customcaenabled }
+        - name: dockerconfigjson
+          fromSecret: { namespace: runai, name: runai-reg-creds-host, key: .dockerconfigjson }
+
+    # Re-creates the pull Secret as a release resource under the name the NVIDIA Run:ai charts default to.
+    # The synced copy cannot be used directly: it is owned by the syncer and read-only in the tenant.
+    - name: registry
+      dependsOn: [discover]
+      timeout: 5m
+      app:
+        templateRef: { name: runai-step-01-registry-secret }
+        parameters:
+          registrySecretName: runai-reg-creds
+          dockerConfigJson: "{{ .Outputs.discover.dockerconfigjson }}"
+          # No control plane lives here, so no `runai-backend` copy and no empty namespace left over.
+          copyToControlPlaneNamespace: "false"
+
+    # CRDs and operator only. The NVIDIA Run:ai operator creates this tenant's own Prometheus instance from
+    # RunaiConfig at runtime, which is why the CRDs must exist in the tenant's own API server.
+    - name: prometheus
+      timeout: 15m
+      app:
+        templateRef: { name: runai-step-05-prometheus-operator }
+
+    # Installs no GPU stack. It creates the DCGM exporter Service the NVIDIA Run:ai operator looks up,
+    # because the real exporter runs on the Control Plane Cluster and the operator only probes this
+    # tenant's own API server. `cluster` depends on it: the check runs from that chart's pre-install
+    # hook, so the Service has to exist first.
+    - name: gpushim
+      timeout: 5m
+      app:
+        templateRef: { name: runai-step-09-gpu-stack-shim }
+
+    # Keep task name `cluster`. The chart requires release `runai-cluster`.
+    # `fqdn` is the shared control-plane URL. `clusterFqdn` is the tenant URL.
+    # Registration creates both values. The control plane and agent use the same tenant URL.
+    - name: cluster
+      dependsOn: [discover, registry, prometheus, gpushim]
+      timeout: 30m
+      app:
+        templateRef: { name: runai-step-08-cluster }
+        parameters:
+          fqdn: "{{ .Outputs.discover.controlplanefqdn }}"
+          clusterFqdn: "{{ .Outputs.discover.clusterdomain }}"
+          clusterUID: "{{ .Outputs.discover.clusteruid }}"
+          clientSecret: "{{ .Outputs.discover.clientsecret }}"
+          customCAEnabled: "{{ .Outputs.discover.customcaenabled }}"
+          ingressClass: "{{ .Values.ingressClass }}"
+          # Declares that no GPU Operator manages DCGM here. `gpushim` puts the Service in this
+          # namespace. Dedicated control-plane tenancy leaves this empty and keeps the chart default.
+          dcgmExporterNamespace: gpu-operator
+
+    # The charts installing is not the same as NVIDIA Run:ai working. The operator's dependency checks
+    # run after them, and until they pass there is no scheduler. Without this task the Stack reports
+    # Healthy over a tenant that can never schedule a workload.
+    - name: verify
+      dependsOn: [cluster]
+      timeout: 20m
+      app:
+        templateRef: { name: runai-step-10-verify-cluster }
+        parameters:
+          verifyTimeoutSeconds: "900"

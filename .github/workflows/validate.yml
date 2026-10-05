@@ -1,0 +1,135 @@
+name: Validate Manifests
+
+on:
+  workflow_dispatch:
+    inputs:
+      vcluster_version:
+        description: vCluster CLI version (empty for pinned default, or latest/SemVer)
+        required: false
+        default: ""
+        type: string
+      platform_version:
+        description: vCluster Platform version (empty for pinned default, or latest/SemVer)
+        required: false
+        default: ""
+        type: string
+  push:
+    branches: [main]
+    paths:
+      - 'certified-stacks/run-ai/**'
+      - 'certified-stacks/nvidia-dynamo/**'
+      - '.github/workflows/validate.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'certified-stacks/run-ai/**'
+      - 'certified-stacks/nvidia-dynamo/**'
+      - '.github/workflows/validate.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  validate:
+    name: Render and validate
+    runs-on: large-8_32
+    timeout-minutes: 10
+    env:
+      # renovate: datasource=github-releases depName=loft-sh/vcluster
+      VCLUSTER_VERSION: ${{ github.event.inputs.vcluster_version || 'v0.37.1' }}
+      # renovate: datasource=github-releases depName=loft-sh/loft extractVersion=^v(?<version>.+)$
+      PLATFORM_VERSION: ${{ github.event.inputs.platform_version || '4.12.0' }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - name: Validate requested versions
+        run: |
+          for version in "$VCLUSTER_VERSION" "$PLATFORM_VERSION"; do
+            if [[ ! "$version" =~ ^latest$|^v?[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z]+)*$ ]]; then
+              echo "Invalid version: $version. Use latest or SemVer." >&2
+              exit 1
+            fi
+          done
+      - name: Set up vind
+        uses: loft-sh/setup-vind@1ffff82986c3afff90ba8f357f69541b24e3a8f0 # v1
+        with:
+          version: ${{ env.VCLUSTER_VERSION }}
+      - name: Set up Helm
+        uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4
+      - name: Set up manifest validation prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes ripgrep python3-yaml
+      - name: Render Run:ai manifests
+        run: ./certified-stacks/run-ai/render.sh --check
+      - name: Check NVIDIA Dynamo manifests
+        run: ./certified-stacks/nvidia-dynamo/test-certified-manifests.sh
+      - name: Start vCluster Platform
+        env:
+          # Fail inside the job's timeout so the diagnostics step below can run. Default is 10m.
+          LOFT_TIMEOUT: 4m
+        run: |
+          cat > "$RUNNER_TEMP/platform-values.yaml" <<'EOF'
+          env:
+            DISABLE_LOFT_ROUTER: true
+          EOF
+          vcluster platform start \
+            --version "$PLATFORM_VERSION" \
+            --password test123 \
+            --host vcluster-platform.local \
+            --no-login \
+            --no-port-forwarding \
+            --no-tunnel \
+            --config "$RUNNER_TEMP/platform-vcluster-config.json" \
+            --values "$RUNNER_TEMP/platform-values.yaml"
+          kubectl wait --for=condition=Available apiservice/v1.management.loft.sh --timeout=5m
+      - name: Platform startup diagnostics
+        if: failure()
+        run: |
+          set +e
+          echo "::group::Nodes"
+          kubectl get nodes -o wide
+          kubectl describe nodes | sed -n '/^Conditions:/,/^Addresses:/p'
+          echo "::endgroup::"
+          echo "::group::Pods"
+          kubectl get pods -A -o wide
+          echo "::endgroup::"
+          echo "::group::Platform pod"
+          kubectl describe pod -A -l app=loft
+          echo "::endgroup::"
+          echo "::group::Events"
+          kubectl get events -A --sort-by=.lastTimestamp | tail -60
+          echo "::endgroup::"
+          while IFS=/ read -r namespace pod; do
+            [ -n "$pod" ] || continue
+            echo "::group::Logs $namespace/$pod (current)"
+            kubectl logs -n "$namespace" "$pod" --all-containers --tail=200 || true
+            echo "::endgroup::"
+            echo "::group::Logs $namespace/$pod (previous)"
+            kubectl logs -n "$namespace" "$pod" --all-containers --previous --tail=200 || true
+            echo "::endgroup::"
+          done < <(kubectl get pods -A -l app=loft -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name}{"\n"}{end}')
+      - name: Validate manifests
+        run: |
+          for directory in certified-stacks/run-ai/dedicated-control-plane certified-stacks/run-ai/central-control-plane certified-stacks/nvidia-dynamo; do
+            kubectl delete --ignore-not-found --recursive --filename "$directory"
+          done
+          for directory in certified-stacks/run-ai/dedicated-control-plane certified-stacks/run-ai/central-control-plane certified-stacks/nvidia-dynamo; do
+            while IFS= read -r -d '' manifest; do
+              echo "::group::Validate $manifest"
+              status=0
+              kubectl apply \
+                --server-side \
+                --dry-run=server \
+                --validate=strict \
+                --request-timeout=30s \
+                --filename "$manifest" || status=$?
+              echo "::endgroup::"
+              [ "$status" -eq 0 ] || exit "$status"
+            done < <(find "$directory" -type f \( -name '*.yaml' -o -name '*.yml' \) -print0 | sort -z)
+          done
