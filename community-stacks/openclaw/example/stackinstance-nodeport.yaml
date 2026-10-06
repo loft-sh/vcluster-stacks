@@ -1,0 +1,25 @@
+# OpenClaw reachable over the network from one allowed CIDR, without kubectl: a NodePort behind an
+# IP-allowlist proxy. Replace 203.0.113.7/32 with your own public IP
+# (`$(curl -4 -s ifconfig.me)/32`) and open the NodePort in the cloud firewall for that CIDR.
+# Everyone behind the allowed address is the operator. Apply with `-n <project namespace>`.
+apiVersion: management.loft.sh/v1
+kind: StackInstance
+metadata:
+  name: openclaw
+spec:
+  displayName: OpenClaw (NodePort)
+  owner:
+    user: admin
+  destination:
+    virtualCluster:
+      name: my-tenant-cluster
+  templateRef:
+    name: openclaw
+  parameters:
+    accessMode: nodeport
+    allowedCidr: 203.0.113.7/32
+    nodePort: "30789"
+    requireCpuNode: "true"
+    agentName: Claw
+    userName: Alex
+  prunePolicy: Prune

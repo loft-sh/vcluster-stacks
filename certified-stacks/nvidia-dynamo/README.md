@@ -103,4 +103,4 @@ From the repository root, run the static checks:
 
 The checks require Python 3 with PyYAML, and Helm. CI also validates every manifest in this directory with a server-side dry run against vCluster Platform.
 
-For general Stack authoring and catalog contribution requirements, see the [repository README](../../README.md#build-a-custom-stack) and [contribution checklist](../../README.md#contribute-a-certified-stack).
+For general Stack authoring and catalog contribution requirements, see the [repository README](../../README.md#build-a-custom-stack) and [contribution checklist](../../README.md#contribute-a-stack).

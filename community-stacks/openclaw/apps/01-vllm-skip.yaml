@@ -1,0 +1,175 @@
+# Step 1 of the OpenClaw stack for modelBackend: external. The `vllm` task selects this App
+# through its templated templateRef.name; a StackTemplate task cannot be skipped, so this App
+# installs no model server and leaves a marker instead.
+#
+# What the rest of the stack needs from step 1 is an OpenAI-compatible endpoint. With an external
+# backend that endpoint already exists (externalBaseUrl): the readiness gate (step 2), the gateway
+# (step 4) and the canary (step 5) receive it as modelBaseUrl and the key as modelApiKey straight
+# from the StackTemplate, so nothing has to be shared between Helm releases.
+#
+# Every parameter of the real step-1 App is declared so the task can pass one parameter set to
+# either App. Only externalBaseUrl is read.
+apiVersion: management.loft.sh/v1
+kind: App
+metadata:
+  name: openclaw-step-01-vllm-skip
+  labels:
+    app.kubernetes.io/part-of: openclaw-stack
+spec:
+  displayName: "[OpenClaw Step - 1] vLLM model server (skipped, external model)"
+  description: Installs no model server. Used when OpenClaw talks to an existing OpenAI-compatible endpoint.
+  access:
+    - users: ["*"]
+      verbs: ["get"]
+  defaultNamespace: openclaw
+  wait: true
+  timeout: 2m
+  parameters:
+    - variable: externalBaseUrl
+      label: External model base URL
+      description: OpenAI-compatible base URL ending in /v1, for example https://api.example.com/v1.
+      type: string
+      required: true
+      defaultValue: ""
+      validation: '^$|^https?://[^ ]+$'
+    - variable: externalApiKey
+      label: External model API key
+      description: Ignored here. The StackTemplate hands the key to steps 2, 4 and 5 as modelApiKey.
+      type: password
+      required: false
+      defaultValue: ""
+    - variable: model
+      label: Hugging Face model id
+      description: Ignored. No model is downloaded.
+      type: string
+      required: true
+      defaultValue: Qwen/Qwen3.8-27B
+    - variable: servedModelName
+      label: Model id
+      description: Ignored. The external endpoint's model id is passed to steps 2, 4 and 5 directly.
+      type: string
+      required: true
+      defaultValue: qwen3.8-27b
+    - variable: maxModelLen
+      label: Max context length (tokens)
+      description: Ignored. No vLLM is started.
+      type: number
+      required: true
+      defaultValue: "262144"
+    - variable: gpuMemoryUtilization
+      label: GPU memory fraction for vLLM
+      description: Ignored. No GPU is used.
+      type: string
+      required: true
+      defaultValue: "0.90"
+    - variable: gpuCount
+      label: GPUs for vLLM
+      description: Ignored. No GPU is used.
+      type: number
+      required: true
+      defaultValue: "1"
+    - variable: maxNumSeqs
+      label: Max concurrent sequences
+      description: Ignored. No vLLM is started.
+      type: number
+      required: true
+      defaultValue: "8"
+    - variable: maxNumBatchedTokens
+      label: Max batched tokens
+      description: Ignored. No vLLM is started.
+      type: number
+      required: true
+      defaultValue: "8192"
+    - variable: vllmExtraArgs
+      label: Extra vLLM args
+      description: Ignored. No vLLM is started.
+      type: multiline
+      required: false
+      defaultValue: ""
+    - variable: vllmEnv
+      label: Extra vLLM environment
+      description: Ignored. No vLLM is started.
+      type: multiline
+      required: false
+      defaultValue: ""
+    - variable: hfToken
+      label: Hugging Face token (optional)
+      description: Ignored. No model is downloaded.
+      type: password
+      required: false
+      defaultValue: ""
+    - variable: image
+      label: vLLM image
+      description: Ignored. No vLLM is started.
+      type: string
+      required: true
+      defaultValue: vllm/vllm-openai:v0.30.0
+    - variable: modelCache
+      label: Model cache storage
+      description: Ignored. No model cache is created.
+      type: string
+      required: true
+      options: ["pvc", "hostPath", "emptyDir"]
+      defaultValue: pvc
+    - variable: modelCacheSize
+      label: Model cache size
+      description: Ignored. No model cache is created.
+      type: string
+      required: true
+      defaultValue: 150Gi
+    - variable: modelCacheStorageClass
+      label: Model cache StorageClass
+      description: Ignored. No model cache is created.
+      type: string
+      required: false
+      defaultValue: ""
+    - variable: modelCachePath
+      label: Model cache directory on the GPU node
+      description: Ignored. No model cache is created.
+      type: string
+      required: true
+      defaultValue: /var/lib/openclaw/vllm-cache
+    - variable: runtimeClassName
+      label: RuntimeClass
+      description: Ignored. No pod is created.
+      type: string
+      required: false
+      defaultValue: ""
+    - variable: memoryRequest
+      label: Memory request
+      description: Ignored. No pod is created.
+      type: string
+      required: true
+      defaultValue: 32Gi
+    - variable: cpuRequest
+      label: CPU request
+      description: Ignored. No pod is created.
+      type: string
+      required: true
+      defaultValue: "8"
+    - variable: shmSize
+      label: Shared memory size
+      description: Ignored. No pod is created.
+      type: string
+      required: true
+      defaultValue: 16Gi
+  config:
+    chart: {}
+    manifests: |
+      {{- $ns := "openclaw" }}
+      {{- if not .Values.externalBaseUrl }}
+      {{- fail "openclaw-step-01-vllm-skip: modelBackend is external but externalBaseUrl is empty" }}
+      {{- end }}
+      # A marker instead of an empty release, so `kubectl -n openclaw get cm vllm-skipped` answers
+      # "where is my model server" without anyone reading the Stack.
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: vllm-skipped
+        namespace: {{ $ns }}
+      data:
+        reason: |
+          No vLLM server was installed: this stack was applied with modelBackend=external, so
+          OpenClaw uses the OpenAI-compatible endpoint below. Set modelBackend to vllm to serve a
+          model on this tenant's GPU instead.
+        externalBaseUrl: {{ .Values.externalBaseUrl | quote }}

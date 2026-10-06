@@ -25,6 +25,12 @@ The Certified Stacks catalog currently contains these integrations:
 
 See the [NVIDIA Run:ai integration guide](https://www.vcluster.com/docs/platform/next/integrations/certified-stacks/runai) to choose a deployment model and understand its prerequisites.
 
+The Community Stacks directory currently contains these integrations:
+
+| Integration | Destination | Components |
+| --- | --- | --- |
+| [OpenClaw](community-stacks/openclaw/) | Tenant cluster, one install per cluster | OpenClaw gateway with lossless-claw, vLLM on the tenant's GPU or an external OpenAI-compatible endpoint, Telegram, and a readiness canary |
+
 ## Use a Certified Stack
 
 If you want to install an existing Certified Stack, use the resources bundled with vCluster Platform instead of applying this repository's development sources. Platform exposes the templates through its catalog and keeps the bundled resources aligned with the installed Platform release.
@@ -38,6 +44,7 @@ Copy a bundled StackTemplate when you need to customize it. Give the copy a diff
 ## Use a Community Stack 
 - See the README included in a Community stack (if present).
 - Create a new Stack Template, then copy-and-paste the stacktemplate.yaml.
+- Or apply the Stack's `apps/` and `stacktemplate.yaml` to the Platform management API as its README describes, for example the [OpenClaw install steps](community-stacks/openclaw/README.md#install).
 
 ## Build a Custom Stack
 

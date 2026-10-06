@@ -14,9 +14,12 @@ override.tf.json
 terraform.tfvars
 *.auto.tfvars
 .env*
+# Community Stacks: an operator's own StackInstance values
+my-instance.yaml
 
 # Generated credentials
 *-kubeconfig.yaml
+*.kubeconfig
 .eks-kubeconfig
 **/rendered/
 **/generated/

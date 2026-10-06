@@ -1,0 +1,128 @@
+# An OpenAI-compatible model endpoint for the `external` backend on a tenant WITHOUT a GPU:
+# llama.cpp serving Qwen3-1.7B (Q8_0, 1.83 GB) on CPU, with an API key and tool calling. Slow,
+# but real: enough to install and exercise the stack where no accelerator exists, and the shape of
+# any external endpoint (base URL ending in /v1, bearer key, model id).
+#
+#   sed "s/REPLACE_WITH_A_RANDOM_KEY/$(openssl rand -hex 16)/" example/external-llama-cpp.yaml | kubectl apply -f -
+#   kubectl -n llm rollout status deploy/llama --timeout=15m    # downloads the model on first start
+#
+# Then install the stack with modelBackend: external, externalBaseUrl: http://llama.llm.svc:8080/v1,
+# externalApiKey: <the key>, servedModelName: qwen3-1.7b, maxModelLen: "32768", modelVision: "false",
+# modelReasoning: "false", thinkingFormat: none (see example/stackinstance-external.yaml).
+#
+# 32k context with a unified KV cache: OpenClaw's system prompt and tool list alone are 8 to 12k
+# tokens; two slots keep the canary's ping from queueing behind a long turn. Expect the first chat
+# turn to take 1 to 3 minutes on 4 vCPUs.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: llm
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: llama-keys
+  namespace: llm
+type: Opaque
+stringData:
+  # Comma-separated: more than one key lets you rotate the stack's externalApiKey without a restart.
+  keys: "REPLACE_WITH_A_RANDOM_KEY"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: llama
+  namespace: llm
+spec:
+  selector:
+    app: llama
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: llama
+  namespace: llm
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: llama
+  template:
+    metadata:
+      labels:
+        app: llama
+    spec:
+      enableServiceLinks: false
+      containers:
+        - name: server
+          image: ghcr.io/ggml-org/llama.cpp:server
+          args:
+            - --host
+            - 0.0.0.0
+            - --port
+            - "8080"
+            - -hf
+            - Qwen/Qwen3-1.7B-GGUF:Q8_0
+            - --alias
+            - qwen3-1.7b
+            - --jinja
+            - --chat-template-kwargs
+            - '{"enable_thinking":false}'
+            - -c
+            - "32768"
+            - -np
+            - "2"
+            - --kv-unified
+            - -fa
+            - "on"
+            - -ctk
+            - q8_0
+            - -ctv
+            - q8_0
+            - -t
+            - "4"
+            - --api-key
+            - $(LLAMA_API_KEYS)
+          env:
+            - name: LLAMA_CACHE
+              value: /cache
+            - name: LLAMA_API_KEYS
+              valueFrom:
+                secretKeyRef:
+                  name: llama-keys
+                  key: keys
+          ports:
+            - name: http
+              containerPort: 8080
+          resources:
+            requests:
+              cpu: "2"
+              memory: 5Gi
+            limits:
+              memory: 7Gi
+          # /health answers 503 while the model downloads and loads.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            periodSeconds: 10
+            failureThreshold: 72
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            periodSeconds: 10
+          volumeMounts:
+            - name: cache
+              mountPath: /cache
+      volumes:
+        # Re-downloaded on every pod start; use a PVC here to keep the weights.
+        - name: cache
+          emptyDir:
+            sizeLimit: 6Gi

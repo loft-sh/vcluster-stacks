@@ -1,0 +1,741 @@
+# OpenClaw + lossless-claw (LCM) as a vCluster Platform Stack, with the model served by vLLM on
+# the tenant's GPUs or by any OpenAI-compatible endpoint.
+#
+# Apply the Apps in apps/ together with this template: a StackTemplate is a graph of references,
+# and a task whose templateRef does not resolve leaves the StackInstance Pending with no useful
+# message.
+#
+# Tasks (step numbers are the apps/ file numbers, a topological order of the graph):
+#   vllm        (01) the model server; returns as soon as the objects exist. With
+#                    modelBackend: external the task selects the -skip App, which installs nothing.
+#   modelready  (02) waits for the model to answer, checks tool calling, publishes the model id
+#   persona     (03) SOUL.md / IDENTITY.md / USER.md from the parameters; runs first so the
+#                    workspace is configured before OpenClaw's first start, and re-applies live
+#   openclaw    (04) the gateway + LCM + front door; runs alongside the model download so the
+#                    dashboard is up early. It only needs the model Service to exist, not to answer.
+#   canary      (05) after both: a pod whose readiness is a real completion + gateway /readyz,
+#                    re-checked continuously. The live status the stack card cannot give you.
+#
+# EVERY task passes EVERY parameter its App declares: a task that omits one gets an EMPTY value,
+# not the App's default.
+#
+# Model-specific knowledge lives in parameter defaults (vllmExtraArgs, thinkingFormat, vllmEnv), so
+# another model or GPU is a parameter change, not a template edit. The defaults are the profile
+# verified end to end; see the README's "Tested model profiles".
+apiVersion: management.loft.sh/v1
+kind: StackTemplate
+metadata:
+  name: openclaw
+  labels:
+    app.kubernetes.io/part-of: openclaw-stack
+spec:
+  displayName: "OpenClaw agent (vLLM or external model, lossless-claw)"
+  description: >-
+    Self-hosted OpenClaw with lossless-claw as the context engine, talking to a vLLM model on the
+    tenant's GPU or to any OpenAI-compatible endpoint. Dashboard by port-forward, Ingress or an
+    IP-allowlisted NodePort; Telegram from the install form; a canary that says whether the agent
+    can answer right now.
+  parameters:
+    # ----- model --------------------------------------------------------------------
+    - variable: modelBackend
+      label: Model backend
+      description: >-
+        vllm: run the model below on this tenant's GPUs. external: use an existing
+        OpenAI-compatible endpoint (externalBaseUrl, externalApiKey); the vLLM parameters are then
+        ignored and the tenant needs no GPU.
+      type: string
+      required: true
+      section: Model
+      options: ["vllm", "external"]
+      defaultValue: vllm
+    - variable: model
+      label: Hugging Face model (vllm)
+      description: >-
+        Model id to download and serve. When you change it, change servedModelName, maxModelLen,
+        vllmExtraArgs (parsers) and thinkingFormat to match; see the README's tested profiles.
+      type: string
+      required: true
+      section: Model
+      defaultValue: Qwen/Qwen3.8-27B
+    - variable: servedModelName
+      label: Model id
+      description: >-
+        The id OpenClaw asks for. With the vllm backend it is the --served-model-name; with an
+        external backend, the model name your endpoint expects.
+      type: string
+      required: true
+      section: Model
+      defaultValue: qwen3.8-27b
+      validation: '^[a-zA-Z0-9][a-zA-Z0-9._/:-]*$'
+    - variable: maxModelLen
+      label: Context length (tokens)
+      description: vLLM --max-model-len and OpenClaw's contextWindow. Must fit the KV cache on your GPU, and must not exceed what an external model supports.
+      type: number
+      required: true
+      section: Model
+      defaultValue: "262144"
+    - variable: maxTokens
+      label: Max output tokens per turn
+      type: number
+      required: true
+      section: Model
+      defaultValue: "16384"
+    - variable: modelVision
+      label: Model accepts images
+      description: >-
+        true lets the agent see photos sent in chat: OpenClaw declares the model image-capable.
+        For vLLM the vision encoder is loaded unless vllmExtraArgs contains --language-model-only.
+      type: boolean
+      required: true
+      section: Model
+      defaultValue: "true"
+    - variable: modelReasoning
+      label: Model is a reasoning model
+      description: Exposes /think levels in OpenClaw. Set false for models without a thinking mode.
+      type: boolean
+      required: true
+      section: Model
+      defaultValue: "true"
+    - variable: thinkingFormat
+      label: Thinking payload format
+      description: >-
+        How OpenClaw switches thinking on and off for this endpoint. qwen-chat-template for Qwen on
+        vLLM (chat_template_kwargs.enable_thinking), qwen for DashScope-style top-level flags,
+        together for Together-style reasoning.enabled, none to send nothing.
+      type: string
+      required: true
+      section: Model
+      options: ["qwen-chat-template", "qwen", "together", "none"]
+      defaultValue: qwen-chat-template
+    - variable: gpuMemoryUtilization
+      label: GPU memory fraction (vllm)
+      description: Fraction of VRAM for weights + KV cache. Leave headroom for the CUDA context, kernels and prefill spikes; 0.90 is a common choice.
+      type: string
+      required: true
+      section: Model
+      defaultValue: "0.90"
+      validation: '^0\.[5-9][0-9]?$'
+    - variable: gpuCount
+      label: GPUs (vllm)
+      description: nvidia.com/gpu request of the vLLM pod. Above 1, vLLM runs tensor-parallel across them (raise vllmShmSize).
+      type: number
+      required: true
+      section: Model
+      defaultValue: "1"
+      min: 1
+      max: 8
+    - variable: maxNumSeqs
+      label: Max concurrent sequences (vllm)
+      type: number
+      required: true
+      section: Model
+      defaultValue: "8"
+    - variable: maxNumBatchedTokens
+      label: Max batched tokens per step (vllm)
+      type: number
+      required: true
+      section: Model
+      defaultValue: "8192"
+    - variable: vllmExtraArgs
+      label: Model-specific vLLM args
+      description: >-
+        One per line. This is the model profile (tool-call parser, reasoning parser, speculative
+        decoding, chat template kwargs). Defaults are for Qwen3.8.
+      type: multiline
+      required: false
+      section: Model
+      defaultValue: |-
+        --tool-call-parser
+        qwen3_xml
+        --reasoning-parser
+        qwen3
+        --enable-prefix-caching
+        --mamba-cache-mode
+        align
+        --speculative-config
+        {"method":"mtp","num_speculative_tokens":2}
+        --default-chat-template-kwargs
+        {"reasoning_effort":"medium"}
+    - variable: vllmEnv
+      label: GPU-specific vLLM environment
+      description: KEY=VALUE per line, added to the vLLM container. Lines starting with # are ignored.
+      type: multiline
+      required: false
+      section: Model
+      defaultValue: |-
+        # sm_120 (RTX PRO 6000, RTX 50xx): the FlashInfer sampler can fail to compile at boot;
+        # the torch sampler is fine. Harmless elsewhere.
+        VLLM_USE_FLASHINFER_SAMPLER=0
+    - variable: hfToken
+      label: Hugging Face token (vllm, optional)
+      description: Only for gated models. Stored in a Secret inside the tenant cluster.
+      type: password
+      required: false
+      section: Model
+      defaultValue: ""
+    - variable: externalBaseUrl
+      label: External model base URL (external)
+      description: OpenAI-compatible base URL ending in /v1, e.g. https://api.example.com/v1. Reachable from the tenant cluster.
+      type: string
+      required: false
+      section: Model
+      defaultValue: ""
+      validation: '^$|^https?://[^ ]+$'
+    - variable: externalApiKey
+      label: External model API key (external)
+      description: Bearer token for the endpoint. Stored as a parameter in the Platform and in Secrets inside the tenant cluster.
+      type: password
+      required: false
+      section: Model
+      defaultValue: ""
+
+    # ----- access -------------------------------------------------------------------
+    - variable: accessMode
+      label: Access mode
+      description: >-
+        port-forward: reach the dashboard with `kubectl port-forward` (published as the
+        dashboardCommand output) and the generated token (dashboardLink carries it); cluster
+        access is the gate. ingress: an Ingress for ingressHost with token auth and a one-time
+        device approval per browser. nodeport: a NodePort behind an IP-allowlist proxy, no token.
+      type: string
+      required: true
+      section: Access
+      options: ["port-forward", "nodeport", "ingress"]
+      defaultValue: port-forward
+    - variable: localPort
+      label: Local port for the port-forward
+      description: Used in the published command and the allowed browser origins. Avoid 18789 (a local OpenClaw usually holds it).
+      type: number
+      required: true
+      section: Access
+      defaultValue: "28789"
+    - variable: ingressClassName
+      label: Ingress class (ingress mode)
+      description: Empty uses the cluster's default IngressClass.
+      type: string
+      required: false
+      section: Access
+      defaultValue: ""
+    - variable: ingressHost
+      label: Ingress host (ingress mode)
+      description: DNS name that resolves to your ingress controller, e.g. claw.example.com. Required in ingress mode.
+      type: string
+      required: false
+      section: Access
+      defaultValue: ""
+      validation: '^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$'
+    - variable: ingressTlsSecret
+      label: Ingress TLS Secret (ingress mode)
+      description: TLS Secret in the openclaw namespace, or the name a cert-manager annotation will fill. Empty serves plain HTTP and the token travels unencrypted.
+      type: string
+      required: false
+      section: Access
+      defaultValue: ""
+      validation: '^$|^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$'
+    - variable: ingressAnnotations
+      label: Ingress annotations (ingress mode)
+      description: >-
+        One key:value per line. Examples: nginx.ingress.kubernetes.io/proxy-read-timeout:3600
+        (long WebSocket sessions), cert-manager.io/cluster-issuer:letsencrypt,
+        nginx.ingress.kubernetes.io/whitelist-source-range:203.0.113.0/24.
+      type: multiline
+      required: false
+      section: Access
+      defaultValue: ""
+    - variable: ingressScheme
+      label: Ingress scheme (ingress mode)
+      description: >-
+        auto: https when ingressTlsSecret is set, http otherwise. Set https when TLS ends in front
+        of the Ingress without a Secret (a managed certificate, a cloud load balancer, Cloudflare),
+        so the published URL and the browser origins match what users see.
+      type: string
+      required: true
+      section: Access
+      options: ["auto", "http", "https"]
+      defaultValue: auto
+    - variable: allowedCidr
+      label: Allowed source CIDR (nodeport mode)
+      description: >-
+        The only network allowed to open the dashboard, e.g. 203.0.113.7/32 (your public IP, see
+        `curl -4 ifconfig.me`). Everyone behind this address gets operator access. Ignored in the
+        other modes.
+      type: string
+      required: false
+      section: Access
+      defaultValue: ""
+      validation: '^$|^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$'
+    - variable: operatorUser
+      label: Operator identity (nodeport mode)
+      description: Identity OpenClaw shows for requests from the allowed CIDR.
+      type: string
+      required: true
+      section: Access
+      defaultValue: operator@openclaw.local
+    - variable: nodePort
+      label: Dashboard NodePort (nodeport mode)
+      description: 30000-32767. Must be open in the cloud firewall for the allowed CIDR.
+      type: number
+      required: true
+      section: Access
+      defaultValue: "30789"
+      min: 30000
+      max: 32767
+
+    # ----- channels -----------------------------------------------------------------
+    - variable: telegramBotToken
+      label: Telegram bot token
+      description: >-
+        Paste the token @BotFather gives you and the agent comes up with Telegram connected.
+        Stored in the Platform as a parameter and on the tenant's state volume (0600 file).
+        Empty = no Telegram (you can still add one by hand later).
+      type: password
+      required: false
+      section: Channels
+      defaultValue: ""
+    - variable: telegramAllowFrom
+      label: Telegram user IDs allowed to DM
+      description: >-
+        Comma-separated numeric Telegram user IDs (ask @userinfobot for yours). Listed users are
+        pre-authorized and command owners: their first DM just works, no pairing code. Empty =
+        the first DM shows a pairing code you approve once.
+      type: string
+      required: false
+      section: Channels
+      defaultValue: ""
+      validation: '^$|^[0-9]+( *, *[0-9]+)*$'
+    - variable: dmScope
+      label: DM session scope
+      description: >-
+        per-channel-peer (default): each chat channel + sender (e.g. your Telegram) gets its own
+        session, so replies stay fast. main: DMs share the dashboard's session.
+      type: string
+      required: true
+      section: Channels
+      options: ["per-channel-peer", "main", "per-peer", "per-account-channel-peer"]
+      defaultValue: per-channel-peer
+
+    # ----- persona ------------------------------------------------------------------
+    - variable: agentName
+      label: Agent name
+      description: What the agent calls itself and what the dashboard shows. Written to IDENTITY.md and the OpenClaw config.
+      type: string
+      required: true
+      section: Persona
+      defaultValue: Claw
+      validation: '^[A-Za-z0-9][A-Za-z0-9 ._-]{0,39}$'
+    - variable: agentEmoji
+      label: Agent emoji
+      description: Shown next to the name in the dashboard and channels. Written to IDENTITY.md.
+      type: string
+      required: true
+      section: Persona
+      defaultValue: "🦀"
+      validation: '^.{1,8}$'
+    - variable: agentSoul
+      label: SOUL.md
+      description: >-
+        The agent's personality, voice and boundaries, written to SOUL.md as is. Re-applied only
+        when you change it here; edits the agent makes itself are kept until then.
+      type: multiline
+      required: true
+      section: Persona
+      defaultValue: |-
+        # SOUL.md - Who You Are
+
+        You are a helpful, friendly assistant with a personality of your own: curious, warm, direct,
+        and calm under pressure. Not a chatbot; a colleague who happens to be an AI.
+
+        ## How you work
+
+        - Be genuinely helpful, not performatively helpful. Skip the "Great question!" and just help.
+        - Have opinions. Recommend, disagree politely, say what you would do and why.
+        - Be resourceful before asking. Read the file, check the context, try it. Come back with
+          answers, not questions.
+        - Short when short will do, thorough when it matters.
+        - Say when you are unsure, and what you would need to be sure.
+
+        ## Boundaries
+
+        - Private things stay private.
+        - Ask before doing anything external or irreversible: sending messages, deleting, paying,
+          publishing.
+        - Never send half-finished replies to messaging surfaces.
+        - You speak for yourself, not as the user.
+
+        ## Continuity
+
+        Each session you wake up fresh; these files are your memory. Read them, keep them current, and
+        tell the user if you change this one.
+    - variable: userName
+      label: Your name
+      description: How the agent addresses you. Written to USER.md.
+      type: string
+      required: true
+      section: Persona
+      defaultValue: Operator
+    - variable: userProfile
+      label: About you
+      description: >-
+        One fact per line; becomes the Profile section of USER.md (OpenClaw injects at most
+        4,000 characters of it). Stored in plain text in the Platform, so only put here what
+        the agent should know.
+      type: multiline
+      required: false
+      section: Persona
+      defaultValue: |-
+        Location: (city, country)
+        Address: (only if you want the agent to know it)
+        Preferences: (how you like to be addressed, tone, working hours, anything else)
+    - variable: userTimezone
+      label: Your timezone
+      description: IANA name such as Europe/Berlin or America/New_York. Dates in the agent's system prompt use it; written to USER.md too. Empty = UTC.
+      type: string
+      required: false
+      section: Persona
+      defaultValue: ""
+      validation: '^$|^UTC$|^[A-Za-z]+(/[A-Za-z0-9_+-]+)+$'
+
+    # ----- resources ----------------------------------------------------------------
+    - variable: vllmCpuRequest
+      label: vLLM CPU request
+      type: string
+      required: true
+      section: Resources
+      defaultValue: "8"
+    - variable: vllmMemoryRequest
+      label: vLLM memory request
+      description: Host RAM for the vLLM pod. Loading weights needs roughly their size in RAM.
+      type: string
+      required: true
+      section: Resources
+      defaultValue: 32Gi
+    - variable: vllmShmSize
+      label: vLLM shared memory
+      description: /dev/shm for vLLM's worker processes. More for tensor parallelism.
+      type: string
+      required: true
+      section: Resources
+      defaultValue: 16Gi
+      validation: '^[0-9]+(Mi|Gi)$'
+
+    # ----- storage ------------------------------------------------------------------
+    - variable: modelCache
+      label: Model cache storage (vllm)
+      description: >-
+        pvc (default): a PersistentVolumeClaim; use a network-attached StorageClass, a node-local
+        one pins the cache to a node that may go away. hostPath: a directory on the GPU node that
+        follows the pod and dies with the node; needs a namespace that allows hostPath (Pod
+        Security privileged); the right choice on private-nodes tenants with local-path.
+        emptyDir: no persistence, re-download on every pod start.
+      type: string
+      required: true
+      section: Storage
+      options: ["pvc", "hostPath", "emptyDir"]
+      defaultValue: pvc
+    - variable: modelCacheSize
+      label: Model cache size (pvc, emptyDir)
+      description: Weights plus compile caches. Qwen3.8-27B in BF16 needs about 60 GB.
+      type: string
+      required: true
+      section: Storage
+      defaultValue: 150Gi
+      validation: '^[0-9]+(Gi|Ti)$'
+    - variable: modelCacheStorageClass
+      label: Model cache StorageClass (pvc)
+      description: Empty uses the tenant default.
+      type: string
+      required: false
+      section: Storage
+      defaultValue: ""
+    - variable: modelCachePath
+      label: Model cache directory on the GPU node (hostPath)
+      type: string
+      required: true
+      section: Storage
+      defaultValue: /var/lib/openclaw/vllm-cache
+    - variable: storageClass
+      label: State volume StorageClass
+      description: For the OpenClaw state volume (chats, memory, workspace). Empty uses the tenant default.
+      type: string
+      required: false
+      section: Storage
+      defaultValue: ""
+    - variable: stateSize
+      label: OpenClaw state volume size
+      type: string
+      required: true
+      section: Storage
+      defaultValue: 20Gi
+      validation: '^[0-9]+(Mi|Gi|Ti)$'
+
+    # ----- scheduling ---------------------------------------------------------------
+    - variable: requireCpuNode
+      label: Keep OpenClaw off the GPU node
+      description: >-
+        true = OpenClaw runs only on non-GPU nodes, so it and its state survive scaling the GPU
+        to 0 or a Spot reclaim; the tenant must have a non-GPU node (an on-demand CPU pool).
+        false = prefer a non-GPU node but accept the GPU node (GPU-only tenants). Decide before
+        the first install when the state StorageClass is node-local.
+      type: boolean
+      required: true
+      section: Scheduling
+      defaultValue: "false"
+    - variable: runtimeClassName
+      label: RuntimeClass for the vLLM pod
+      description: Empty uses the node default. Set "nvidia" where the NVIDIA runtime is installed but not the default.
+      type: string
+      required: false
+      section: Scheduling
+      defaultValue: ""
+
+    # ----- versions -----------------------------------------------------------------
+    - variable: vllmImage
+      label: vLLM image
+      type: string
+      required: true
+      section: Versions
+      # renovate: datasource=docker depName=vllm/vllm-openai
+      defaultValue: vllm/vllm-openai:v0.30.0
+    - variable: openclawImage
+      label: OpenClaw image
+      type: string
+      required: true
+      section: Versions
+      # renovate: datasource=docker depName=ghcr.io/openclaw/openclaw
+      defaultValue: ghcr.io/openclaw/openclaw:2026.9.6
+    - variable: proxyImage
+      label: Proxy image (nodeport and ingress modes)
+      type: string
+      required: true
+      section: Versions
+      # renovate: datasource=docker depName=nginxinc/nginx-unprivileged
+      defaultValue: nginxinc/nginx-unprivileged:1.27-alpine
+    - variable: losslessClawVersion
+      label: lossless-claw version
+      type: string
+      required: true
+      section: Versions
+      # renovate: datasource=npm depName=@martian-engineering/lossless-claw
+      defaultValue: "1.1.0"
+
+  tasks:
+    # A StackTemplate task cannot be skipped. modelBackend: external selects the -skip App, which
+    # installs no model server; the three consumers below get the external endpoint instead.
+    - name: vllm
+      timeout: 15m
+      app:
+        templateRef:
+          name: "openclaw-step-01-vllm{{ if eq .Values.modelBackend \"external\" }}-skip{{ end }}"
+        parameters:
+          model: "{{ .Values.model }}"
+          servedModelName: "{{ .Values.servedModelName }}"
+          maxModelLen: "{{ .Values.maxModelLen }}"
+          gpuMemoryUtilization: "{{ .Values.gpuMemoryUtilization }}"
+          gpuCount: "{{ .Values.gpuCount }}"
+          maxNumSeqs: "{{ .Values.maxNumSeqs }}"
+          maxNumBatchedTokens: "{{ .Values.maxNumBatchedTokens }}"
+          vllmExtraArgs: "{{ .Values.vllmExtraArgs }}"
+          vllmEnv: "{{ .Values.vllmEnv }}"
+          hfToken: "{{ .Values.hfToken }}"
+          image: "{{ .Values.vllmImage }}"
+          modelCache: "{{ .Values.modelCache }}"
+          modelCacheSize: "{{ .Values.modelCacheSize }}"
+          modelCacheStorageClass: "{{ .Values.modelCacheStorageClass }}"
+          modelCachePath: "{{ .Values.modelCachePath }}"
+          runtimeClassName: "{{ .Values.runtimeClassName }}"
+          memoryRequest: "{{ .Values.vllmMemoryRequest }}"
+          cpuRequest: "{{ .Values.vllmCpuRequest }}"
+          shmSize: "{{ .Values.vllmShmSize }}"
+          externalBaseUrl: "{{ .Values.externalBaseUrl }}"
+          externalApiKey: "{{ .Values.externalApiKey }}"
+
+    - name: modelready
+      dependsOn: [vllm]
+      # The gate Job itself gives up after 28 min (vllm) or 3 min (external); this leaves room for
+      # one AppInstance retry.
+      timeout: 60m
+      app:
+        templateRef:
+          name: openclaw-step-02-model-ready
+        parameters:
+          servedModelName: "{{ .Values.servedModelName }}"
+          modelBaseUrl: "{{ if eq .Values.modelBackend \"vllm\" }}http://vllm.openclaw.svc:8000/v1{{ else }}{{ .Values.externalBaseUrl }}{{ end }}"
+          modelBackend: "{{ .Values.modelBackend }}"
+          # vLLM enforces no auth; OpenClaw and the checks just need a non-empty key.
+          modelApiKey: "{{ if eq .Values.modelBackend \"vllm\" }}vllm-local{{ else }}{{ .Values.externalApiKey }}{{ end }}"
+          deadlineSeconds: "{{ if eq .Values.modelBackend \"vllm\" }}1680{{ else }}180{{ end }}"
+      outputs:
+        - name: model
+          fromResource:
+            apiVersion: v1
+            kind: ConfigMap
+            namespace: openclaw
+            name: vllm-model
+            jsonPath: "{.data.id}"
+        - name: toolcalls
+          fromResource:
+            apiVersion: v1
+            kind: ConfigMap
+            namespace: openclaw
+            name: vllm-model
+            jsonPath: "{.data.toolcalls}"
+
+    - name: persona
+      # The App's hook Job waits up to 10 min for a Ready gateway; a failed first deploy is
+      # retried after 1 min, so the task needs more than 2x the App timeout.
+      timeout: 25m
+      app:
+        templateRef:
+          name: openclaw-step-03-persona
+        parameters:
+          agentName: "{{ .Values.agentName }}"
+          agentEmoji: "{{ .Values.agentEmoji }}"
+          agentSoul: "{{ .Values.agentSoul }}"
+          userName: "{{ .Values.userName }}"
+          userProfile: "{{ .Values.userProfile }}"
+          userTimezone: "{{ .Values.userTimezone }}"
+          workspaceDir: "/home/node/.openclaw/workspace"
+          stateDir: "/home/node/.openclaw"
+      outputs:
+        - name: applied
+          fromResource:
+            apiVersion: v1
+            kind: ConfigMap
+            namespace: openclaw
+            name: openclaw-persona
+            jsonPath: "{.data.sha}"
+
+    # Runs after persona so the workspace is configured before OpenClaw's first start.
+    - name: openclaw
+      dependsOn: [vllm, persona]
+      # The App deploy waits up to 15 min for the pod; a failed first deploy is retried after
+      # 1 min, so the task needs more than 2x the App timeout.
+      timeout: 40m
+      app:
+        templateRef:
+          name: openclaw-step-04-gateway
+        parameters:
+          accessMode: "{{ .Values.accessMode }}"
+          localPort: "{{ .Values.localPort }}"
+          allowedCidr: "{{ .Values.allowedCidr }}"
+          operatorUser: "{{ .Values.operatorUser }}"
+          nodePort: "{{ .Values.nodePort }}"
+          ingressClassName: "{{ .Values.ingressClassName }}"
+          ingressHost: "{{ .Values.ingressHost }}"
+          ingressTlsSecret: "{{ .Values.ingressTlsSecret }}"
+          ingressAnnotations: "{{ .Values.ingressAnnotations }}"
+          ingressScheme: "{{ .Values.ingressScheme }}"
+          image: "{{ .Values.openclawImage }}"
+          proxyImage: "{{ .Values.proxyImage }}"
+          losslessClawVersion: "{{ .Values.losslessClawVersion }}"
+          modelBaseUrl: "{{ if eq .Values.modelBackend \"vllm\" }}http://vllm.openclaw.svc:8000/v1{{ else }}{{ .Values.externalBaseUrl }}{{ end }}"
+          modelBackend: "{{ .Values.modelBackend }}"
+          modelApiKey: "{{ if eq .Values.modelBackend \"vllm\" }}vllm-local{{ else }}{{ .Values.externalApiKey }}{{ end }}"
+          modelId: "{{ .Values.servedModelName }}"
+          contextWindow: "{{ .Values.maxModelLen }}"
+          maxTokens: "{{ .Values.maxTokens }}"
+          modelVision: "{{ .Values.modelVision }}"
+          modelReasoning: "{{ .Values.modelReasoning }}"
+          thinkingFormat: "{{ .Values.thinkingFormat }}"
+          stateSize: "{{ .Values.stateSize }}"
+          storageClass: "{{ .Values.storageClass }}"
+          agentName: "{{ .Values.agentName }}"
+          agentEmoji: "{{ .Values.agentEmoji }}"
+          userTimezone: "{{ .Values.userTimezone }}"
+          requireCpuNode: "{{ .Values.requireCpuNode }}"
+          dmScope: "{{ .Values.dmScope }}"
+          telegramBotToken: "{{ .Values.telegramBotToken }}"
+          telegramAllowFrom: "{{ .Values.telegramAllowFrom }}"
+      outputs:
+        - name: url
+          fromResource:
+            apiVersion: v1
+            kind: ConfigMap
+            namespace: openclaw
+            name: openclaw-endpoint
+            jsonPath: "{.data.url}"
+        - name: reachability
+          fromResource:
+            apiVersion: v1
+            kind: ConfigMap
+            namespace: openclaw
+            name: openclaw-endpoint
+            jsonPath: "{.data.reachability}"
+        - name: command
+          fromResource:
+            apiVersion: v1
+            kind: ConfigMap
+            namespace: openclaw
+            name: openclaw-endpoint
+            jsonPath: "{.data.command}"
+        - name: token
+          fromSecret:
+            namespace: openclaw
+            name: openclaw-gateway-token
+            key: token
+        # From the ConfigMap, not the Secret: a Secret-backed output is masked on the stack
+        # card, and this one is meant to be copied. Carries the token only in port-forward mode.
+        - name: link
+          fromResource:
+            apiVersion: v1
+            kind: ConfigMap
+            namespace: openclaw
+            name: openclaw-endpoint
+            jsonPath: "{.data.link}"
+        # From the endpoint ConfigMap, not the Service: a ClusterIP Service has no nodePort field
+        # and an output that resolves to nothing shows as an error on the stack card.
+        - name: nodeport
+          fromResource:
+            apiVersion: v1
+            kind: ConfigMap
+            namespace: openclaw
+            name: openclaw-endpoint
+            jsonPath: "{.data.port}"
+        - name: telegrambot
+          fromResource:
+            apiVersion: v1
+            kind: ConfigMap
+            namespace: openclaw
+            name: openclaw-endpoint
+            jsonPath: "{.data.telegramBot}"
+
+    # The live truth after install: a pod whose readiness is a real completion + gateway
+    # /readyz, re-checked every interval. The stack card does not re-evaluate App tasks, so look
+    # at this pod (kubectl get deploy stack-canary, or the tenant's workloads view) instead.
+    - name: canary
+      dependsOn: [openclaw, modelready]
+      # The App waits up to 10 min for a Ready canary; task > 2x App so one retry fits.
+      timeout: 25m
+      app:
+        templateRef:
+          name: openclaw-step-05-canary
+        parameters:
+          modelId: "{{ .Values.servedModelName }}"
+          modelBaseUrl: "{{ if eq .Values.modelBackend \"vllm\" }}http://vllm.openclaw.svc:8000/v1{{ else }}{{ .Values.externalBaseUrl }}{{ end }}"
+          modelApiKey: "{{ if eq .Values.modelBackend \"vllm\" }}vllm-local{{ else }}{{ .Values.externalApiKey }}{{ end }}"
+          openclawUrl: "http://openclaw.openclaw.svc"
+          # Every check costs tokens on an external endpoint: check less often there.
+          intervalSeconds: "{{ if eq .Values.modelBackend \"vllm\" }}60{{ else }}300{{ end }}"
+          completionTimeoutSeconds: "60"
+
+  publishedOutputs:
+    - name: dashboardUrl
+      fromTask: { task: openclaw, output: url }
+    - name: dashboardReachability
+      fromTask: { task: openclaw, output: reachability }
+    - name: dashboardCommand
+      fromTask: { task: openclaw, output: command }
+    - name: dashboardLink
+      fromTask: { task: openclaw, output: link }
+    - name: dashboardToken
+      fromTask: { task: openclaw, output: token }
+    - name: dashboardNodePort
+      fromTask: { task: openclaw, output: nodeport }
+    - name: telegramBot
+      fromTask: { task: openclaw, output: telegrambot }
+    - name: modelId
+      fromTask: { task: modelready, output: model }
+    - name: modelToolCalling
+      fromTask: { task: modelready, output: toolcalls }
+    - name: personaVersion
+      fromTask: { task: persona, output: applied }

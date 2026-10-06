@@ -1,0 +1,126 @@
+# Creates a tenant cluster and installs the OpenClaw stack into it through deploy.stacks.
+# Apply the Apps and the StackTemplate before this template. Needs vCluster Platform 4.12 and a
+# vCluster version of 0.37 or later for the tenant cluster.
+#
+# This template cannot create GPUs. In the shape below the tenant shares the control plane
+# cluster's nodes, so the vLLM pod's nvidia.com/gpu request lands on a GPU node of that cluster
+# (NVIDIA device plugin installed, nvidia.com/gpu allocatable). For a tenant with its own nodes
+# add a privateNodes block to the values; node pool definitions are provider-specific and are
+# therefore not part of this template.
+#
+# A tenant creator fills in who the agent is and how to reach it. Infrastructure choices (model,
+# cache, scheduling) are made once here for every tenant created from this template.
+apiVersion: management.loft.sh/v1
+kind: VirtualClusterTemplate
+metadata:
+  name: openclaw-agent
+  labels:
+    app.kubernetes.io/part-of: openclaw-stack
+spec:
+  displayName: OpenClaw agent tenant
+  description: Creates a tenant cluster, then deploys the OpenClaw stack into it through deploy.stacks.
+  owner:
+    user: admin
+  parameters:
+    - variable: agentName
+      label: Agent name
+      description: What the agent calls itself and what the dashboard shows.
+      type: string
+      required: true
+      defaultValue: Claw
+      validation: '^[A-Za-z0-9][A-Za-z0-9 ._-]{0,39}$'
+    - variable: agentEmoji
+      label: Agent emoji
+      type: string
+      required: true
+      defaultValue: "🦀"
+      validation: '^.{1,8}$'
+    - variable: agentSoul
+      label: SOUL.md
+      description: The agent's personality, voice and boundaries. Leave the default for a friendly generalist.
+      type: multiline
+      required: true
+      defaultValue: |-
+        # SOUL.md - Who You Are
+
+        You are a helpful, friendly assistant with a personality of your own: curious, warm, direct,
+        and calm under pressure. Be genuinely helpful, have opinions, be resourceful before asking,
+        and ask before doing anything external or irreversible.
+    - variable: userName
+      label: Your name
+      type: string
+      required: true
+      defaultValue: Operator
+    - variable: userProfile
+      label: About you
+      description: One fact per line (location, preferences). Plain text in the Platform.
+      type: multiline
+      required: false
+      defaultValue: ""
+    - variable: userTimezone
+      label: Your timezone
+      description: IANA name such as Europe/Berlin. Empty = UTC.
+      type: string
+      required: false
+      defaultValue: ""
+      validation: '^$|^UTC$|^[A-Za-z]+(/[A-Za-z0-9_+-]+)+$'
+    - variable: telegramBotToken
+      label: Telegram bot token
+      description: From @BotFather. Empty = no Telegram.
+      type: password
+      required: false
+      defaultValue: ""
+    - variable: telegramAllowFrom
+      label: Telegram user IDs allowed to DM
+      description: Comma-separated numeric IDs; pre-authorized. Empty = pairing code on first DM.
+      type: string
+      required: false
+      defaultValue: ""
+      validation: '^$|^[0-9]+( *, *[0-9]+)*$'
+    - variable: accessMode
+      label: Access mode
+      description: port-forward (kubectl, token) or ingress (set the host below).
+      type: string
+      required: true
+      options: ["port-forward", "ingress"]
+      defaultValue: port-forward
+    - variable: ingressHost
+      label: Ingress host (ingress mode)
+      description: DNS name that resolves to the control plane cluster's ingress controller.
+      type: string
+      required: false
+      defaultValue: ""
+      validation: '^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$'
+  template:
+    instanceTemplate:
+      metadata:
+        labels:
+          loft.sh/stacks-sync: "true"
+    helmRelease:
+      chart:
+        # The Platform requires a pinned vCluster version here; deploy.stacks needs 0.37 or later.
+        # renovate: datasource=github-releases depName=loft-sh/vcluster extractVersion=^v(?<version>.+)$
+        version: "0.37.3"
+      values: |-
+        deploy:
+          stacks:
+            - name: openclaw
+              templateRef:
+                name: openclaw
+              prunePolicy: Prune
+              # Every value is rendered with toJson so multiline text stays valid YAML.
+              parameters:
+                agentName: {{ .Values.agentName | toJson }}
+                agentEmoji: {{ .Values.agentEmoji | toJson }}
+                agentSoul: {{ .Values.agentSoul | toJson }}
+                userName: {{ .Values.userName | toJson }}
+                userProfile: {{ .Values.userProfile | toJson }}
+                userTimezone: {{ .Values.userTimezone | toJson }}
+                telegramBotToken: {{ .Values.telegramBotToken | toJson }}
+                telegramAllowFrom: {{ .Values.telegramAllowFrom | toJson }}
+                accessMode: {{ .Values.accessMode | toJson }}
+                ingressHost: {{ .Values.ingressHost | toJson }}
+                # Infrastructure choices, made once for every tenant from this template. The
+                # model profile keeps the StackTemplate defaults.
+                modelCache: "pvc"
+                requireCpuNode: "false"

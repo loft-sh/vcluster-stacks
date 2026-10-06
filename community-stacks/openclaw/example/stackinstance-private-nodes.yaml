@@ -1,0 +1,25 @@
+# The shape this stack was verified on: a private-nodes tenant cluster whose only StorageClass is
+# local-path, one Spot GPU node and one on-demand CPU node. The model cache is a hostPath
+# directory on the GPU node (a local-path PVC would pin itself to a node that gets reclaimed) and
+# OpenClaw with its state stays on the CPU node. hostPath needs the openclaw namespace to allow it
+# (Pod Security level privileged). Apply with `-n <project namespace>`.
+apiVersion: management.loft.sh/v1
+kind: StackInstance
+metadata:
+  name: openclaw
+spec:
+  displayName: OpenClaw (private nodes)
+  owner:
+    user: admin
+  destination:
+    virtualCluster:
+      name: my-tenant-cluster
+  templateRef:
+    name: openclaw
+  parameters:
+    modelCache: hostPath
+    modelCachePath: /var/lib/openclaw/vllm-cache
+    requireCpuNode: "true"
+    agentName: Claw
+    userName: Alex
+  prunePolicy: Prune

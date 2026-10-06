@@ -1,0 +1,210 @@
+# Step 5 of the OpenClaw stack: the live truth about whether the agent can actually work.
+#
+# WHY A CANARY
+#
+# A stack task's status is decided when it deploys and never re-checked (only Argo CD tasks get
+# continuous health). So the stack card says Healthy even after the GPU node is reclaimed and
+# vLLM is gone, or after an external endpoint's key expires. This pod is the honest signal: its
+# readiness is a REAL chat completion against the model endpoint plus OpenClaw's /readyz,
+# refreshed every interval. Watch it with
+#
+#   kubectl -n openclaw get deploy stack-canary      READY 1/1 = the agent can answer right now
+#   kubectl -n openclaw logs deploy/stack-canary     one line per check, with latency
+#
+# or in the Platform UI under the tenant cluster's workloads. It is also the natural target for
+# alerting. The task itself turns Healthy at install once both checks pass (it runs after the
+# model-ready gate and the gateway), which makes it a useful install-time gate too.
+#
+# The container is the Platform's own image (curl, jq). It runs the check loop as its main
+# process and writes /tmp/status; the readiness probe only reads that file, so a slow or hung
+# model cannot stall the kubelet. Ready flips to false after `failureThreshold` missed checks.
+# With an external backend every check costs tokens: the StackTemplate passes a longer interval.
+apiVersion: management.loft.sh/v1
+kind: App
+metadata:
+  name: openclaw-step-05-canary
+  labels:
+    app.kubernetes.io/part-of: openclaw-stack
+spec:
+  displayName: "[OpenClaw Step - 5] Canary (live model + gateway check)"
+  description: A pod whose readiness is a real model completion plus OpenClaw /readyz, refreshed continuously.
+  access:
+    - users: ["*"]
+      verbs: ["get"]
+  defaultNamespace: openclaw
+  wait: true
+  timeout: 10m
+  parameters:
+    - variable: modelId
+      label: Model id
+      type: string
+      required: true
+      defaultValue: qwen3.8-27b
+    - variable: modelBaseUrl
+      label: Model base URL
+      description: OpenAI-compatible base URL ending in /v1.
+      type: string
+      required: true
+      defaultValue: http://vllm.openclaw.svc:8000/v1
+    - variable: modelApiKey
+      label: Model API key
+      description: Bearer token for the endpoint, stored in a Secret. Empty sends no Authorization header.
+      type: password
+      required: false
+      defaultValue: ""
+    - variable: openclawUrl
+      label: OpenClaw URL (in-cluster Service)
+      type: string
+      required: true
+      defaultValue: http://openclaw.openclaw.svc
+    - variable: intervalSeconds
+      label: Check interval (seconds)
+      type: number
+      required: true
+      defaultValue: "60"
+    - variable: completionTimeoutSeconds
+      label: Completion timeout (seconds)
+      description: A completion slower than this counts as failed.
+      type: number
+      required: true
+      defaultValue: "60"
+  config:
+    chart: {}
+    manifests: |
+      {{- $ns := "openclaw" }}
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: stack-canary
+        namespace: {{ $ns }}
+      data:
+        check.sh: |
+      {{ include "canary.check" . | indent 4 }}
+      ---
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: stack-canary
+        namespace: {{ $ns }}
+      type: Opaque
+      stringData:
+        apiKey: {{ .Values.modelApiKey | quote }}
+      ---
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: stack-canary
+        namespace: {{ $ns }}
+        labels:
+          app: stack-canary
+      spec:
+        replicas: 1
+        selector:
+          matchLabels:
+            app: stack-canary
+        template:
+          metadata:
+            labels:
+              app: stack-canary
+            annotations:
+              checksum/check: {{ include "canary.check" . | sha256sum | trunc 16 }}
+              # A rotated key must reach the running pod: roll it.
+              checksum/key: {{ .Values.modelApiKey | sha256sum | trunc 16 }}
+          spec:
+            automountServiceAccountToken: false
+            enableServiceLinks: false
+            securityContext:
+              runAsNonRoot: true
+              seccompProfile:
+                type: RuntimeDefault
+            affinity:
+              nodeAffinity:
+                preferredDuringSchedulingIgnoredDuringExecution:
+                  - weight: 100
+                    preference:
+                      matchExpressions:
+                        - key: nvidia.com/gpu.present
+                          operator: NotIn
+                          values: ["true"]
+            tolerations:
+              - key: nvidia.com/gpu
+                operator: Exists
+                effect: NoSchedule
+            containers:
+              - name: canary
+                image: {{ .Values.__image__ | quote }}
+                command: ["sh", "/etc/canary/check.sh"]
+                securityContext:
+                  allowPrivilegeEscalation: false
+                  readOnlyRootFilesystem: true
+                  capabilities:
+                    drop: ["ALL"]
+                env:
+                  - { name: MODEL,    value: {{ .Values.modelId | quote }} }
+                  - { name: BASE,     value: {{ .Values.modelBaseUrl | quote }} }
+                  - { name: OPENCLAW, value: {{ .Values.openclawUrl | quote }} }
+                  - { name: INTERVAL, value: {{ .Values.intervalSeconds | quote }} }
+                  - { name: TIMEOUT,  value: {{ .Values.completionTimeoutSeconds | quote }} }
+                  - name: API_KEY
+                    valueFrom:
+                      secretKeyRef:
+                        name: stack-canary
+                        key: apiKey
+                resources:
+                  requests: { cpu: 10m, memory: 32Mi }
+                  limits: { memory: 64Mi }
+                # Ready only if the LAST check passed and is recent. Three misses = not ready.
+                readinessProbe:
+                  exec:
+                    command:
+                      - sh
+                      - -c
+                      - 'set -- $(cat /tmp/status 2>/dev/null); [ "${1:-}" = ok ] && [ $(( $(date +%s) - ${2:-0} )) -lt $(( INTERVAL * 3 )) ]'
+                  initialDelaySeconds: 5
+                  periodSeconds: 15
+                  failureThreshold: 3
+                  successThreshold: 1
+                volumeMounts:
+                  - { name: check, mountPath: /etc/canary, readOnly: true }
+                  - { name: tmp,   mountPath: /tmp }
+            volumes:
+              - name: check
+                configMap:
+                  name: stack-canary
+              - name: tmp
+                emptyDir: {}
+      {{- define "canary.check" -}}
+      #!/bin/sh
+      # Loop forever: one real completion + one gateway readiness check per interval.
+      # /tmp/status = "<ok|fail> <epoch> <detail>", read by the readiness probe.
+      BASE="${BASE%/}"
+      auth() { if [ -n "${API_KEY:-}" ]; then printf 'Authorization: Bearer %s' "$API_KEY"; else printf 'X-OpenClaw-Stack: canary'; fi; }
+      body=$(jq -cn --arg m "$MODEL" '{model:$m, max_tokens:8, temperature:0,
+        messages:[{role:"user",content:"Reply with the single word: pong"}]}')
+      while :; do
+        start=$(date +%s)
+        model=fail; gw=fail; detail=""
+        resp=$(curl -s -m "$TIMEOUT" -H "$(auth)" -X POST "$BASE/chat/completions" \
+          -H 'Content-Type: application/json' -d "$body" 2>/dev/null || true)
+        if printf '%s' "$resp" | jq -e '.choices[0].message' >/dev/null 2>&1; then
+          model=ok
+        else
+          detail="model: $(printf '%s' "$resp" | head -c 120 | tr '\n' ' ')"
+        fi
+        if curl -sf -m 10 "$OPENCLAW/readyz" 2>/dev/null | jq -e '.ready == true' >/dev/null 2>&1; then
+          gw=ok
+        else
+          detail="$detail gateway: /readyz not ready"
+        fi
+        took=$(( $(date +%s) - start ))
+        if [ "$model" = ok ] && [ "$gw" = ok ]; then
+          printf 'ok %s model=ok gateway=ok %ss\n' "$(date +%s)" "$took" > /tmp/status.tmp
+          echo "$(date -u +%FT%TZ) ok model=ok gateway=ok completion=${took}s"
+        else
+          printf 'fail %s model=%s gateway=%s\n' "$(date +%s)" "$model" "$gw" > /tmp/status.tmp
+          echo "$(date -u +%FT%TZ) FAIL model=$model gateway=$gw $detail"
+        fi
+        mv /tmp/status.tmp /tmp/status
+        sleep "$INTERVAL"
+      done
+      {{- end -}}
