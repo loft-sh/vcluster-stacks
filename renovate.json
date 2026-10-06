@@ -28,6 +28,32 @@
       "matchStrings": [
         "# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+)(?: extractVersion=(?<extractVersion>\\S+))?\\s+[^\\n]*?'(?<currentValue>[^']+)'"
       ]
+    },
+    {
+      "customType": "regex",
+      "description": "OpenClaw: container images pinned as parameter defaults in the StackTemplate and Apps",
+      "fileMatch": ["^community-stacks/openclaw/stacktemplate\\.yaml$", "^community-stacks/openclaw/apps/.+\\.yaml$"],
+      "matchStrings": [
+        "# renovate: datasource=docker depName=(?<depName>\\S+)\\s+defaultValue: \"?[^\\s\":]+:(?<currentValue>[^\\s\"]+)\"?"
+      ],
+      "datasourceTemplate": "docker"
+    },
+    {
+      "customType": "regex",
+      "description": "OpenClaw: npm packages pinned as parameter defaults in the StackTemplate and Apps",
+      "fileMatch": ["^community-stacks/openclaw/stacktemplate\\.yaml$", "^community-stacks/openclaw/apps/.+\\.yaml$"],
+      "matchStrings": [
+        "# renovate: datasource=npm depName=(?<depName>\\S+)\\s+defaultValue: \"?(?<currentValue>[^\\s\"]+)\"?"
+      ],
+      "datasourceTemplate": "npm"
+    },
+    {
+      "customType": "regex",
+      "description": "OpenClaw: vCluster version pinned in the tenant cluster template",
+      "fileMatch": ["^community-stacks/openclaw/virtualclustertemplate\\.yaml$"],
+      "matchStrings": [
+        "# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+)(?: extractVersion=(?<extractVersion>\\S+))?\\s+version: \"?(?<currentValue>[^\\s\"]+)\"?"
+      ]
     }
   ]
 }

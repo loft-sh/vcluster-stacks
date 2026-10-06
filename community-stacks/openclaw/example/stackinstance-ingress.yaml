@@ -1,0 +1,30 @@
+# OpenClaw behind the cluster's ingress controller with TLS. The gateway keeps token auth; the
+# first browser from each device is approved once (see README, "Access modes"). Set ingressHost
+# to a name that resolves to your ingress controller and ingressTlsSecret to a TLS Secret in the
+# openclaw namespace (or let a cert-manager annotation create it). Apply with
+# `-n <project namespace>`.
+apiVersion: management.loft.sh/v1
+kind: StackInstance
+metadata:
+  name: openclaw
+spec:
+  displayName: OpenClaw (Ingress)
+  owner:
+    user: admin
+  destination:
+    virtualCluster:
+      name: my-tenant-cluster
+  templateRef:
+    name: openclaw
+  parameters:
+    accessMode: ingress
+    ingressClassName: nginx
+    ingressHost: claw.example.com
+    ingressTlsSecret: openclaw-tls
+    ingressAnnotations: |-
+      cert-manager.io/cluster-issuer:letsencrypt
+      nginx.ingress.kubernetes.io/proxy-read-timeout:3600
+    requireCpuNode: "true"
+    agentName: Claw
+    userName: Alex
+  prunePolicy: Prune

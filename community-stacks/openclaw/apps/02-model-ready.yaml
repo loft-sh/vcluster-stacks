@@ -1,0 +1,279 @@
+# Step 2 of the OpenClaw stack: the readiness gate for the model endpoint.
+#
+# A Helm post-install hook Job that waits until the model answers, sends one chat completion WITH
+# a tool definition to see whether the model (and, for vLLM, its parser) produce a tool call
+# (OpenClaw is useless without tool calling), and records both in the `vllm-model` ConfigMap,
+# which the StackTemplate publishes as the modelId and modelToolCalling outputs. On timeout it
+# exits 1, so the stack shows WHY instead of reporting a broken tenant as Healthy.
+#
+# Backends (parameter modelBackend):
+#   vllm      wait until /v1/models lists the served model (download and load take 10-20 min), then
+#             test tool calling; on timeout print the vLLM pod state and log tail. deadlineSeconds
+#             stays under the Platform's 30 minute deploy cap; if the first download is slower the
+#             AppInstance retries (1, 5, 15 min later) and the second run succeeds against the
+#             by-then cached weights.
+#   external  an OpenAI-compatible endpoint that already exists: retry one small completion until
+#             it answers, so a wrong URL, key or model id fails HERE, before OpenClaw starts.
+#
+# The API key reaches the Job only through a Secret and is never printed.
+#
+# `wait: true` is what makes Helm block on the hook Job (hooks are synchronous), so `timeout`
+# here must be above the Job deadline.
+#
+# The image is the Platform's own (Alpine with curl, jq, kubectl), injected as __image__.
+apiVersion: management.loft.sh/v1
+kind: App
+metadata:
+  name: openclaw-step-02-model-ready
+  labels:
+    app.kubernetes.io/part-of: openclaw-stack
+spec:
+  displayName: "[OpenClaw Step - 2] Model readiness gate"
+  description: Waits for the model endpoint to answer, checks tool calling, records the result.
+  access:
+    - users: ["*"]
+      verbs: ["get"]
+  defaultNamespace: openclaw
+  wait: true
+  timeout: 30m
+  parameters:
+    - variable: servedModelName
+      label: Model id
+      description: The model id the endpoint serves (vLLM --served-model-name, or the model name your external endpoint expects).
+      type: string
+      required: true
+      defaultValue: qwen3.8-27b
+    - variable: modelBaseUrl
+      label: Model base URL
+      description: OpenAI-compatible base URL ending in /v1.
+      type: string
+      required: true
+      defaultValue: http://vllm.openclaw.svc:8000/v1
+    - variable: modelBackend
+      label: Model backend
+      description: vllm waits for the in-cluster server and prints its logs on failure. external retries one completion against the endpoint.
+      type: string
+      required: true
+      options: ["vllm", "external"]
+      defaultValue: vllm
+    - variable: modelApiKey
+      label: Model API key
+      description: Bearer token for the endpoint, stored in a Secret. Empty sends no Authorization header.
+      type: password
+      required: false
+      defaultValue: ""
+    - variable: deadlineSeconds
+      label: Deadline (seconds)
+      description: How long to wait for the model. Keep under 1740 (the Platform's 30 min deploy cap).
+      type: number
+      required: true
+      defaultValue: "1680"
+  config:
+    chart: {}
+    manifests: |
+      {{- $ns := "openclaw" }}
+      {{- $name := .Release.Name }}
+      apiVersion: v1
+      kind: ServiceAccount
+      metadata:
+        name: model-ready-{{ $name }}
+        namespace: {{ $ns }}
+        annotations:
+          "helm.sh/hook": pre-install,pre-upgrade
+          "helm.sh/hook-weight": "-5"
+          "helm.sh/hook-delete-policy": before-hook-creation
+      ---
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: Role
+      metadata:
+        name: model-ready-{{ $name }}
+        namespace: {{ $ns }}
+        annotations:
+          "helm.sh/hook": pre-install,pre-upgrade
+          "helm.sh/hook-weight": "-5"
+          "helm.sh/hook-delete-policy": before-hook-creation
+      rules:
+        - apiGroups: [""]
+          resources: ["configmaps"]
+          verbs: ["get", "patch"]
+        # Diagnostics on failure only (vLLM backend).
+        - apiGroups: [""]
+          resources: ["pods", "pods/log"]
+          verbs: ["get", "list"]
+        - apiGroups: ["apps"]
+          resources: ["deployments"]
+          verbs: ["get"]
+      ---
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: RoleBinding
+      metadata:
+        name: model-ready-{{ $name }}
+        namespace: {{ $ns }}
+        annotations:
+          "helm.sh/hook": pre-install,pre-upgrade
+          "helm.sh/hook-weight": "-5"
+          "helm.sh/hook-delete-policy": before-hook-creation
+      subjects:
+        - kind: ServiceAccount
+          name: model-ready-{{ $name }}
+          namespace: {{ $ns }}
+      roleRef:
+        kind: Role
+        name: model-ready-{{ $name }}
+        apiGroup: rbac.authorization.k8s.io
+      ---
+      # The endpoint credential, only ever mounted into the hook Job as an env var.
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: model-ready-{{ $name }}
+        namespace: {{ $ns }}
+        annotations:
+          "helm.sh/hook": pre-install,pre-upgrade
+          "helm.sh/hook-weight": "-5"
+          "helm.sh/hook-delete-policy": before-hook-creation
+      type: Opaque
+      stringData:
+        apiKey: {{ .Values.modelApiKey | quote }}
+      ---
+      # Release resource (Helm-owned, so it is pruned with the stack). The hook Job fills it in.
+      # Pre-created with empty values; the stack only reads it after the task is Healthy, which
+      # is after the hook has completed.
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: vllm-model
+        namespace: {{ $ns }}
+      data:
+        id: ""
+        toolcalls: ""
+        checkedAt: ""
+      ---
+      apiVersion: batch/v1
+      kind: Job
+      metadata:
+        name: model-ready-{{ $name }}
+        namespace: {{ $ns }}
+        annotations:
+          "helm.sh/hook": post-install,post-upgrade
+          "helm.sh/hook-weight": "0"
+          "helm.sh/hook-delete-policy": before-hook-creation
+      spec:
+        backoffLimit: 0
+        template:
+          spec:
+            serviceAccountName: model-ready-{{ $name }}
+            restartPolicy: Never
+            enableServiceLinks: false
+            securityContext:
+              runAsNonRoot: true
+              seccompProfile:
+                type: RuntimeDefault
+            containers:
+              - name: check
+                image: {{ .Values.__image__ | quote }}
+                securityContext:
+                  allowPrivilegeEscalation: false
+                  readOnlyRootFilesystem: true
+                  capabilities:
+                    drop: ["ALL"]
+                resources:
+                  requests: { cpu: 50m, memory: 64Mi }
+                  limits: { cpu: 500m, memory: 256Mi }
+                env:
+                  # kubectl needs a writable cache dir.
+                  - name: HOME
+                    value: /tmp
+                  - name: KUBECACHEDIR
+                    value: /tmp/.kube-cache
+                  - name: NS
+                    value: {{ $ns | quote }}
+                  - name: MODEL
+                    value: {{ .Values.servedModelName | quote }}
+                  - name: BASE
+                    value: {{ .Values.modelBaseUrl | quote }}
+                  - name: BACKEND
+                    value: {{ .Values.modelBackend | quote }}
+                  - name: DEADLINE
+                    value: {{ .Values.deadlineSeconds | quote }}
+                  - name: API_KEY
+                    valueFrom:
+                      secretKeyRef:
+                        name: model-ready-{{ $name }}
+                        key: apiKey
+                command: ["sh", "-c"]
+                args:
+                  - |
+      {{ include "openclaw.modelready" . | indent 14 }}
+                volumeMounts:
+                  - { name: tmp, mountPath: /tmp }
+            volumes:
+              - name: tmp
+                emptyDir: {}
+      {{- define "openclaw.modelready" -}}
+      set -eu
+      end=$(( $(date +%s) + DEADLINE ))
+      BASE="${BASE%/}"
+      # Either the bearer header or a harmless one, so curl always gets exactly one -H "$(auth)".
+      auth() { if [ -n "${API_KEY:-}" ]; then printf 'Authorization: Bearer %s' "$API_KEY"; else printf 'X-OpenClaw-Stack: model-ready'; fi; }
+
+      give_up() {
+        echo "model '$MODEL' at $BASE did not answer within ${DEADLINE}s." >&2
+        if [ "$BACKEND" = vllm ]; then
+          echo "--- pods (app=vllm)" >&2
+          kubectl -n "$NS" get pods -l app=vllm -o wide >&2 || true
+          echo "--- container state" >&2
+          kubectl -n "$NS" get pods -l app=vllm -o jsonpath='{range .items[*]}{.metadata.name}{": "}{.status.containerStatuses[0].state}{"\n"}{end}' >&2 || true
+          echo "--- log tail" >&2
+          kubectl -n "$NS" logs deploy/vllm --tail=60 >&2 || true
+        else
+          echo "Check externalBaseUrl, externalApiKey and the model id. Last response:" >&2
+          printf '%s' "${last:-<none>}" | head -c 800 >&2; echo >&2
+        fi
+        exit 1
+      }
+
+      ping=$(jq -cn --arg m "$MODEL" '{model:$m, max_tokens:8, temperature:0,
+        messages:[{role:"user",content:"Reply with the single word: pong"}]}')
+      last=""
+      while :; do
+        if [ "$BACKEND" = vllm ]; then
+          # Listing is free; a completion against a loading server would just hang.
+          if curl -sf -m 10 -H "$(auth)" "$BASE/models" | jq -e --arg m "$MODEL" '.data[]? | select(.id == $m)' >/dev/null 2>&1; then
+            break
+          fi
+        else
+          last=$(curl -s -m 60 -H "$(auth)" -X POST "$BASE/chat/completions" -H 'Content-Type: application/json' -d "$ping" || true)
+          if printf '%s' "$last" | jq -e '.choices[0].message' >/dev/null 2>&1; then
+            break
+          fi
+        fi
+        if [ "$(date +%s)" -ge "$end" ]; then give_up; fi
+        echo "waiting for $MODEL at $BASE ..."
+        sleep 15
+      done
+      echo "model $MODEL answers at $BASE"
+
+      # Tool-calling smoke test. Recorded, not asserted: a model that answers but does not call the
+      # tool still yields a usable (if weaker) OpenClaw, and the result is published so it is visible.
+      body=$(jq -cn --arg m "$MODEL" '{
+        model: $m,
+        messages: [{role: "user", content: "What is the weather in Paris right now? You must use the get_weather tool to find out."}],
+        tools: [{type: "function", function: {name: "get_weather", description: "Get the current weather for a city",
+                 parameters: {type: "object", properties: {city: {type: "string"}}, required: ["city"]}}}],
+        max_tokens: 1024, temperature: 0 }')
+      resp=$(curl -s -m 600 -H "$(auth)" -X POST "$BASE/chat/completions" -H 'Content-Type: application/json' -d "$body" || echo '{}')
+      tool=$(printf '%s' "$resp" | jq -r '.choices[0].message.tool_calls[0].function.name // empty' 2>/dev/null || true)
+      if [ "$tool" = "get_weather" ]; then
+        toolcalls=ok
+        echo "tool calling works (model called get_weather)"
+      else
+        toolcalls=missing
+        echo "WARNING: no tool call in the response. For vLLM check --tool-call-parser. Response head:" >&2
+        printf '%s' "$resp" | head -c 800 >&2; echo >&2
+      fi
+
+      kubectl -n "$NS" patch configmap vllm-model --type merge \
+        -p "{\"data\":{\"id\":\"$MODEL\",\"toolcalls\":\"$toolcalls\",\"checkedAt\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}}"
+      echo "recorded in configmap vllm-model"
+      {{- end -}}

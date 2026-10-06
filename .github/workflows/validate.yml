@@ -18,12 +18,14 @@ on:
     paths:
       - 'certified-stacks/run-ai/**'
       - 'certified-stacks/nvidia-dynamo/**'
+      - 'community-stacks/openclaw/**'
       - '.github/workflows/validate.yml'
   pull_request:
     branches: [main]
     paths:
       - 'certified-stacks/run-ai/**'
       - 'certified-stacks/nvidia-dynamo/**'
+      - 'community-stacks/openclaw/**'
       - '.github/workflows/validate.yml'
 
 permissions:
@@ -69,6 +71,8 @@ jobs:
         run: ./certified-stacks/run-ai/render.sh --check
       - name: Check NVIDIA Dynamo manifests
         run: ./certified-stacks/nvidia-dynamo/test-certified-manifests.sh
+      - name: Check OpenClaw manifests
+        run: ./community-stacks/openclaw/test-manifests.sh
       - name: Start vCluster Platform
         env:
           # Fail inside the job's timeout so the diagnostics step below can run. Default is 10m.
@@ -116,10 +120,31 @@ jobs:
           done < <(kubectl get pods -A -l app=loft -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name}{"\n"}{end}')
       - name: Validate manifests
         run: |
-          for directory in certified-stacks/run-ai/dedicated-control-plane certified-stacks/run-ai/central-control-plane certified-stacks/nvidia-dynamo; do
-            kubectl delete --ignore-not-found --recursive --filename "$directory"
+          directories=(
+            certified-stacks/run-ai/dedicated-control-plane
+            certified-stacks/run-ai/central-control-plane
+            certified-stacks/nvidia-dynamo
+            community-stacks/openclaw
+          )
+          # NUL-separated *.yaml/*.yml files under $1 whose top-level documents are Platform
+          # objects (apiVersion <group>.loft.sh/...). Supporting plain Kubernetes manifests, such
+          # as a test model endpoint, are skipped: the management API does not serve core kinds.
+          platform_manifests() {
+            find "$1" -type f \( -name '*.yaml' -o -name '*.yml' \) -print0 | sort -z |
+              while IFS= read -r -d '' manifest; do
+                if grep -qE '^apiVersion: [a-z]+\.loft\.sh/' "$manifest"; then
+                  printf '%s\0' "$manifest"
+                else
+                  echo "Skip $manifest: no loft.sh object" >&2
+                fi
+              done
+          }
+          for directory in "${directories[@]}"; do
+            while IFS= read -r -d '' manifest; do
+              kubectl delete --ignore-not-found --filename "$manifest"
+            done < <(platform_manifests "$directory")
           done
-          for directory in certified-stacks/run-ai/dedicated-control-plane certified-stacks/run-ai/central-control-plane certified-stacks/nvidia-dynamo; do
+          for directory in "${directories[@]}"; do
             while IFS= read -r -d '' manifest; do
               echo "::group::Validate $manifest"
               status=0
@@ -131,5 +156,5 @@ jobs:
                 --filename "$manifest" || status=$?
               echo "::endgroup::"
               [ "$status" -eq 0 ] || exit "$status"
-            done < <(find "$directory" -type f \( -name '*.yaml' -o -name '*.yml' \) -print0 | sort -z)
+            done < <(platform_manifests "$directory")
           done

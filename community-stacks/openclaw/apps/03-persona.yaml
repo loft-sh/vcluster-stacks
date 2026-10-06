@@ -1,0 +1,294 @@
+# Step 3 of the OpenClaw stack: who the agent is and who it works for.
+#
+# Renders SOUL.md (voice, boundaries), IDENTITY.md (name, emoji) and USER.md (about the user) from
+# the stack parameters into the `openclaw-persona` ConfigMap, and applies them to the workspace of
+# a RUNNING gateway with kubectl exec, so a persona change takes effect on the agent's next turn
+# without a restart (OpenClaw re-reads these files every turn).
+#
+# On a FRESH install this task runs before the gateway exists and only writes the ConfigMap; the
+# gateway pod's seed step (apps/04-gateway.yaml) copies the files into the workspace at boot,
+# before OpenClaw seeds its stock files. A workspace whose SOUL.md/IDENTITY.md/USER.md differ from
+# the stock templates counts as configured, so the first-run "who am I" ritual (BOOTSTRAP.md)
+# never runs.
+#
+# Ownership rule: the files are (re)written only when the rendered content changes. The
+# ConfigMap carries a sha of the three files; both this Job and the seed step compare it with
+# the marker $STATE/.stack-persona-sha and skip when equal. What the agent adds to USER.md or
+# IDENTITY.md on its own survives restarts until the stack parameters change.
+#
+# The image is the Platform's own (curl, jq, kubectl), injected as __image__.
+apiVersion: management.loft.sh/v1
+kind: App
+metadata:
+  name: openclaw-step-03-persona
+  labels:
+    app.kubernetes.io/part-of: openclaw-stack
+spec:
+  displayName: "[OpenClaw Step - 3] Persona (SOUL.md, IDENTITY.md, USER.md)"
+  description: The agent's name, emoji and soul, and the user's profile, applied to the OpenClaw workspace.
+  access:
+    - users: ["*"]
+      verbs: ["get"]
+  defaultNamespace: openclaw
+  wait: true
+  timeout: 10m
+  parameters:
+    - variable: agentName
+      label: Agent name
+      type: string
+      required: true
+      defaultValue: Claw
+      validation: '^[A-Za-z0-9][A-Za-z0-9 ._-]{0,39}$'
+    - variable: agentEmoji
+      label: Agent emoji
+      description: Written to IDENTITY.md; the gateway shows the same one in the UI.
+      type: string
+      required: true
+      defaultValue: "🦀"
+      validation: '^.{1,8}$'
+    - variable: agentSoul
+      label: SOUL.md
+      description: The agent's personality, written to SOUL.md verbatim.
+      type: multiline
+      required: true
+      defaultValue: |-
+        # SOUL.md - Who You Are
+
+        You are a helpful, friendly assistant with a personality of your own.
+    - variable: userName
+      label: User name
+      type: string
+      required: true
+      defaultValue: Operator
+    - variable: userProfile
+      label: About the user
+      description: One fact per line (Location, Preferences, ...). Becomes the Profile section of USER.md.
+      type: multiline
+      required: false
+      defaultValue: ""
+    - variable: userTimezone
+      label: User timezone
+      description: IANA name such as Europe/Berlin. Written to USER.md; the gateway uses the same one for dates. Empty omits it.
+      type: string
+      required: false
+      defaultValue: ""
+      validation: '^$|^UTC$|^[A-Za-z]+(/[A-Za-z0-9_+-]+)+$'
+    - variable: workspaceDir
+      label: OpenClaw workspace directory
+      type: string
+      required: true
+      defaultValue: /home/node/.openclaw/workspace
+    - variable: stateDir
+      label: OpenClaw state directory
+      type: string
+      required: true
+      defaultValue: /home/node/.openclaw
+  config:
+    chart: {}
+    manifests: |
+      {{- $ns := "openclaw" }}
+      {{- $name := .Release.Name }}
+      {{- $identity := include "persona.identity" . }}
+      {{- $user := include "persona.user" . }}
+      {{- $sha := printf "%s\n%s\n%s" .Values.agentSoul $identity $user | sha256sum }}
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: openclaw-persona
+        namespace: {{ $ns }}
+      data:
+        # Changes only when one of the three files changes: the stack's persona version.
+        sha: {{ $sha | quote }}
+        SOUL.md: |
+      {{ .Values.agentSoul | indent 4 }}
+        IDENTITY.md: |
+      {{ $identity | indent 4 }}
+        USER.md: |
+      {{ $user | indent 4 }}
+      ---
+      apiVersion: v1
+      kind: ServiceAccount
+      metadata:
+        name: persona-{{ $name }}
+        namespace: {{ $ns }}
+        annotations:
+          "helm.sh/hook": pre-install,pre-upgrade
+          "helm.sh/hook-weight": "-5"
+          "helm.sh/hook-delete-policy": before-hook-creation
+      ---
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: Role
+      metadata:
+        name: persona-{{ $name }}
+        namespace: {{ $ns }}
+        annotations:
+          "helm.sh/hook": pre-install,pre-upgrade
+          "helm.sh/hook-weight": "-5"
+          "helm.sh/hook-delete-policy": before-hook-creation
+      rules:
+        - apiGroups: [""]
+          resources: ["configmaps"]
+          verbs: ["get"]
+        - apiGroups: [""]
+          resources: ["pods"]
+          verbs: ["get", "list"]
+        - apiGroups: [""]
+          resources: ["pods/exec"]
+          verbs: ["create"]
+      ---
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: RoleBinding
+      metadata:
+        name: persona-{{ $name }}
+        namespace: {{ $ns }}
+        annotations:
+          "helm.sh/hook": pre-install,pre-upgrade
+          "helm.sh/hook-weight": "-5"
+          "helm.sh/hook-delete-policy": before-hook-creation
+      subjects:
+        - kind: ServiceAccount
+          name: persona-{{ $name }}
+          namespace: {{ $ns }}
+      roleRef:
+        kind: Role
+        name: persona-{{ $name }}
+        apiGroup: rbac.authorization.k8s.io
+      ---
+      apiVersion: batch/v1
+      kind: Job
+      metadata:
+        name: persona-{{ $name }}
+        namespace: {{ $ns }}
+        annotations:
+          "helm.sh/hook": post-install,post-upgrade
+          "helm.sh/hook-weight": "0"
+          "helm.sh/hook-delete-policy": before-hook-creation
+      spec:
+        backoffLimit: 0
+        template:
+          spec:
+            serviceAccountName: persona-{{ $name }}
+            restartPolicy: Never
+            enableServiceLinks: false
+            securityContext:
+              runAsNonRoot: true
+              seccompProfile:
+                type: RuntimeDefault
+            containers:
+              - name: apply
+                image: {{ .Values.__image__ | quote }}
+                securityContext:
+                  allowPrivilegeEscalation: false
+                  readOnlyRootFilesystem: true
+                  capabilities:
+                    drop: ["ALL"]
+                resources:
+                  requests: { cpu: 50m, memory: 64Mi }
+                  limits: { cpu: 500m, memory: 256Mi }
+                env:
+                  - name: HOME
+                    value: /tmp
+                  - name: KUBECACHEDIR
+                    value: /tmp/.kube-cache
+                  - name: NS
+                    value: {{ $ns | quote }}
+                  - name: WS
+                    value: {{ .Values.workspaceDir | quote }}
+                  - name: STATE
+                    value: {{ .Values.stateDir | quote }}
+                  - name: SHA
+                    value: {{ $sha | quote }}
+                command: ["sh", "-c"]
+                args:
+                  - |
+      {{ include "persona.apply" . | indent 14 }}
+                volumeMounts:
+                  - { name: tmp,     mountPath: /tmp }
+                  - { name: persona, mountPath: /etc/openclaw-persona, readOnly: true }
+            volumes:
+              - name: tmp
+                emptyDir: {}
+              - name: persona
+                configMap:
+                  name: openclaw-persona
+      {{- define "persona.identity" -}}
+      # IDENTITY.md - Who Am I?
+
+      - **Name:** {{ .Values.agentName }}
+      - **Creature:** AI assistant
+      - **Vibe:** warm, direct, competent
+      - **Emoji:** {{ .Values.agentEmoji }}
+      {{- end -}}
+      {{- define "persona.user" -}}
+      # USER.md - User Model
+
+      ## Profile
+
+      - Name: {{ .Values.userName }}
+      {{- if .Values.userTimezone }}
+      - Timezone: {{ .Values.userTimezone }}
+      {{- end }}
+      {{- range $line := splitList "\n" (.Values.userProfile | default "") }}
+      {{- $l := trim $line }}
+      {{- if $l }}
+      - {{ $l }}
+      {{- end }}
+      {{- end }}
+
+      ## Directives
+
+      <!-- observed: stack install | status: active -->
+
+      - Always address the user as {{ .Values.userName }}.
+      {{- end -}}
+      {{- define "persona.apply" -}}
+      set -eu
+
+      # Pick a Ready gateway pod that is NOT terminating (this hook often runs while the openclaw
+      # task is rolling its pod, and exec into a dying pod fails). No gateway pods at all means a
+      # fresh install: the pod's seed step applies the files at boot. Pods that exist but are
+      # not Ready yet are waited for. Every exec is retried against a freshly chosen pod.
+      pick_pod() {
+        kubectl -n "$NS" get pods -l app=openclaw -o json 2>/dev/null | jq -r '
+          [.items[] | select(.metadata.deletionTimestamp == null and .status.phase == "Running"
+             and any(.status.conditions[]?; .type == "Ready" and .status == "True"))]
+          | .[0].metadata.name // empty'
+      }
+      any_pod() {
+        kubectl -n "$NS" get pods -l app=openclaw -o json 2>/dev/null \
+          | jq -r '[.items[] | select(.metadata.deletionTimestamp == null)] | length'
+      }
+      apply_to() { # $1 = pod
+        have="$(kubectl -n "$NS" exec "$1" -c gateway -- sh -c "cat '$STATE/.stack-persona-sha' 2>/dev/null" || true)"
+        if [ "$have" = "$SHA" ]; then
+          echo "persona $SHA already applied in $1"
+          return 0
+        fi
+        for f in SOUL.md IDENTITY.md USER.md; do
+          kubectl -n "$NS" exec -i "$1" -c gateway -- sh -c "mkdir -p '$WS' && cat > '$WS/$f' && chmod 600 '$WS/$f'" \
+            < "/etc/openclaw-persona/$f" || return 1
+          echo "wrote $WS/$f"
+        done
+        printf '%s' "$SHA" | kubectl -n "$NS" exec -i "$1" -c gateway -- sh -c "cat > '$STATE/.stack-persona-sha'" || return 1
+        echo "persona $SHA applied to $1 (live; takes effect on the next turn)"
+      }
+
+      attempt=0
+      while :; do
+        attempt=$((attempt + 1))
+        if [ "$(any_pod)" = "0" ]; then
+          echo "no gateway pod; persona $SHA will be applied by the pod's seed step at boot"
+          exit 0
+        fi
+        pod="$(pick_pod)"
+        if [ -n "$pod" ] && apply_to "$pod"; then
+          exit 0
+        fi
+        if [ "$attempt" -ge 60 ]; then
+          echo "gave up after $attempt attempts: no Ready gateway pod accepted the persona" >&2
+          exit 1
+        fi
+        [ -n "$pod" ] && echo "apply to $pod failed (pod rolling?), retrying" || echo "gateway pod not Ready yet, waiting"
+        sleep 5
+      done
+      {{- end -}}

@@ -1,0 +1,34 @@
+# Installs OpenClaw into an existing tenant cluster with one NVIDIA GPU, in the default access
+# mode (port-forward). Apply it in the project namespace that owns the tenant cluster, for example
+# `kubectl apply -n p-default -f example/stackinstance.yaml`.
+#
+# Every parameter has a default; the ones below are the ones most installs want to set. Keep your
+# real values (profile, tokens) in an untracked copy such as my-instance.yaml.
+#
+# spec.owner is required (every task fails with MissingOwner without it) and, like
+# spec.destination, immutable: to move the stack, delete and recreate.
+apiVersion: management.loft.sh/v1
+kind: StackInstance
+metadata:
+  name: openclaw
+spec:
+  displayName: OpenClaw
+  owner:
+    user: admin
+  destination:
+    virtualCluster:
+      name: my-tenant-cluster
+  templateRef:
+    name: openclaw
+  parameters:
+    # Keep OpenClaw and its state off the GPU node; needs a non-GPU node in the tenant.
+    requireCpuNode: "true"
+    # Persona. SOUL.md keeps the template default.
+    agentName: Claw
+    userName: Alex
+    userTimezone: Europe/Berlin
+    userProfile: |-
+      Location: Berlin, Germany
+      Preferences: short answers, first-name basis
+  # Delete child AppInstances when a template update removes a task.
+  prunePolicy: Prune

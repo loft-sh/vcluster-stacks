@@ -1,0 +1,30 @@
+# OpenClaw on a tenant cluster WITHOUT a GPU, talking to an existing OpenAI-compatible endpoint.
+# No vLLM is installed; the vLLM parameters are ignored. Set the model id your endpoint expects
+# and whether it accepts images and has a thinking mode. Provide the API key in the Platform UI
+# or at apply time; never commit it. Apply with `-n <project namespace>`.
+apiVersion: management.loft.sh/v1
+kind: StackInstance
+metadata:
+  name: openclaw
+spec:
+  displayName: OpenClaw (external model)
+  owner:
+    user: admin
+  destination:
+    virtualCluster:
+      name: my-tenant-cluster
+  templateRef:
+    name: openclaw
+  parameters:
+    modelBackend: external
+    externalBaseUrl: https://api.example.com/v1
+    # externalApiKey: <set it in the UI or at apply time; a committed value is a leaked key>
+    servedModelName: my-model
+    maxModelLen: "128000"
+    maxTokens: "8192"
+    modelVision: "false"
+    modelReasoning: "false"
+    thinkingFormat: none
+    agentName: Claw
+    userName: Alex
+  prunePolicy: Prune

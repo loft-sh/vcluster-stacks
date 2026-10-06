@@ -1,0 +1,1046 @@
+# Step 4 of the OpenClaw stack: the gateway itself, with lossless-claw (LCM) as its context
+# engine, and the front door the access mode asks for.
+#
+# ACCESS MODES (parameter accessMode)
+#
+#   port-forward (default)  No proxy, no NodePort. The gateway binds all pod interfaces with
+#                           token auth; the Service is a ClusterIP to port 18789. Reach it with
+#                             kubectl -n openclaw port-forward svc/openclaw <localPort>:80
+#                           and open http://localhost:<localPort>/. The token is generated once by
+#                           the seed step, kept on the state volume, mirrored into Secret
+#                           openclaw-gateway-token and published as the dashboardToken output
+#                           (dashboardLink carries it as a URL fragment). Cluster access is the
+#                           gate; the browser peer is loopback, so device pairing auto-approves.
+#   ingress                 For clusters with an ingress controller. An Ingress for ingressHost
+#                           (TLS from ingressTlsSecret) reaches the nginx sidecar, which is the
+#                           gateway's trusted proxy; the gateway keeps token auth. The first
+#                           browser from a non-loopback address must be approved once
+#                           (`openclaw devices approve`), which is the second factor next to the
+#                           token; restrict the Ingress further with annotations (source-range
+#                           allowlist, an auth proxy). dashboardLink deliberately carries no
+#                           token here: the host is public.
+#   nodeport                The IP-allowlist design below; no token, the allowlist is the gate.
+#
+# HOW NODEPORT ACCESS WORKS
+#
+#   browser --> NodePort (externalTrafficPolicy: Local, so the real client IP arrives)
+#           --> nginx sidecar :8080  allow <allowedCidr> + 127.0.0.1, deny everything else
+#           --> gateway 127.0.0.1:18789  (OpenClaw binds loopback only; nobody else can reach it)
+#
+# OpenClaw runs in `trusted-proxy` auth mode: nginx is the only thing that can reach the gateway
+# and it stamps `X-Forwarded-User: <operatorUser>` on every request, which OpenClaw maps to
+# operator.admin, and browsers carrying that identity are paired automatically
+# (deviceAutoApprove). Result: from the allowed IP the URL opens straight into the dashboard, no
+# token to paste and no device pairing. The ONLY access control is therefore the IP allowlist
+# (plus, on cloud providers, the firewall in front of the node). OpenClaw's own audit flags
+# operator.admin auto-approval as CRITICAL for exactly that reason; here it is the point.
+#
+# 127.0.0.1 is allowed by nginx so `kubectl port-forward` can reach /healthz. It cannot reach the
+# dashboard: OpenClaw refuses a proxy that attributes its client to a loopback address.
+#
+# MODEL
+#
+# The model is an OpenAI-compatible endpoint (modelBaseUrl) with a bearer key (modelApiKey, a
+# Secret, never in a ConfigMap): the stack's own vLLM (the key is then a placeholder, vLLM enforces
+# no auth) or an external service. The provider is registered under the fixed id `vllm` so an
+# existing instance's sessions keep resolving `vllm/<model>` when the backend changes.
+#
+# STATE
+#
+# Everything OpenClaw owns lives under /home/node/.openclaw on one PVC: openclaw.json, sessions,
+# the LCM SQLite database, the workspace and installed plugins. The seed init container writes the
+# keys this stack manages into openclaw.json on every start (deep-merge, so anything changed in
+# the UI under other keys survives) and the plugin init container installs lossless-claw once.
+#
+# The PVC is mounted at /home/node, NOT at /home/node/.openclaw, on purpose. A freshly provisioned
+# volume's root directory is owned by root (local-path and most CSI drivers; fsGroup does not
+# change the owner), and OpenClaw chmods its state directory while installing plugins, which fails
+# with EPERM on a directory it does not own. Mounted one level up, `.openclaw` is created by the
+# seed container as uid 1000 and everything works. It also makes ~/.cache writable, which OpenClaw
+# uses as its temp fallback.
+#
+# TMPDIR is a 0700 directory the seed container creates: OpenClaw refuses a world-writable temp
+# root without the sticky bit, and a Kubernetes emptyDir at /tmp is exactly that.
+#
+# THE PUBLISHED URL
+#
+# Private-nodes tenants have no cloud controller manager: no LoadBalancer, no ExternalIP on the
+# Node object. In nodeport mode the seed container asks the cloud metadata server (GCE, then AWS,
+# then Azure) for the node's public IP and falls back to the node's internal IP. It records the
+# result in the `openclaw-endpoint` ConfigMap, which the StackTemplate publishes. `reachability`
+# tells you which one you got: `public` or `internal` (internal = reachable only from inside the
+# node network or via port-forward), or `port-forward` / `ingress` in the other modes.
+#
+# PERSONA
+#
+# SOUL.md, IDENTITY.md and USER.md come from the persona task (apps/03-persona.yaml) via the
+# openclaw-persona ConfigMap. The seed step copies them into the workspace when the stack's
+# version (the ConfigMap's sha) differs from the marker .stack-persona-sha; otherwise the workspace
+# is left alone, so the agent's own edits survive restarts. The display name and emoji in the UI
+# come from agents.entries.main.identity (agentName, agentEmoji), which OpenClaw prefers over
+# IDENTITY.md.
+#
+# CHAT CHANNELS
+#
+# A Telegram bot token given as a stack input is rendered into Secret openclaw-channels, mounted
+# only into the seed step, written to $STATE/telegram-token (0600) and referenced from
+# channels.telegram.tokenFile, all before the gateway's first start, so the bot is live on boot.
+# The token never enters a ConfigMap, managed.json or the logs. With telegramAllowFrom set, those
+# Telegram user IDs are pre-authorized (no pairing code) and made command owners. An empty token
+# leaves `channels` untouched, so a bot added out-of-band survives restarts.
+#
+# Decide requireCpuNode BEFORE the first install: a node-local volume is bound to the node the
+# pod first landed on, so flipping it later means deleting the openclaw-state PVC (scale the
+# Deployment to 0 first) and letting a re-sync recreate it.
+#
+# EVERY parameter is passed explicitly by the StackTemplate task. An omitted one arrives EMPTY.
+apiVersion: management.loft.sh/v1
+kind: App
+metadata:
+  name: openclaw-step-04-gateway
+  labels:
+    app.kubernetes.io/part-of: openclaw-stack
+spec:
+  displayName: "[OpenClaw Step - 4] Gateway (OpenClaw + lossless-claw)"
+  description: OpenClaw gateway with the lossless-claw context engine, reachable by port-forward, Ingress or an IP-allowlisted NodePort.
+  access:
+    - users: ["*"]
+      verbs: ["get"]
+  defaultNamespace: openclaw
+  wait: true
+  timeout: 15m
+  parameters:
+    - variable: accessMode
+      label: Access mode
+      description: port-forward (kubectl, token auth), ingress (Ingress + token auth + one-time device approval) or nodeport (IP allowlist proxy).
+      type: string
+      required: true
+      options: ["port-forward", "nodeport", "ingress"]
+      defaultValue: port-forward
+    - variable: localPort
+      label: Local port for kubectl port-forward
+      description: Only used to build the published command and allowed origins. Not 18789, which a locally installed OpenClaw usually holds.
+      type: number
+      required: true
+      defaultValue: "28789"
+    - variable: allowedCidr
+      label: Allowed source CIDR (nodeport mode)
+      description: The only network allowed to open the dashboard, e.g. 203.0.113.7/32. Ignored in the other modes.
+      type: string
+      required: false
+      defaultValue: ""
+      validation: '^$|^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$'
+    - variable: operatorUser
+      label: Operator identity (nodeport mode)
+      description: Identity the proxy asserts to OpenClaw for every allowed request. Shown in the UI.
+      type: string
+      required: true
+      defaultValue: operator@openclaw.local
+    - variable: nodePort
+      label: NodePort (nodeport mode)
+      description: 30000-32767. The dashboard is http://<node ip>:<this port>/.
+      type: number
+      required: true
+      defaultValue: "30789"
+    - variable: ingressClassName
+      label: Ingress class (ingress mode)
+      description: Empty uses the cluster's default IngressClass.
+      type: string
+      required: false
+      defaultValue: ""
+    - variable: ingressHost
+      label: Ingress host (ingress mode)
+      description: DNS name the Ingress answers for, e.g. claw.example.com. Required in ingress mode.
+      type: string
+      required: false
+      defaultValue: ""
+      validation: '^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$'
+    - variable: ingressTlsSecret
+      label: Ingress TLS Secret (ingress mode)
+      description: Name of a TLS Secret in the openclaw namespace (or one cert-manager fills in). Empty serves plain HTTP; the token then travels unencrypted.
+      type: string
+      required: false
+      defaultValue: ""
+      validation: '^$|^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$'
+    - variable: ingressAnnotations
+      label: Ingress annotations (ingress mode)
+      description: One key:value per line, e.g. nginx.ingress.kubernetes.io/proxy-read-timeout:3600 for long WebSocket sessions, a cert-manager issuer, or a source-range allowlist.
+      type: multiline
+      required: false
+      defaultValue: ""
+    - variable: ingressScheme
+      label: Ingress scheme (ingress mode)
+      description: auto derives https from ingressTlsSecret; http or https force the scheme of the published URL and the allowed browser origins (TLS terminated in front of the Ingress).
+      type: string
+      required: true
+      options: ["auto", "http", "https"]
+      defaultValue: auto
+    - variable: image
+      label: OpenClaw image
+      type: string
+      required: true
+      # renovate: datasource=docker depName=ghcr.io/openclaw/openclaw
+      defaultValue: ghcr.io/openclaw/openclaw:2026.9.6
+    - variable: proxyImage
+      label: Proxy image
+      type: string
+      required: true
+      # renovate: datasource=docker depName=nginxinc/nginx-unprivileged
+      defaultValue: nginxinc/nginx-unprivileged:1.27-alpine
+    - variable: losslessClawVersion
+      label: lossless-claw version
+      description: npm version of @martian-engineering/lossless-claw (needs OpenClaw >= 2026.9.2).
+      type: string
+      required: true
+      # renovate: datasource=npm depName=@martian-engineering/lossless-claw
+      defaultValue: "1.1.0"
+    - variable: modelBaseUrl
+      label: Model base URL
+      description: OpenAI-compatible base URL ending in /v1.
+      type: string
+      required: true
+      defaultValue: http://vllm.openclaw.svc:8000/v1
+    - variable: modelBackend
+      label: Model backend
+      description: Shown next to the model name in the UI.
+      type: string
+      required: true
+      options: ["vllm", "external"]
+      defaultValue: vllm
+    - variable: modelApiKey
+      label: Model API key
+      description: Bearer token for the endpoint, stored in a Secret and injected as an env var. OpenClaw needs a non-empty value even for an unauthenticated vLLM.
+      type: password
+      required: false
+      defaultValue: ""
+    - variable: modelId
+      label: Model id
+      type: string
+      required: true
+      defaultValue: qwen3.8-27b
+    - variable: contextWindow
+      label: Model context window (tokens)
+      description: Must equal the server's context length; LCM compacts at contextThreshold of this.
+      type: number
+      required: true
+      defaultValue: "262144"
+    - variable: maxTokens
+      label: Max output tokens per turn
+      type: number
+      required: true
+      defaultValue: "16384"
+    - variable: modelVision
+      label: Model accepts images
+      description: true declares the model as image-capable to OpenClaw (input text+image), so photos sent in chat reach the model.
+      type: boolean
+      required: true
+      defaultValue: "true"
+    - variable: modelReasoning
+      label: Model is a reasoning model
+      description: Declares the model as reasoning-capable so OpenClaw exposes /think levels.
+      type: boolean
+      required: true
+      defaultValue: "true"
+    - variable: thinkingFormat
+      label: Thinking payload format
+      description: How OpenClaw switches thinking on and off for this endpoint. qwen-chat-template for Qwen on vLLM, qwen for DashScope-style flags, together for Together-style reasoning.enabled, none to send nothing.
+      type: string
+      required: true
+      options: ["qwen-chat-template", "qwen", "together", "none"]
+      defaultValue: qwen-chat-template
+    - variable: stateSize
+      label: State volume size
+      type: string
+      required: true
+      defaultValue: 20Gi
+      validation: '^[0-9]+(Mi|Gi|Ti)$'
+    - variable: storageClass
+      label: StorageClass
+      description: Empty uses the tenant default.
+      type: string
+      required: false
+      defaultValue: ""
+    - variable: agentName
+      label: Agent name
+      description: >-
+        Display name for the UI and channels (agents.entries.main.identity). The persona task
+        writes the same name into IDENTITY.md, which is what the model reads.
+      type: string
+      required: true
+      defaultValue: Claw
+      validation: '^[A-Za-z0-9][A-Za-z0-9 ._-]{0,39}$'
+    - variable: agentEmoji
+      label: Agent emoji
+      description: Shown in the UI and channels; the persona task writes the same one into IDENTITY.md.
+      type: string
+      required: true
+      defaultValue: "🦀"
+      validation: '^.{1,8}$'
+    - variable: userTimezone
+      label: User timezone
+      description: IANA name such as Europe/Berlin for dates in the system prompt and message envelopes. Empty uses the container's timezone (UTC).
+      type: string
+      required: false
+      defaultValue: ""
+      validation: '^$|^UTC$|^[A-Za-z]+(/[A-Za-z0-9_+-]+)+$'
+    - variable: requireCpuNode
+      label: Require a non-GPU node
+      description: >-
+        true = OpenClaw may only run on nodes WITHOUT nvidia.com/gpu.present=true, so it (and its
+        node-local state volume) survives the GPU node being scaled down or reclaimed. Needs a
+        non-GPU node in the tenant. false = prefer one, but accept a GPU node. Decide BEFORE the
+        first install: a node-local volume is bound to the node the pod first landed on, so
+        flipping this later means deleting the openclaw-state PVC (scale the Deployment to 0
+        first) and letting a re-sync recreate it.
+      type: boolean
+      required: true
+      defaultValue: "false"
+    - variable: dmScope
+      label: DM session scope
+      description: >-
+        How direct messages from channels (Telegram etc.) map to sessions. main = they share the
+        dashboard's main session (context grows fast, slow replies); per-channel-peer = each
+        channel+sender gets its own session (recommended); per-peer / per-account-channel-peer
+        as in the OpenClaw docs. LCM remembers across all of them.
+      type: string
+      required: true
+      options: ["per-channel-peer", "main", "per-peer", "per-account-channel-peer"]
+      defaultValue: per-channel-peer
+    - variable: telegramBotToken
+      label: Telegram bot token
+      description: From @BotFather. Empty = Telegram not managed by the stack.
+      type: password
+      required: false
+      defaultValue: ""
+    - variable: telegramAllowFrom
+      label: Telegram user IDs allowed to DM
+      description: Comma-separated numeric Telegram user IDs; pre-authorized, no pairing code. Empty = pairing flow.
+      type: string
+      required: false
+      defaultValue: ""
+      validation: '^$|^[0-9]+( *, *[0-9]+)*$'
+  config:
+    chart: {}
+    manifests: |
+      {{- $ns := "openclaw" }}
+      {{- $sc := .Values.storageClass }}
+      {{- $mode := .Values.accessMode }}
+      {{- if and (eq $mode "ingress") (not .Values.ingressHost) }}
+      {{- fail "openclaw-step-04-gateway: accessMode is ingress but ingressHost is empty" }}
+      {{- end }}
+      {{- /* The scheme users see: forced by ingressScheme, or derived from the TLS Secret. */}}
+      {{- $scheme := .Values.ingressScheme | default "auto" }}
+      {{- if eq $scheme "auto" }}
+      {{- $scheme = ternary "https" "http" (ne (.Values.ingressTlsSecret | default "") "") }}
+      {{- end }}
+      apiVersion: v1
+      kind: ServiceAccount
+      metadata:
+        name: openclaw
+        namespace: {{ $ns }}
+      ---
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: Role
+      metadata:
+        name: openclaw
+        namespace: {{ $ns }}
+      rules:
+        # The seed init container records the reachable URL in the openclaw-endpoint ConfigMap.
+        - apiGroups: [""]
+          resources: ["configmaps"]
+          verbs: ["get", "patch"]
+        # The seed init container mirrors the generated gateway token into a Secret so the
+        # stack can publish it as an output.
+        - apiGroups: [""]
+          resources: ["secrets"]
+          verbs: ["get", "create", "patch"]
+      ---
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: RoleBinding
+      metadata:
+        name: openclaw
+        namespace: {{ $ns }}
+      subjects:
+        - kind: ServiceAccount
+          name: openclaw
+          namespace: {{ $ns }}
+      roleRef:
+        kind: Role
+        name: openclaw
+        apiGroup: rbac.authorization.k8s.io
+      ---
+      apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata:
+        name: openclaw-state
+        namespace: {{ $ns }}
+        annotations:
+          # Never let Helm delete the state. When a deploy fails (wait timeout), the Platform
+          # uninstalls the failed release before retrying, and without this the volume with
+          # every session and the LCM database goes with it. Delete the PVC by hand if you
+          # really want a clean slate.
+          "helm.sh/resource-policy": keep
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- if $sc }}
+        storageClassName: {{ $sc }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.stateSize }}
+      ---
+      # The model endpoint credential, injected into the gateway as MODEL_API_KEY and referenced
+      # from openclaw.json as "${MODEL_API_KEY}"; never written to the config file itself.
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: openclaw-model-key
+        namespace: {{ $ns }}
+      type: Opaque
+      stringData:
+        apiKey: {{ .Values.modelApiKey | quote }}
+      {{- if .Values.telegramBotToken }}
+      ---
+      # Only ever mounted into the seed step, which writes the token to the state volume.
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: openclaw-channels
+        namespace: {{ $ns }}
+      type: Opaque
+      stringData:
+        telegramBotToken: {{ .Values.telegramBotToken | quote }}
+      {{- end }}
+      ---
+      # Helm-owned so it is pruned with the stack; the seed container patches the real values in.
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: openclaw-endpoint
+        namespace: {{ $ns }}
+      data:
+        url: pending
+        ip: ""
+        port: {{ .Values.nodePort | quote }}
+        reachability: pending
+        command: pending
+        link: pending
+        telegramBot: not configured
+      ---
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: openclaw-bootstrap
+        namespace: {{ $ns }}
+      data:
+        # The keys this stack owns in openclaw.json. allowedOrigins is filled by seed.sh once the
+        # reachable address is known. Anything NOT in here is left alone on later starts.
+        managed.json: |
+      {{ include "openclaw.managed" . | indent 4 }}
+        seed.sh: |
+      {{ include "openclaw.seed" . | indent 4 }}
+        nginx.conf: |
+      {{ include "openclaw.nginx" . | indent 4 }}
+      ---
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: openclaw
+        namespace: {{ $ns }}
+      spec:
+        {{- if eq $mode "nodeport" }}
+        # NodePort, not LoadBalancer: a private-nodes tenant has no cloud controller manager, so a
+        # LoadBalancer Service never gets an address (and `wait: true` would hang on it).
+        type: NodePort
+        # Keeps the client's source IP, which is what the proxy's allowlist checks. Traffic must
+        # hit the node that runs the pod; the published URL is built from exactly that node.
+        externalTrafficPolicy: Local
+        {{- else }}
+        # port-forward: in-cluster only (the canary's /readyz) plus kubectl port-forward.
+        # ingress: the Ingress controller's backend.
+        type: ClusterIP
+        {{- end }}
+        selector:
+          app: openclaw
+        ports:
+          - name: http
+            port: 80
+            {{- if eq $mode "port-forward" }}
+            targetPort: 18789
+            {{- else }}
+            targetPort: 8080
+            {{- end }}
+            {{- if eq $mode "nodeport" }}
+            nodePort: {{ .Values.nodePort }}
+            {{- end }}
+      {{- if eq $mode "ingress" }}
+      ---
+      apiVersion: networking.k8s.io/v1
+      kind: Ingress
+      metadata:
+        name: openclaw
+        namespace: {{ $ns }}
+        {{- $ann := list }}
+        {{- range $line := splitList "\n" (.Values.ingressAnnotations | default "") }}
+        {{- $l := trim $line }}
+        {{- if and $l (not (hasPrefix "#" $l)) (contains ":" $l) }}
+        {{- $ann = append $ann $l }}
+        {{- end }}
+        {{- end }}
+        {{- if $ann }}
+        annotations:
+          {{- range $a := $ann }}
+          {{- $kv := splitn ":" 2 $a }}
+          {{ trim $kv._0 | quote }}: {{ trim $kv._1 | trimAll "\"" | quote }}
+          {{- end }}
+        {{- end }}
+      spec:
+        {{- if .Values.ingressClassName }}
+        ingressClassName: {{ .Values.ingressClassName }}
+        {{- end }}
+        {{- if .Values.ingressTlsSecret }}
+        tls:
+          - hosts: [{{ .Values.ingressHost | quote }}]
+            secretName: {{ .Values.ingressTlsSecret }}
+        {{- end }}
+        rules:
+          - host: {{ .Values.ingressHost | quote }}
+            http:
+              paths:
+                - path: /
+                  pathType: Prefix
+                  backend:
+                    service:
+                      name: openclaw
+                      port:
+                        number: 80
+      {{- end }}
+      ---
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: openclaw
+        namespace: {{ $ns }}
+      spec:
+        replicas: 1
+        selector:
+          matchLabels:
+            app: openclaw
+        strategy:
+          # RWO state volume: two pods cannot coexist during a rollout.
+          type: Recreate
+        template:
+          metadata:
+            labels:
+              app: openclaw
+            annotations:
+              # Roll the pod whenever the managed config, seed script or proxy config changes.
+              checksum/bootstrap: {{ printf "%s%s%s" (include "openclaw.managed" .) (include "openclaw.seed" .) (include "openclaw.nginx" .) | sha256sum | trunc 16 }}
+              # A changed token or allowlist must re-run the seed step: roll the pod.
+              checksum/channels: {{ printf "%s|%s" .Values.telegramBotToken .Values.telegramAllowFrom | sha256sum | trunc 16 }}
+              # A rotated model key only lives in a Secret env var: roll the pod to pick it up.
+              checksum/model: {{ .Values.modelApiKey | sha256sum | trunc 16 }}
+          spec:
+            serviceAccountName: openclaw
+            enableServiceLinks: false
+            # OpenClaw holds a gateway-owner lease in its state database (5 min TTL) and drains
+            # in-flight turns for up to ~5 min on SIGTERM. With Kubernetes' default 30 s grace a
+            # busy gateway gets SIGKILLed mid-turn, never releases the lease, and the replacement
+            # pod crashloops with "Another Gateway owner lease is still active" until the TTL
+            # runs out. Give it time to shut down cleanly.
+            terminationGracePeriodSeconds: 330
+            securityContext:
+              fsGroup: 1000
+              seccompProfile:
+                type: RuntimeDefault
+            # requireCpuNode=true: only non-GPU nodes, so the gateway and its node-local volume
+            # outlive the GPU node. Otherwise prefer one but accept a GPU node, because a tenant
+            # may have nothing else.
+            affinity:
+              nodeAffinity:
+                {{- if eq (.Values.requireCpuNode | toString) "true" }}
+                requiredDuringSchedulingIgnoredDuringExecution:
+                  nodeSelectorTerms:
+                    - matchExpressions:
+                        - key: nvidia.com/gpu.present
+                          operator: NotIn
+                          values: ["true"]
+                {{- else }}
+                preferredDuringSchedulingIgnoredDuringExecution:
+                  - weight: 100
+                    preference:
+                      matchExpressions:
+                        - key: nvidia.com/gpu.present
+                          operator: NotIn
+                          values: ["true"]
+                {{- end }}
+            tolerations:
+              - key: nvidia.com/gpu
+                operator: Exists
+                effect: NoSchedule
+            initContainers:
+              # 1. Record the reachable URL and write the managed keys into openclaw.json.
+              #    Platform image (curl, jq, kubectl), run as the same uid as OpenClaw so the
+              #    files on the PVC are writable by the gateway.
+              - name: seed-config
+                image: {{ .Values.__image__ | quote }}
+                command: ["sh", "/etc/openclaw-bootstrap/seed.sh"]
+                securityContext:
+                  runAsUser: 1000
+                  runAsGroup: 1000
+                  runAsNonRoot: true
+                  allowPrivilegeEscalation: false
+                  readOnlyRootFilesystem: true
+                  capabilities:
+                    drop: ["ALL"]
+                env:
+                  - name: HOME
+                    value: /tmp
+                  - name: KUBECACHEDIR
+                    value: /tmp/.kube-cache
+                  - name: NODE_PORT
+                    value: {{ .Values.nodePort | quote }}
+                  - name: LOCAL_PORT
+                    value: {{ .Values.localPort | quote }}
+                  - name: ACCESS_MODE
+                    value: {{ $mode | quote }}
+                  - name: INGRESS_HOST
+                    value: {{ .Values.ingressHost | quote }}
+                  - name: INGRESS_SCHEME
+                    value: {{ $scheme | quote }}
+                  - name: TELEGRAM_ALLOW_FROM
+                    value: {{ .Values.telegramAllowFrom | quote }}
+                  - name: HOST_IP
+                    valueFrom: { fieldRef: { fieldPath: status.hostIP } }
+                  - name: POD_NAMESPACE
+                    valueFrom: { fieldRef: { fieldPath: metadata.namespace } }
+                volumeMounts:
+                  - { name: state,     mountPath: /home/node }
+                  - { name: bootstrap, mountPath: /etc/openclaw-bootstrap, readOnly: true }
+                  - { name: persona,   mountPath: /etc/openclaw-persona, readOnly: true }
+                  - { name: channels,  mountPath: /etc/openclaw-channels, readOnly: true }
+                  - { name: tmp,       mountPath: /tmp }
+              # 2. Install lossless-claw into the state dir (once per version). Needs egress to
+              #    the npm registry. --force + --accept-capabilities are what the docs require for
+              #    a non-interactive install from an npm source.
+              - name: install-plugin
+                image: {{ .Values.image | quote }}
+                command: ["sh", "-c"]
+                args:
+                  - |
+                    set -eu
+                    V="{{ .Values.losslessClawVersion }}"
+                    M="$OPENCLAW_STATE_DIR/.lossless-claw-$V"
+                    if [ -f "$M" ]; then echo "lossless-claw $V already installed"; exit 0; fi
+                    openclaw plugins install "npm:@martian-engineering/lossless-claw@$V" --force --accept-capabilities --pin
+                    touch "$M"
+                    echo "installed lossless-claw $V"
+                securityContext:
+                  runAsUser: 1000
+                  runAsGroup: 1000
+                  runAsNonRoot: true
+                  allowPrivilegeEscalation: false
+                  readOnlyRootFilesystem: true
+                  capabilities:
+                    drop: ["ALL"]
+                env:
+                  - { name: HOME,                   value: /home/node }
+                  - { name: OPENCLAW_STATE_DIR,     value: /home/node/.openclaw }
+                  - { name: OPENCLAW_CONFIG_PATH,   value: /home/node/.openclaw/openclaw.json }
+                  - { name: npm_config_cache,       value: /tmp/.npm }
+                  - { name: TMPDIR,                 value: /tmp/oc }
+                volumeMounts:
+                  - { name: state, mountPath: /home/node }
+                  - { name: tmp,   mountPath: /tmp }
+            containers:
+              # `args`, not `command`: keeps the image entrypoint (tini + docker-entrypoint.mjs),
+              # which runs `openclaw doctor --fix` against the mounted state on image upgrades.
+              - name: gateway
+                image: {{ .Values.image | quote }}
+                args: ["node", "openclaw.mjs", "gateway", "--port", "18789"]
+                securityContext:
+                  runAsUser: 1000
+                  runAsGroup: 1000
+                  runAsNonRoot: true
+                  allowPrivilegeEscalation: false
+                  readOnlyRootFilesystem: true
+                  capabilities:
+                    drop: ["ALL"]
+                env:
+                  - { name: HOME,                    value: /home/node }
+                  - { name: OPENCLAW_STATE_DIR,      value: /home/node/.openclaw }
+                  - { name: OPENCLAW_CONFIG_PATH,    value: /home/node/.openclaw/openclaw.json }
+                  - { name: OPENCLAW_WORKSPACE_DIR,  value: /home/node/.openclaw/workspace }
+                  - { name: TMPDIR,                  value: /tmp/oc }
+                  # Referenced from openclaw.json as "${MODEL_API_KEY}".
+                  - name: MODEL_API_KEY
+                    valueFrom:
+                      secretKeyRef:
+                        name: openclaw-model-key
+                        key: apiKey
+                resources:
+                  requests: { cpu: "1", memory: 2Gi }
+                  limits: { memory: 4Gi }
+                # exec probes: in nodeport and ingress mode the gateway listens on loopback only, so
+                # the kubelet cannot reach it over the pod IP. The Control UI answers unknown paths
+                # with 200, hence the body checks (this is the official manifest's approach too).
+                startupProbe:
+                  exec:
+                    command: ["node", "-e", "fetch('http://127.0.0.1:18789/readyz').then(r=>r.json()).then(j=>process.exit(j.ready===true?0:1)).catch(()=>process.exit(1))"]
+                  periodSeconds: 5
+                  failureThreshold: 60
+                readinessProbe:
+                  exec:
+                    command: ["node", "-e", "fetch('http://127.0.0.1:18789/readyz').then(r=>r.json()).then(j=>process.exit(j.ready===true?0:1)).catch(()=>process.exit(1))"]
+                  periodSeconds: 15
+                livenessProbe:
+                  exec:
+                    command: ["node", "-e", "fetch('http://127.0.0.1:18789/healthz').then(r=>r.json()).then(j=>process.exit(j.ok===true?0:1)).catch(()=>process.exit(1))"]
+                  periodSeconds: 30
+                  failureThreshold: 4
+                volumeMounts:
+                  - { name: state, mountPath: /home/node }
+                  - { name: tmp,   mountPath: /tmp }
+              {{- if ne $mode "port-forward" }}
+              # The front door in nodeport mode (IP allowlist, identity header) and in ingress mode
+              # (the gateway's trusted proxy behind the Ingress controller).
+              - name: proxy
+                image: {{ .Values.proxyImage | quote }}
+                ports:
+                  - { name: http, containerPort: 8080 }
+                securityContext:
+                  allowPrivilegeEscalation: false
+                  capabilities:
+                    drop: ["ALL"]
+                resources:
+                  requests: { cpu: 50m, memory: 64Mi }
+                  limits: { memory: 128Mi }
+                # tcpSocket, not httpGet: in nodeport mode the kubelet's probe would come from the
+                # node IP and be denied by the allowlist.
+                readinessProbe:
+                  tcpSocket: { port: 8080 }
+                  periodSeconds: 10
+                volumeMounts:
+                  - { name: bootstrap, mountPath: /etc/nginx/conf.d/default.conf, subPath: nginx.conf, readOnly: true }
+              {{- end }}
+            volumes:
+              - name: state
+                persistentVolumeClaim:
+                  claimName: openclaw-state
+              - name: bootstrap
+                configMap:
+                  name: openclaw-bootstrap
+              # Written by the persona task (apps/03-persona.yaml). Optional so this App also
+              # deploys on a stack without that task; the seed step then leaves the workspace alone.
+              - name: persona
+                configMap:
+                  name: openclaw-persona
+                  optional: true
+              # Absent when no token was given (optional), so the seed step simply skips it.
+              - name: channels
+                secret:
+                  secretName: openclaw-channels
+                  optional: true
+              - name: tmp
+                emptyDir: {}
+      {{- define "openclaw.managed" -}}
+      {
+        "gateway": {
+          "mode": "local",
+          {{- if eq .Values.accessMode "nodeport" }}
+          "bind": "loopback",
+          "port": 18789,
+          "trustedProxies": ["127.0.0.1"],
+          "auth": {
+            "mode": "trusted-proxy",
+            "identityScopes": {
+              {{ .Values.operatorUser | quote }}: ["operator.admin"]
+            },
+            "trustedProxy": {
+              "userHeader": "x-forwarded-user",
+              "requiredHeaders": ["x-forwarded-proto", "x-forwarded-host"],
+              "allowUsers": [{{ .Values.operatorUser | quote }}],
+              "allowLoopback": true,
+              "deviceAutoApprove": { "enabled": true, "scopes": ["operator.admin"] }
+            }
+          },
+          {{- else if eq .Values.accessMode "ingress" }}
+          "bind": "loopback",
+          "port": 18789,
+          "trustedProxies": ["127.0.0.1"],
+          "auth": { "mode": "token" },
+          {{- else }}
+          "bind": "lan",
+          "port": 18789,
+          "trustedProxies": [],
+          "auth": { "mode": "token" },
+          {{- end }}
+          "controlUi": {
+            "enabled": true,
+            "allowedOrigins": [],
+            "experimental": { "customPlugins": true }
+          }
+        },
+        "models": {
+          "providers": {
+            "vllm": {
+              "baseUrl": {{ .Values.modelBaseUrl | quote }},
+              "apiKey": "${MODEL_API_KEY}",
+              "api": "openai-completions",
+              "timeoutSeconds": 300,
+              "models": [
+                {
+                  "id": {{ .Values.modelId | quote }},
+                  "name": {{ printf "%s (%s)" .Values.modelId .Values.modelBackend | quote }},
+                  "reasoning": {{ if eq (.Values.modelReasoning | toString) "true" }}true{{ else }}false{{ end }},
+                  "input": [{{ if eq (.Values.modelVision | toString) "true" }}"text", "image"{{ else }}"text"{{ end }}],
+                  "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+                  {{- if ne .Values.thinkingFormat "none" }}
+                  "compat": { "thinkingFormat": {{ .Values.thinkingFormat | quote }} },
+                  {{- end }}
+                  "contextWindow": {{ .Values.contextWindow }},
+                  "maxTokens": {{ .Values.maxTokens }}
+                }
+              ]
+            }
+          }
+        },
+        "session": { "dmScope": {{ .Values.dmScope | quote }} },
+        "agents": {
+          "defaults": {
+            "model": { "primary": {{ printf "vllm/%s" .Values.modelId | quote }} },
+            {{- if .Values.userTimezone }}
+            "userTimezone": {{ .Values.userTimezone | quote }},
+            {{- end }}
+            "workspace": "/home/node/.openclaw/workspace"
+          },
+          "entries": {
+            "main": {
+              "identity": { "name": {{ .Values.agentName | quote }}, "emoji": {{ .Values.agentEmoji | quote }} }
+            }
+          }
+        },
+        "plugins": {
+          "slots": { "contextEngine": "lossless-claw" },
+          "entries": {
+            "lossless-claw": {
+              "enabled": true,
+              "hooks": { "allowConversationAccess": true },
+              "config": {
+                "freshTailCount": 64,
+                "leafChunkTokens": 20000,
+                "newSessionRetainDepth": 2,
+                "contextThreshold": 0.75,
+                "incrementalMaxDepth": 1
+              }
+            }
+          }
+        }
+      }
+      {{- end -}}
+      {{- define "openclaw.seed" -}}
+      set -eu
+      STATE=/home/node/.openclaw
+      CFG="$STATE/openclaw.json"
+      MANAGED=/etc/openclaw-bootstrap/managed.json
+      NS="$POD_NAMESPACE"
+
+      # Owned by this uid (see the header): OpenClaw chmods it, and refuses a temp root that is
+      # world-writable without the sticky bit, so give it a private one on the shared /tmp.
+      mkdir -p "$STATE" && chmod 700 "$STATE"
+      mkdir -p /tmp/oc && chmod 700 /tmp/oc
+
+      # --- where is this node reachable? --------------------------------------------------
+      ip="$HOST_IP"
+      if [ "$ACCESS_MODE" = "port-forward" ]; then
+        reach=port-forward
+        url="http://localhost:$LOCAL_PORT/"
+        cmd="kubectl -n $NS port-forward svc/openclaw $LOCAL_PORT:80"
+      elif [ "$ACCESS_MODE" = "ingress" ]; then
+        reach=ingress
+        url="$INGRESS_SCHEME://$INGRESS_HOST/"
+        cmd="n/a (ingress mode: open the URL)"
+      else
+        # Node objects on private nodes carry no ExternalIP, so ask the cloud metadata server
+        # (GCE, then AWS, then Azure) and fall back to the node's internal IP.
+        pub=""
+        pub="$(curl -sf -m 3 -H 'Metadata-Flavor: Google' \
+          'http://169.254.169.254/computeMetadata/v1/instance/network-interfaces/0/access-configs/0/external-ip' 2>/dev/null || true)"
+        if [ -z "$pub" ]; then
+          tok="$(curl -sf -m 3 -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' \
+            'http://169.254.169.254/latest/api/token' 2>/dev/null || true)"
+          if [ -n "$tok" ]; then
+            pub="$(curl -sf -m 3 -H "X-aws-ec2-metadata-token: $tok" \
+              'http://169.254.169.254/latest/meta-data/public-ipv4' 2>/dev/null || true)"
+          fi
+        fi
+        if [ -z "$pub" ]; then
+          pub="$(curl -sf -m 3 -H 'Metadata: true' \
+            'http://169.254.169.254/metadata/instance/network/interface/0/ipv4/ipAddress/0/publicIpAddress?api-version=2021-02-01&format=text' 2>/dev/null || true)"
+        fi
+        if [ -n "$pub" ]; then reach=public; ip="$pub"; else reach=internal; fi
+        url="http://$ip:$NODE_PORT/"
+        cmd="n/a (nodeport mode)"
+      fi
+      # --- gateway token (port-forward and ingress modes) ---------------------------------
+      # Generated once and kept on the volume, so it survives restarts; mirrored into a Secret
+      # for the stack's dashboardToken output. In nodeport mode the proxy asserts identity and
+      # the Secret only carries a placeholder (the output must still resolve).
+      tok="not used in nodeport mode"
+      if [ "$ACCESS_MODE" != "nodeport" ]; then
+        TOK="$STATE/.gateway-token"
+        if [ ! -s "$TOK" ]; then
+          head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$TOK"
+          chmod 600 "$TOK"
+        fi
+        tok="$(cat "$TOK")"
+      fi
+      # `link` is the one-click form: the Control UI reads the token from the URL fragment. It
+      # goes into the endpoint ConfigMap on purpose, so the dashboardLink output is plain text
+      # with a copy button on the stack card (a Secret-backed output is masked). Only in
+      # port-forward mode: there, anyone who can read the outputs still needs kubectl access to
+      # the tenant. In ingress mode the host is public, so the link carries no token.
+      if [ "$ACCESS_MODE" = "port-forward" ]; then link="$url#token=$tok"; else link="$url"; fi
+      kubectl -n "$NS" create secret generic openclaw-gateway-token \
+        --from-literal=token="$tok" --from-literal=link="$link" \
+        --dry-run=client -o yaml | kubectl -n "$NS" apply -f - >/dev/null
+      echo "dashboard endpoint: $url ($reach)"
+      kubectl -n "$NS" patch configmap openclaw-endpoint --type merge \
+        -p "$(jq -cn --arg u "$url" --arg i "$ip" --arg p "$NODE_PORT" --arg r "$reach" --arg c "$cmd" --arg l "$link" \
+              '{data:{url:$u,ip:$i,port:$p,reachability:$r,command:$c,link:$l}}')"
+
+      # --- openclaw.json ------------------------------------------------------------------
+      # Deep-merge the managed keys over whatever is on the volume. Arrays are replaced, so the
+      # model list and allowedOrigins are always exactly what the stack says, and gateway.auth
+      # is replaced wholesale so switching access modes leaves no stale auth keys behind.
+      if [ "$ACCESS_MODE" = "port-forward" ]; then
+        origins="$(jq -cn --arg p "$LOCAL_PORT" '[("http://localhost:" + $p), ("http://127.0.0.1:" + $p)]')"
+      elif [ "$ACCESS_MODE" = "ingress" ]; then
+        # The public origin, plus loopback so a port-forward through the proxy still works.
+        origins="$(jq -cn --arg o "$INGRESS_SCHEME://$INGRESS_HOST" --arg p "$LOCAL_PORT" \
+          '[$o, ("http://localhost:" + $p), ("http://127.0.0.1:" + $p)]')"
+      else
+        origins="$(jq -cn --arg o "http://$ip:$NODE_PORT" --arg p "$NODE_PORT" \
+          '[$o, ("http://localhost:" + $p), ("http://127.0.0.1:" + $p)]')"
+      fi
+      managed="$(jq --argjson o "$origins" --arg t "$tok" --arg m "$ACCESS_MODE" \
+        '.gateway.controlUi.allowedOrigins = $o | if $m != "nodeport" then .gateway.auth.token = $t else . end' "$MANAGED")"
+
+      # --- chat channels: Telegram from the stack input -----------------------------------
+      # Token -> $STATE/telegram-token (a regular 0600 file, as tokenFile requires), config ->
+      # channels.telegram (replaced wholesale below so a removed allowlist does not linger).
+      # The token itself is never printed. Without a token, `channels` is left untouched.
+      CH=/etc/openclaw-channels
+      TG_FILE="$STATE/telegram-token"
+      tgbot="not configured"
+      if [ -s "$CH/telegramBotToken" ]; then
+        tr -d '\r\n' < "$CH/telegramBotToken" > "$TG_FILE.tmp" && chmod 600 "$TG_FILE.tmp" && mv "$TG_FILE.tmp" "$TG_FILE"
+        allow="$(printf '%s' "${TELEGRAM_ALLOW_FROM:-}" | tr ',' '\n' | sed 's/[^0-9]//g' | grep -v '^$' | jq -R . | jq -sc .)"
+        managed="$(printf '%s' "$managed" | jq --arg f "$TG_FILE" --argjson a "$allow" '
+          .channels.telegram = ({enabled: true, tokenFile: $f}
+            + (if ($a | length) > 0 then {dmPolicy: "allowlist", allowFrom: $a} else {dmPolicy: "pairing"} end))
+          | if ($a | length) > 0 then .commands.ownerAllowFrom = ($a | map("telegram:" + .)) else . end')"
+        me="$(curl -s -m 10 "https://api.telegram.org/bot$(cat "$TG_FILE")/getMe" 2>/dev/null || true)"
+        if printf '%s' "$me" | jq -e '.ok == true' >/dev/null 2>&1; then
+          tgbot="@$(printf '%s' "$me" | jq -r '.result.username')"
+        elif [ -n "$me" ]; then
+          tgbot="invalid token: $(printf '%s' "$me" | jq -r '.description // "rejected by Telegram"')"
+        else
+          tgbot="unreachable: could not call api.telegram.org"
+        fi
+        echo "telegram: $tgbot (allowFrom: $allow)"
+      fi
+      # No token given: channels and any existing token file are left exactly as they are.
+      kubectl -n "$NS" patch configmap openclaw-endpoint --type merge \
+        -p "$(jq -cn --arg b "$tgbot" '{data:{telegramBot:$b}}')"
+
+      if [ -s "$CFG" ]; then
+        printf '%s' "$managed" | jq --slurpfile cur "$CFG" '. as $m | ($cur[0] * $m) | .gateway.auth = $m.gateway.auth
+          | if $m.channels.telegram then .channels.telegram = $m.channels.telegram else . end' > "$CFG.tmp"
+        mv "$CFG.tmp" "$CFG"
+        echo "merged managed keys into existing $CFG"
+      else
+        printf '%s\n' "$managed" > "$CFG"
+        echo "wrote new $CFG"
+      fi
+      chmod 600 "$CFG"
+
+      # --- persona: SOUL.md, IDENTITY.md, USER.md ------------------------------------------
+      # Copied (not mounted: the agent writes to its workspace) from the persona task's
+      # ConfigMap, only when the stack's version differs from what was last applied. Doing it
+      # here, before OpenClaw's own seeding, means a fresh workspace is already "configured" and
+      # the first-run BOOTSTRAP ritual never runs. What the agent later adds to these files is
+      # kept until the stack parameters change.
+      P=/etc/openclaw-persona
+      WS="$STATE/workspace"
+      if [ -s "$P/sha" ]; then
+        want="$(cat "$P/sha")"
+        have="$(cat "$STATE/.stack-persona-sha" 2>/dev/null || true)"
+        if [ "$want" != "$have" ]; then
+          mkdir -p "$WS" && chmod 700 "$WS"
+          for f in SOUL.md IDENTITY.md USER.md; do
+            cp "$P/$f" "$WS/$f" && chmod 600 "$WS/$f"
+          done
+          printf '%s' "$want" > "$STATE/.stack-persona-sha"
+          echo "applied persona $want to $WS"
+        else
+          echo "persona $want already applied"
+        fi
+      fi
+      {{- end -}}
+      {{- define "openclaw.nginx" -}}
+      map $http_upgrade $connection_upgrade {
+        default upgrade;
+        ''      close;
+      }
+      {{- if eq .Values.accessMode "ingress" }}
+      # TLS ends at the Ingress controller; pass its scheme on instead of this plain-HTTP hop's.
+      map $http_x_forwarded_proto $forwarded_proto {
+        default $scheme;
+        https   https;
+      }
+      {{- end }}
+      server {
+        listen 8080;
+        server_name _;
+        {{- if eq .Values.accessMode "nodeport" }}
+
+        # The allowlist. externalTrafficPolicy: Local keeps the real client address.
+        # 127.0.0.1 = kubectl port-forward, which already requires cluster access.
+        {{- if .Values.allowedCidr }}
+        allow {{ .Values.allowedCidr }};
+        {{- end }}
+        allow 127.0.0.1;
+        deny all;
+        {{- end }}
+
+        client_max_body_size 200m;
+
+        # Health endpoints are open to everyone (the canary and kubelet probes live inside the
+        # cluster, which the allowlist otherwise denies). They carry no data beyond ok/ready.
+        location = /healthz { allow all; proxy_pass http://127.0.0.1:18789; }
+        location = /readyz  { allow all; proxy_pass http://127.0.0.1:18789; }
+
+        location / {
+          proxy_pass http://127.0.0.1:18789;
+          proxy_http_version 1.1;
+          proxy_set_header Upgrade $http_upgrade;
+          proxy_set_header Connection $connection_upgrade;
+          proxy_set_header Host $host;
+          {{- if eq .Values.accessMode "nodeport" }}
+          # Identity for OpenClaw's trusted-proxy auth. Fixed value: everyone the allowlist
+          # admits IS the operator.
+          proxy_set_header X-Forwarded-User {{ .Values.operatorUser | quote }};
+          proxy_set_header X-Forwarded-Proto $scheme;
+          {{- else }}
+          proxy_set_header X-Forwarded-Proto $forwarded_proto;
+          {{- end }}
+          proxy_set_header X-Forwarded-Host $host;
+          # Overwrite, never append: a client-supplied value must not survive this hop.
+          proxy_set_header X-Forwarded-For $remote_addr;
+          proxy_read_timeout 3600s;
+          proxy_send_timeout 3600s;
+          proxy_buffering off;
+        }
+      }
+      {{- end -}}

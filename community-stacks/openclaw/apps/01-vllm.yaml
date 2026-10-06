@@ -1,0 +1,357 @@
+# Step 1 of the OpenClaw stack: the model server (modelBackend: vllm).
+#
+# One vLLM Deployment holding gpuCount GPUs of the tenant cluster, OpenAI-compatible on port 8000.
+# Weights are downloaded from Hugging Face on first start (tens of GB, about 10 minutes on a fast
+# link) into the model cache, which comes in three shapes (parameter modelCache):
+#
+#   pvc       (default) a PersistentVolumeClaim `vllm-cache`. Use a network-attached StorageClass:
+#             a node-local class such as local-path pins the claim to the node it was created on,
+#             and once that node is replaced (Spot reclaim, GPU pool scaled to 0 and back) the new
+#             vLLM pod can never be scheduled until someone deletes the PVC by hand (seen live).
+#             The claim carries helm.sh/resource-policy: keep so a failed deploy or a reinstall
+#             does not download everything again.
+#   hostPath  a directory on whichever node runs vLLM (modelCachePath). Follows the pod to any GPU
+#             node, survives pod restarts, dies with the node: a re-download, not data loss. Needs
+#             a namespace that allows hostPath volumes (Pod Security level privileged). The right
+#             choice for private-nodes tenants whose only StorageClass is local-path.
+#   emptyDir  no persistence; every pod start downloads again. Zero prerequisites.
+#
+# vLLM runs as root in its image, so directory ownership is never a problem.
+#
+# wait is false on purpose: the Deployment takes 10-20 minutes to become Ready (download + load +
+# kernel compile) and the model-ready task (step 2) is the gate that waits for it and explains a
+# failure. Helm returns as soon as the objects exist.
+#
+# Model-specific flags (parsers, speculative decoding, chat template kwargs) come in through
+# vllmExtraArgs; GPU- or driver-specific environment through vllmEnv. Nothing in this App knows
+# the model.
+#
+# EVERY parameter is passed explicitly by the StackTemplate task. An omitted one arrives EMPTY,
+# not defaulted. externalBaseUrl and externalApiKey exist only so the task can pass one parameter
+# set to this App or to its -skip twin (apps/01-vllm-skip.yaml).
+apiVersion: management.loft.sh/v1
+kind: App
+metadata:
+  name: openclaw-step-01-vllm
+  labels:
+    app.kubernetes.io/part-of: openclaw-stack
+spec:
+  displayName: "[OpenClaw Step - 1] vLLM model server"
+  description: vLLM serving one open-weight model on the tenant's GPUs, OpenAI-compatible on port 8000.
+  access:
+    - users: ["*"]
+      verbs: ["get"]
+  defaultNamespace: openclaw
+  wait: false
+  timeout: 10m
+  parameters:
+    - variable: model
+      label: Hugging Face model id
+      type: string
+      required: true
+      defaultValue: Qwen/Qwen3.8-27B
+    - variable: servedModelName
+      label: Served model name
+      description: The id clients (OpenClaw) use. Keep it short.
+      type: string
+      required: true
+      defaultValue: qwen3.8-27b
+      validation: '^[a-zA-Z0-9][a-zA-Z0-9._/:-]*$'
+    - variable: maxModelLen
+      label: Max context length (tokens)
+      type: number
+      required: true
+      defaultValue: "262144"
+    - variable: gpuMemoryUtilization
+      label: GPU memory fraction for vLLM
+      description: Fraction of VRAM vLLM may use for weights + KV cache. Leave headroom for the CUDA context and prefill spikes.
+      type: string
+      required: true
+      defaultValue: "0.90"
+      validation: '^0\.[5-9][0-9]?$'
+    - variable: gpuCount
+      label: GPUs for vLLM
+      description: nvidia.com/gpu request of the pod. Above 1, vLLM runs tensor-parallel across them.
+      type: number
+      required: true
+      defaultValue: "1"
+      min: 1
+      max: 8
+    - variable: maxNumSeqs
+      label: Max concurrent sequences
+      type: number
+      required: true
+      defaultValue: "8"
+    - variable: maxNumBatchedTokens
+      label: Max batched tokens per step
+      type: number
+      required: true
+      defaultValue: "8192"
+    - variable: vllmExtraArgs
+      label: Extra vLLM args
+      description: >-
+        One argument per line, appended verbatim to `vllm serve`. This is where the MODEL-SPECIFIC
+        flags go (tool-call parser, reasoning parser, speculative decoding, chat template kwargs).
+        Blank lines and #comments are ignored.
+      type: multiline
+      required: false
+      defaultValue: ""
+    - variable: vllmEnv
+      label: Extra vLLM environment
+      description: KEY=VALUE per line, added to the vLLM container. For GPU- or driver-specific switches. Blank lines and #comments are ignored.
+      type: multiline
+      required: false
+      defaultValue: ""
+    - variable: hfToken
+      label: Hugging Face token (optional)
+      description: Only needed for gated models or to avoid rate limits. Stored in a Secret in the namespace.
+      type: password
+      required: false
+      defaultValue: ""
+    - variable: image
+      label: vLLM image
+      type: string
+      required: true
+      # renovate: datasource=docker depName=vllm/vllm-openai
+      defaultValue: vllm/vllm-openai:v0.30.0
+    - variable: modelCache
+      label: Model cache storage
+      description: pvc (network-attached StorageClass recommended), hostPath (node-local directory, follows the pod), or emptyDir (no persistence).
+      type: string
+      required: true
+      options: ["pvc", "hostPath", "emptyDir"]
+      defaultValue: pvc
+    - variable: modelCacheSize
+      label: Model cache size
+      description: PVC request or emptyDir size limit. Weights plus compile caches; ignored for hostPath.
+      type: string
+      required: true
+      defaultValue: 150Gi
+      validation: '^[0-9]+(Gi|Ti)$'
+    - variable: modelCacheStorageClass
+      label: Model cache StorageClass
+      description: pvc only. Empty uses the tenant default. Avoid node-local classes such as local-path.
+      type: string
+      required: false
+      defaultValue: ""
+    - variable: modelCachePath
+      label: Model cache directory on the GPU node
+      description: hostPath only. Directory on the node that runs vLLM.
+      type: string
+      required: true
+      defaultValue: /var/lib/openclaw/vllm-cache
+    - variable: runtimeClassName
+      label: RuntimeClass
+      description: >-
+        Empty uses the node's default container runtime. Set to "nvidia" on clusters where the
+        NVIDIA runtime is installed but not the containerd default.
+      type: string
+      required: false
+      defaultValue: ""
+    - variable: memoryRequest
+      label: Memory request
+      type: string
+      required: true
+      defaultValue: 32Gi
+    - variable: cpuRequest
+      label: CPU request
+      type: string
+      required: true
+      defaultValue: "8"
+    - variable: shmSize
+      label: Shared memory size
+      description: /dev/shm for vLLM's worker processes. More for tensor parallelism.
+      type: string
+      required: true
+      defaultValue: 16Gi
+      validation: '^[0-9]+(Mi|Gi)$'
+    - variable: externalBaseUrl
+      label: External model base URL
+      description: Ignored here. Read by the -skip twin when modelBackend is external.
+      type: string
+      required: false
+      defaultValue: ""
+      validation: '^$|^https?://[^ ]+$'
+    - variable: externalApiKey
+      label: External model API key
+      description: Ignored here. The StackTemplate hands the key to steps 2, 4 and 5 as modelApiKey.
+      type: password
+      required: false
+      defaultValue: ""
+  config:
+    chart: {}
+    manifests: |
+      {{- $ns := "openclaw" }}
+      {{- $extra := .Values.vllmExtraArgs | default "" }}
+      {{- $env := .Values.vllmEnv | default "" }}
+      {{- $gpus := .Values.gpuCount | toString }}
+      {{- if .Values.hfToken }}
+      ---
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: vllm-hf-token
+        namespace: {{ $ns }}
+      type: Opaque
+      stringData:
+        token: {{ .Values.hfToken | quote }}
+      {{- end }}
+      {{- if eq .Values.modelCache "pvc" }}
+      ---
+      apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata:
+        name: vllm-cache
+        namespace: {{ $ns }}
+        annotations:
+          # Weights are re-downloadable, but a failed deploy uninstalls the release before it
+          # retries, and 50+ GB per retry adds up. Delete the claim by hand to reclaim the disk.
+          "helm.sh/resource-policy": keep
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- if .Values.modelCacheStorageClass }}
+        storageClassName: {{ .Values.modelCacheStorageClass }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.modelCacheSize }}
+      {{- end }}
+      ---
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: vllm
+        namespace: {{ $ns }}
+      spec:
+        type: ClusterIP
+        selector:
+          app: vllm
+        ports:
+          - name: http
+            port: 8000
+            targetPort: 8000
+      ---
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: vllm
+        namespace: {{ $ns }}
+      spec:
+        replicas: 1
+        selector:
+          matchLabels:
+            app: vllm
+        strategy:
+          # One set of GPUs and one RWO volume: two pods can never coexist.
+          type: Recreate
+        template:
+          metadata:
+            labels:
+              app: vllm
+          spec:
+            # The Service is called "vllm", so Kubernetes would inject VLLM_PORT=tcp://... and
+            # friends, and VLLM_PORT is a real vLLM setting (an integer). Turn service links off.
+            enableServiceLinks: false
+            {{- if .Values.runtimeClassName }}
+            runtimeClassName: {{ .Values.runtimeClassName }}
+            {{- end }}
+            tolerations:
+              - key: nvidia.com/gpu
+                operator: Exists
+                effect: NoSchedule
+            containers:
+              - name: vllm
+                image: {{ .Values.image | quote }}
+                command: ["vllm", "serve", {{ .Values.model | quote }}]
+                args:
+                  - --served-model-name
+                  - {{ .Values.servedModelName | quote }}
+                  - --host
+                  - "0.0.0.0"
+                  - --port
+                  - "8000"
+                  - --max-model-len
+                  - {{ .Values.maxModelLen | quote }}
+                  - --gpu-memory-utilization
+                  - {{ .Values.gpuMemoryUtilization | quote }}
+                  - --max-num-seqs
+                  - {{ .Values.maxNumSeqs | quote }}
+                  - --max-num-batched-tokens
+                  - {{ .Values.maxNumBatchedTokens | quote }}
+                  {{- if gt (int $gpus) 1 }}
+                  - --tensor-parallel-size
+                  - {{ $gpus | quote }}
+                  {{- end }}
+                  - --enable-auto-tool-choice
+                  {{- range $line := splitList "\n" $extra }}
+                  {{- $arg := trim $line }}
+                  {{- if and $arg (not (hasPrefix "#" $arg)) }}
+                  - {{ $arg | quote }}
+                  {{- end }}
+                  {{- end }}
+                env:
+                  - name: HF_HOME
+                    value: /data/hf
+                  - name: VLLM_CACHE_ROOT
+                    value: /data/vllm-cache
+                  {{- range $line := splitList "\n" $env }}
+                  {{- $l := trim $line }}
+                  {{- if and $l (not (hasPrefix "#" $l)) (contains "=" $l) }}
+                  {{- $kv := splitn "=" 2 $l }}
+                  - name: {{ trim $kv._0 | quote }}
+                    value: {{ trim $kv._1 | quote }}
+                  {{- end }}
+                  {{- end }}
+                  {{- if .Values.hfToken }}
+                  - name: HF_TOKEN
+                    valueFrom:
+                      secretKeyRef:
+                        name: vllm-hf-token
+                        key: token
+                  {{- end }}
+                ports:
+                  - name: http
+                    containerPort: 8000
+                resources:
+                  requests:
+                    cpu: {{ .Values.cpuRequest | quote }}
+                    memory: {{ .Values.memoryRequest | quote }}
+                    nvidia.com/gpu: {{ $gpus | quote }}
+                  limits:
+                    nvidia.com/gpu: {{ $gpus | quote }}
+                # /health answers 200 only once the engine is loaded, so this doubles as the
+                # "model is in VRAM" signal. 15s x 120 = 30 min covers a cold download.
+                startupProbe:
+                  httpGet: { path: /health, port: 8000 }
+                  periodSeconds: 15
+                  failureThreshold: 120
+                readinessProbe:
+                  httpGet: { path: /health, port: 8000 }
+                  periodSeconds: 15
+                livenessProbe:
+                  httpGet: { path: /health, port: 8000 }
+                  periodSeconds: 30
+                  failureThreshold: 6
+                volumeMounts:
+                  - { name: cache, mountPath: /data }
+                  - { name: shm,   mountPath: /dev/shm }
+            volumes:
+              - name: cache
+                {{- if eq .Values.modelCache "hostPath" }}
+                # Node-local cache that follows the pod to any GPU node (see the header).
+                hostPath:
+                  path: {{ .Values.modelCachePath | quote }}
+                  type: DirectoryOrCreate
+                {{- else if eq .Values.modelCache "pvc" }}
+                persistentVolumeClaim:
+                  claimName: vllm-cache
+                {{- else }}
+                emptyDir:
+                  sizeLimit: {{ .Values.modelCacheSize }}
+                {{- end }}
+              # vLLM's worker processes share tensors over /dev/shm; the container default of
+              # 64 MB is far too small.
+              - name: shm
+                emptyDir:
+                  medium: Memory
+                  sizeLimit: {{ .Values.shmSize }}
