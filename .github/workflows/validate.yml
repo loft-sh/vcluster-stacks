@@ -144,11 +144,11 @@ jobs:
                 fi
               done
           }
-          for directory in "${directories[@]}"; do
-            while IFS= read -r -d '' manifest; do
-              kubectl delete --ignore-not-found --filename "$manifest"
-            done < <(platform_manifests "$directory")
-          done
+          # The Platform seeds its bundled copy of these stacks asynchronously after the pod
+          # starts, with field manager "loft". A dry run that reaches a seeded object before
+          # seeding finishes would otherwise fail on field ownership, so take ownership of
+          # every field. The apply is a dry run and persists nothing; --validate=strict still
+          # rejects unknown or malformed fields.
           for directory in "${directories[@]}"; do
             while IFS= read -r -d '' manifest; do
               echo "::group::Validate $manifest"
@@ -157,6 +157,7 @@ jobs:
                 --server-side \
                 --dry-run=server \
                 --validate=strict \
+                --force-conflicts \
                 --request-timeout=30s \
                 --filename "$manifest" || status=$?
               echo "::endgroup::"
