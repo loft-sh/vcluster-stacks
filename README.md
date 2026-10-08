@@ -22,7 +22,7 @@ The Certified Stacks catalog currently contains these integrations:
 | --- | --- | --- |
 | [NVIDIA Run:ai](certified-stacks/run-ai/) | Dedicated control plane and central control plane | vCluster, NVIDIA GPU components, and NVIDIA Run:ai |
 | [NVIDIA Dynamo](certified-stacks/nvidia-dynamo/) | One runtime per tenant cluster or control plane cluster | NVIDIA Dynamo operator, NATS, and etcd |
-| [Saturn Cloud Enterprise](certified-stacks/saturn) | One installation per tenant cluster or control plane cluster | Saturn Cloud Helm operator and the Saturn Cloud Enterprise components it installs
+| [Saturn Cloud Enterprise](certified-stacks/saturn) | One installation per tenant cluster or control plane cluster | Saturn Cloud Helm operator and the Saturn Cloud Enterprise components it installs |
 
 For Run:ai, see [NVIDIA Run:ai integration guide](https://www.vcluster.com/docs/platform/next/integrations/certified-stacks/runai) to choose a deployment model and understand its prerequisites.
 
@@ -36,10 +36,11 @@ If you want to install an existing Certified Stack, use the resources bundled wi
 
 Copy a bundled StackTemplate when you need to customize it. Give the copy a different name and remove the `vcluster.com/certified` annotation so its ownership and update behavior remain clear.
 
-## Use a Community Stack 
+## Use a Community Stack
+
 - See the README included in a Community stack (if present).
 - Create a new Stack Template, then copy-and-paste the stacktemplate.yaml.
-- Or apply the Stack's `apps/` and `stacktemplate.yaml` to the Platform management API as its README describes, for example the [OpenClaw install steps](community-stacks/openclaw/README.md#install).
+- Or apply the Stack's `apps/` (Apps or ArgoCDApplicationTemplates), its `stacktemplate.yaml` and any supporting resources, such as NodeProfiles or a tenant cluster template, to the Platform management API as its README describes. See, for example, the [OpenClaw install steps](community-stacks/openclaw/README.md#install) or the [NVIDIA GPU Operator install steps](community-stacks/nvidia-gpu-operator/README.md#install).
 
 ## Build a Custom Stack
 
@@ -86,7 +87,7 @@ Do not commit credentials, tokens, private keys, or rendered Secrets. Use placeh
 
 We welcome Community Stack contributions! 
 
-As a reminder, using the native API does not by itself make a Stack Certified- and Certification means the integration has been reviewed, tested, and accepted into this catalog for automatic bundling with vCluster Platform. If you have interest in partnering with vCluster for a Certified Stack, please reach out.
+As a reminder, using the native API does not by itself make a Stack Certified. Certification means the integration has been reviewed, tested, and accepted into this catalog for automatic bundling with vCluster Platform. If you have interest in partnering with vCluster for a Certified Stack, please reach out.
 
 Keep each integration in its own top-level directory. A contribution should include:
 

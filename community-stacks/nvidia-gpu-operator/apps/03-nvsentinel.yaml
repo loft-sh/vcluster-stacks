@@ -1,0 +1,147 @@
+# CPU controllers and GPU node agents use the pool labels from node-profiles.yaml.
+# platformConnector is a node-local socket service, so it stays with GPU health monitors.
+apiVersion: management.loft.sh/v1
+kind: ArgoCDApplicationTemplate
+metadata:
+  name: nvidia-gpu-operator-nvsentinel
+  labels:
+    app.kubernetes.io/part-of: nvidia-gpu-operator-stack
+spec:
+  displayName: NVIDIA GPU Stack - NVSentinel
+  owner:
+    team: loft-admins
+  parameters:
+    - variable: cpuNodePool
+      label: CPU Service Pool Label
+      description: Value of workload.example.com/pool on CPU service workers.
+      type: string
+      required: true
+      defaultValue: cpu-services
+    - variable: version
+      label: Chart Version and Image Tag
+      type: string
+      required: true
+      # renovate: datasource=github-releases depName=NVIDIA/NVSentinel
+      defaultValue: v1.13.0
+    - variable: project
+      label: Argo CD Project
+      type: string
+      required: true
+      defaultValue: default
+    - variable: driverPreinstalled
+      label: NVIDIA Driver Preinstalled
+      type: boolean
+      defaultValue: 'false'
+    - variable: dcgmHost
+      label: DCGM Service Host
+      description: Supplied by the gpuready gate's contract when this template runs inside the nvidia-gpu-operator Stack.
+        The default applies when it is deployed on its own.
+      type: string
+      defaultValue: nvidia-dcgm.gpu-operator.svc
+    - variable: dcgmPort
+      label: DCGM Service Port
+      type: string
+      defaultValue: '5555'
+  template:
+    spec:
+      destination:
+        namespace: nvsentinel
+      project: '{{ .Values.project }}'
+      source:
+        chart: nvsentinel
+        repoURL: oci://ghcr.io/nvidia/nvsentinel
+        targetRevision: '{{ .Values.version }}'
+        helm:
+          releaseName: nvsentinel
+          values: |
+            global:
+              dryRun: true
+              image:
+                tag: '{{ .Values.version }}'
+              dcgm:
+                enabled: true
+                service:
+                  # default guards against an empty value if this runs outside the Stack.
+                  endpoint: {{ .Values.dcgmHost | default "nvidia-dcgm.gpu-operator.svc" | quote }}
+                  port: {{ .Values.dcgmPort | default "5555" }}
+              gpuHealthMonitor:
+                enabled: true
+              syslogHealthMonitor:
+                enabled: true
+              nicHealthMonitor:
+                enabled: false
+              cspHealthMonitor:
+                enabled: false
+              healthEventsAnalyzer:
+                enabled: false
+              mongodbStore:
+                enabled: false
+              faultQuarantine:
+                enabled: false
+              nodeDrainer:
+                enabled: false
+              faultRemediation:
+                enabled: false
+              janitor:
+                enabled: false
+              janitorProvider:
+                enabled: false
+              tracing:
+                enabled: false
+                endpoint: ''
+              auditLogging:
+                enabled: false
+              nodeSelector:
+                kubernetes.io/os: linux
+                workload.example.com/pool: gpu-compute
+              tolerations:
+              - key: nvidia.com/gpu
+                operator: Exists
+                effect: NoSchedule
+              systemNodeSelector:
+                kubernetes.io/os: linux
+                workload.example.com/pool: {{ .Values.cpuNodePool | quote }}
+              systemNodeTolerations: []
+            networkPolicy:
+              enabled: true
+            podMonitor:
+              enabled: false
+              interval: 30s
+            labeler:
+              assumeDriverInstalled: {{ .Values.driverPreinstalled | toString }}
+            janitor-provider:
+              csp:
+                provider: kind
+            mongodb-store:
+              mongodb:
+                persistence:
+                  size: 10Gi
+            platformConnector:
+              affinity:
+                nodeAffinity:
+                  requiredDuringSchedulingIgnoredDuringExecution:
+                    nodeSelectorTerms:
+                    - matchExpressions:
+                      - key: workload.example.com/pool
+                        operator: In
+                        values:
+                        - gpu-compute
+            nodeConditionCleanup:
+              nodeSelector:
+                kubernetes.io/os: linux
+                workload.example.com/pool: {{ .Values.cpuNodePool | quote }}
+              tolerations: []
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+        retry:
+          backoff:
+            duration: 30s
+            factor: 2
+            maxDuration: 10m
+          limit: 20
+        syncOptions:
+          - CreateNamespace=true
+          - ServerSideApply=true
+          - SkipDryRunOnMissingResource=true

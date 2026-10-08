@@ -54,6 +54,22 @@
       "matchStrings": [
         "# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+)(?: extractVersion=(?<extractVersion>\\S+))?\\s+version: \"?(?<currentValue>[^\\s\"]+)\"?"
       ]
+    },
+    {
+      "customType": "regex",
+      "description": "NVIDIA GPU Operator: chart and release versions pinned as parameter defaults",
+      "fileMatch": ["^community-stacks/nvidia-gpu-operator/stacktemplate\\.yaml$", "^community-stacks/nvidia-gpu-operator/virtualclustertemplate\\.yaml$", "^community-stacks/nvidia-gpu-operator/apps/.+\\.yaml$"],
+      "matchStrings": [
+        "# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+)(?: registryUrl=(?<registryUrl>\\S+))?\\s+defaultValue: [\"']?(?<currentValue>[^\\s\"']+)[\"']?"
+      ]
+    },
+    {
+      "customType": "regex",
+      "description": "NVIDIA GPU Operator: vCluster version pinned in the tenant cluster template",
+      "fileMatch": ["^community-stacks/nvidia-gpu-operator/virtualclustertemplate\\.yaml$"],
+      "matchStrings": [
+        "# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+)(?: extractVersion=(?<extractVersion>\\S+))?\\s+version: \"?(?<currentValue>[^\\s\"]+)\"?"
+      ]
     }
   ]
 }
