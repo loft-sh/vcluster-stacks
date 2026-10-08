@@ -1,0 +1,240 @@
+# NVIDIA GPU Operator and NVSentinel as one Stack, gated on GPUs the scheduler can actually see.
+#
+# Two kinds of task. GPU Operator and NVSentinel are argoCDApplication tasks: Argo CD owns their
+# reconciliation once the Stack has ordered the rollout. The readiness gates and the smoke test
+# are app tasks: Platform Apps whose manifests live in apps/, and whose Jobs run the
+# vCluster Platform image (.Values.__image__), so the Stack needs no image or chart of its own.
+#
+# cert-manager is not part of the Stack. NVSentinel in the dry-run configuration used here renders
+# no cert-manager resources; its MongoDB store, Janitor and preflight components need it, so a
+# production NVSentinel needs cert-manager installed first.
+#
+# Apply everything in apps/ together with this template. A templateRef is resolved when the task
+# runs, so a missing template shows as TemplateNotFound on that task.
+#
+# Tasks (the apps/ file numbers are a topological order of the graph):
+#   gpu-operator    (01) argoCDApplication: the NVIDIA GPU Operator
+#   gpuready        (02) app: waits for minGPUs allocatable GPUs, marks gpu-stack-contract ready
+#   dcgmready       (02) app: waits for the nvidia-dcgm DaemonSet to finish rolling out
+#   gpu-smoke-test  (03) app: CUDA VectorAdd on the GPU pool
+#   nvsentinel      (03) argoCDApplication: NVSentinel in dry-run mode
+#
+# Timeouts: every App `timeout` stays below the Platform per-deploy cap of 30m, and each task
+# timeout exceeds its App timeout, so the task timeout is the reporting path for a stuck step.
+# Write durations with seconds (15m0s): metav1.Duration normalizes on write, and a GitOps copy
+# written as 15m drifts forever.
+#
+# Stack-driven AppInstances do not apply App parameter defaults, so app tasks pass every value
+# they rely on, and booleans arrive as the strings "true" and "false".
+apiVersion: management.loft.sh/v1
+kind: StackTemplate
+metadata:
+  name: nvidia-gpu-operator
+  labels:
+    app.kubernetes.io/part-of: nvidia-gpu-operator-stack
+spec:
+  displayName: NVIDIA GPU Operator and NVSentinel
+  description: NVIDIA GPU Operator and NVSentinel on GPU workers, with controllers and readiness gates on CPU
+    service workers, gated on GPUs the scheduler can actually see and proven with a CUDA smoke test.
+  # NVIDIA's own NGC catalog logo for the GPU Operator, the icon in its Chart.yaml.
+  icon: https://assets.nvidiagrid.net/ngc/logos/GPUoperator.png
+  owner:
+    team: loft-admins
+  parameters:
+    - variable: argoProject
+      label: Argo CD Project
+      description: Argo CD project every task's Application belongs to. It must permit the chart sources and
+        the destination namespaces.
+      type: string
+      required: true
+      defaultValue: default
+      section: Argo CD
+    - variable: cpuNodePool
+      label: CPU Service Pool Label
+      description: Value of workload.example.com/pool on CPU service workers. The GPU Operator controller, the
+        NVSentinel labeler and the gate Jobs run there.
+      type: string
+      required: true
+      defaultValue: cpu-services
+      section: Node Pools
+    - variable: minGPUs
+      label: Minimum Allocatable GPUs
+      description: How many GPUs the scheduler must advertise before the gpuready gate passes and NVSentinel starts.
+      type: number
+      required: true
+      defaultValue: '1'
+      min: 1
+      section: Node Pools
+    - variable: driverPreinstalled
+      label: NVIDIA Driver Preinstalled
+      description: Enable when the node OS image already contains the NVIDIA driver. GPU Operator then skips the
+        driver and NVSentinel labels nodes in preinstalled-driver mode.
+      type: boolean
+      defaultValue: 'false'
+      section: GPU Operator
+    - variable: waitForClusterPolicy
+      label: Gate On ClusterPolicy As Well As GPU Capacity
+      description: Off by default. The gpuready gate verifies allocatable GPU capacity, which is the signal that
+        actually decides whether a GPU pod can be scheduled. ClusterPolicy aggregates every GPU Operator operand,
+        including dcgm-exporter, so gating on it makes the Stack wait on components no downstream task needs.
+        Enable it only if you want the Stack to hold until the whole operand set is healthy.
+      type: boolean
+      defaultValue: 'false'
+      section: GPU Operator
+    - variable: gpuOperatorVersion
+      label: GPU Operator Version
+      type: string
+      required: true
+      section: Versions
+      # renovate: datasource=helm depName=gpu-operator registryUrl=https://helm.ngc.nvidia.com/nvidia
+      defaultValue: v26.3.3
+    - variable: nvsentinelVersion
+      label: NVSentinel Chart and Image Version
+      type: string
+      required: true
+      section: Versions
+      # renovate: datasource=github-releases depName=NVIDIA/NVSentinel
+      defaultValue: v1.13.0
+  # Values the gate publishes, readable from the StackInstance outputs subresource.
+  publishedOutputs:
+    - name: gpucount
+      fromTask:
+        task: gpuready
+        output: gpucount
+    - name: gpupool
+      fromTask:
+        task: gpuready
+        output: gpupool
+    - name: dcgmhost
+      fromTask:
+        task: gpuready
+        output: dcgmhost
+    - name: dcgmport
+      fromTask:
+        task: gpuready
+        output: dcgmport
+  tasks:
+    - name: gpu-operator
+      timeout: 45m0s
+      argoCDApplication:
+        templateRef:
+          name: nvidia-gpu-operator-gpu-operator
+        parameters:
+          cpuNodePool: '{{ .Values.cpuNodePool }}'
+          version: '{{ .Values.gpuOperatorVersion }}'
+          project: '{{ .Values.argoProject }}'
+          driverPreinstalled: '{{ .Values.driverPreinstalled | toString }}'
+    # The GPU Operator Application goes Healthy as soon as its resources are created, long
+    # before a driver is built and a GPU is schedulable. This gate holds until the scheduler
+    # advertises minGPUs, then marks the contract ready for the tasks that read its outputs.
+    #
+    # The name has no hyphen on purpose: a task that declares outputs is referenced as
+    # {{ .Outputs.task.name }}, and the template syntax cannot address a name with "-".
+    - name: gpuready
+      dependsOn:
+        - gpu-operator
+      timeout: 28m0s
+      app:
+        templateRef:
+          name: nvidia-gpu-operator-gate
+        parameters:
+          cpuNodeSelector: 'workload.example.com/pool={{ .Values.cpuNodePool }}'
+          gateName: gpuready
+          # Off by default. Allocatable GPU capacity is the stronger signal and is checked
+          # regardless; ClusterPolicy only adds a wait on operands, such as dcgm-exporter,
+          # that nothing downstream depends on.
+          waitEnabled: '{{ .Values.waitForClusterPolicy | toString }}'
+          waitResource: clusterpolicy/cluster-policy
+          waitCondition: jsonpath={.status.state}=ready
+          watchAPIGroup: nvidia.com
+          watchResources: clusterpolicies
+          capacityResource: nvidia.com/gpu
+          capacityMin: '{{ .Values.minGPUs }}'
+          capacityNodeSelector: workload.example.com/pool=gpu-compute
+          contractName: gpu-stack-contract
+          # The gate App is workload-agnostic. The GPU keys belong here, with the Stack that
+          # publishes them.
+          contractData: |
+            gpuPool: gpu-compute
+            dcgmHost: nvidia-dcgm.gpu-operator.svc
+            dcgmPort: "5555"
+          timeoutSeconds: "1380"
+      outputs:
+        - name: gpucount
+          fromResource:
+            apiVersion: v1
+            kind: ConfigMap
+            namespace: gpu-stack
+            name: gpu-stack-contract
+            jsonPath: '{.data.observedCount}'
+        - name: gpupool
+          fromResource:
+            apiVersion: v1
+            kind: ConfigMap
+            namespace: gpu-stack
+            name: gpu-stack-contract
+            jsonPath: '{.data.gpuPool}'
+        - name: dcgmhost
+          fromResource:
+            apiVersion: v1
+            kind: ConfigMap
+            namespace: gpu-stack
+            name: gpu-stack-contract
+            jsonPath: '{.data.dcgmHost}'
+        - name: dcgmport
+          fromResource:
+            apiVersion: v1
+            kind: ConfigMap
+            namespace: gpu-stack
+            name: gpu-stack-contract
+            jsonPath: '{.data.dcgmPort}'
+    # The GPU Operator creates dcgm-exporter and nvidia-dcgm together, with nothing ordering
+    # them. NVSentinel started against a DCGM host engine that is not serving reports
+    # GpuDcgmConnectivityFailure. This gate only waits: no capacity check, no contract.
+    # It follows gpuready so a GPU node exists: a DaemonSet that schedules no pods yet has
+    # already finished rolling out. rollout covers any number of GPU workers.
+    - name: dcgmready
+      dependsOn:
+        - gpuready
+      timeout: 15m0s
+      app:
+        templateRef:
+          name: nvidia-gpu-operator-gate
+        parameters:
+          cpuNodeSelector: 'workload.example.com/pool={{ .Values.cpuNodePool }}'
+          gateName: dcgmready
+          waitResource: daemonset/nvidia-dcgm
+          waitNamespace: gpu-operator
+          waitCondition: rollout
+          watchAPIGroup: apps
+          watchResources: daemonsets
+          capacityMin: "0"
+          timeoutSeconds: "780"
+    # Proves the GPU computes, not only that the scheduler advertised it. Runs beside the
+    # dcgmready gate and NVSentinel, and occupies one GPU for the few seconds it takes.
+    - name: gpu-smoke-test
+      dependsOn:
+        - gpuready
+      timeout: 12m0s
+      app:
+        templateRef:
+          name: nvidia-gpu-operator-gpu-smoke-test
+        parameters:
+          gpuNodeSelector: 'workload.example.com/pool={{ .Outputs.gpuready.gpupool }}'
+          gpuCount: "1"
+    - name: nvsentinel
+      dependsOn:
+        - gpuready
+        - dcgmready
+      timeout: 20m0s
+      argoCDApplication:
+        templateRef:
+          name: nvidia-gpu-operator-nvsentinel
+        parameters:
+          cpuNodePool: '{{ .Values.cpuNodePool }}'
+          version: '{{ .Values.nvsentinelVersion }}'
+          project: '{{ .Values.argoProject }}'
+          driverPreinstalled: '{{ .Values.driverPreinstalled | toString }}'
+          # Read from the contract the gate published rather than hard-coded here.
+          dcgmHost: '{{ .Outputs.gpuready.dcgmhost }}'
+          dcgmPort: '{{ .Outputs.gpuready.dcgmport }}'

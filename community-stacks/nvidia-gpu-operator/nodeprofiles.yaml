@@ -1,0 +1,31 @@
+# Apply to the Platform management API before assigning profiles to node pools.
+# CPU nodes remain untainted. GPU taints are permanent scheduling policy.
+# No startupTaints: Node Ready does not prove NVIDIA initialization is complete.
+apiVersion: management.loft.sh/v1
+kind: NodeProfile
+metadata:
+  name: nvidia-gpu-operator-cpu-services
+  labels:
+    app.kubernetes.io/part-of: nvidia-gpu-operator-stack
+spec:
+  displayName: NVIDIA GPU Stack - CPU Services
+  description: CPU service workers.
+  nodeLabels:
+    workload.example.com/pool: cpu-services
+
+---
+apiVersion: management.loft.sh/v1
+kind: NodeProfile
+metadata:
+  name: nvidia-gpu-operator-gpu-compute
+  labels:
+    app.kubernetes.io/part-of: nvidia-gpu-operator-stack
+spec:
+  displayName: NVIDIA GPU Stack - GPU Compute
+  description: GPU workers reserved for workloads with the NVIDIA GPU toleration.
+  nodeLabels:
+    workload.example.com/pool: gpu-compute
+  taints:
+  - key: nvidia.com/gpu
+    value: 'true'
+    effect: NoSchedule

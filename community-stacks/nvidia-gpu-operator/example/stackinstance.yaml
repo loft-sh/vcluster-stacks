@@ -1,0 +1,35 @@
+# Installs the nvidia-gpu-operator Stack into an existing tenant cluster. Apply it in the project
+# namespace that owns the tenant cluster, for example
+# `kubectl apply -n p-default -f example/stackinstance.yaml`.
+#
+# The tenant cluster must already have:
+#   - the Argo CD integration enabled (integrations.argoCD.connector in its vcluster.yaml),
+#   - at least one CPU worker labeled workload.example.com/pool=cpu-services, and
+#   - GPU workers labeled workload.example.com/pool=gpu-compute and tainted
+#     nvidia.com/gpu=true:NoSchedule.
+# The NodeProfiles in nodeprofiles.yaml set both. To create a tenant cluster that has all of this,
+# use virtualclustertemplate.yaml instead of this file.
+#
+# spec.owner is required and, like spec.destination, immutable: to move the Stack, delete and
+# recreate it.
+apiVersion: management.loft.sh/v1
+kind: StackInstance
+metadata:
+  name: nvidia-gpu-operator
+  labels:
+    app.kubernetes.io/part-of: nvidia-gpu-operator-stack
+spec:
+  displayName: NVIDIA GPU Operator and NVSentinel
+  owner:
+    user: admin
+  destination:
+    virtualCluster:
+      name: my-tenant-cluster
+  templateRef:
+    name: nvidia-gpu-operator
+  parameters:
+    argoProject: default
+    cpuNodePool: cpu-services
+    minGPUs: "1"
+    # Set to "true" when the GPU node image already contains the NVIDIA driver.
+    driverPreinstalled: "false"

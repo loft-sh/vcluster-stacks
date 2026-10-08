@@ -1,0 +1,206 @@
+# Creates a tenant cluster with private nodes in two fixed pools and installs the
+# nvidia-gpu-operator Stack into it through deploy.stacks.
+#
+# Apply nodeprofiles.yaml, the ArgoCDApplicationTemplates in apps/ and stacktemplate.yaml before
+# this template. Needs vCluster Platform 4.12 or later and vCluster 0.37 or later for
+# deploy.stacks.
+#
+# Each pool pairs a nodeTypeSelector, which picks the machine the node provider hands out, with a
+# profile, which applies that NodeProfile's labels and taints as the node joins. The
+# vcluster.com/profile property in nodeTypeSelector names a node type published by the provider.
+# Despite the name, it is unrelated to the NodeProfile named in profile.
+apiVersion: management.loft.sh/v1
+kind: VirtualClusterTemplate
+metadata:
+  name: nvidia-gpu-operator-private-nodes
+  labels:
+    app.kubernetes.io/part-of: nvidia-gpu-operator-stack
+  annotations:
+    vcluster.com/template-icon: gpu.svg
+spec:
+  displayName: NVIDIA GPU Stack - Private Nodes
+  description: Fixed GPU and CPU private node pools with GPU Operator and NVSentinel delivered by a
+    Stack.
+  owner:
+    team: loft-admins
+  parameters:
+    - variable: kubernetesVersion
+      label: Kubernetes Version
+      description: Control plane Kubernetes version. Updating this value triggers a rolling upgrade of the
+        tenant cluster control plane while the fixed worker pools remain managed through the NodeClaim lifecycle.
+      options:
+        - v1.34.11
+        - v1.35.8
+        - v1.36.4
+        - v1.37.0
+      defaultValue: v1.36.4
+      section: Control Plane
+    - variable: argoConnector
+      label: Argo CD Connector
+      description: Existing Platform Argo CD connector name.
+      type: string
+      required: true
+      section: Argo CD
+    - variable: argoProject
+      label: Argo CD Project
+      type: string
+      required: true
+      defaultValue: default
+      section: Argo CD
+    - variable: gpuNodeProvider
+      label: GPU Node Provider
+      description: Node provider that supplies the GPU workers.
+      type: string
+      required: true
+      section: Node Pools
+    - variable: gpuNodeType
+      label: GPU Node Type
+      description: Value of the provider's vcluster.com/profile node type property for GPU machines.
+      type: string
+      required: true
+      defaultValue: xlarge-gpu
+      section: Node Pools
+    - variable: gpuNodeCount
+      label: GPU Worker Count
+      description: GPU workers to provision.
+      type: number
+      required: true
+      defaultValue: "1"
+      min: 1
+      section: Node Pools
+    - variable: cpuNodeProvider
+      label: CPU Node Provider
+      description: Node provider that supplies the CPU service worker. May be the same provider as the GPU pool.
+      type: string
+      required: true
+      section: Node Pools
+    - variable: cpuNodeType
+      label: CPU Node Type
+      description: Value of the provider's vcluster.com/profile node type property for the CPU service worker.
+        Size it for about 15 pods; 2 cpu / 4Gi was too small in testing.
+      type: string
+      required: true
+      defaultValue: large
+      section: Node Pools
+    - variable: cpuNodePool
+      label: CPU Service Pool Label
+      description: Value of workload.example.com/pool on CPU service workers. Must match the label set by the
+        nvidia-gpu-operator-cpu-services NodeProfile.
+      type: string
+      required: true
+      defaultValue: cpu-services
+      section: Node Pools
+    - variable: minGPUs
+      label: Minimum Allocatable GPUs
+      description: How many GPUs the scheduler must advertise before the gpuready gate passes.
+      type: number
+      required: true
+      defaultValue: "1"
+      min: 1
+      section: GPU Stack
+    - variable: driverPreinstalled
+      label: NVIDIA Driver Preinstalled
+      description: Enable when the GPU node OS image already contains the NVIDIA driver.
+      type: boolean
+      defaultValue: "false"
+      section: GPU Stack
+    - variable: waitForClusterPolicy
+      label: Gate On ClusterPolicy As Well As GPU Capacity
+      description: Off by default. The gpuready gate verifies allocatable GPU capacity, which is what decides
+        whether a GPU pod can be scheduled. Enable to also wait for every GPU Operator operand to be healthy.
+      type: boolean
+      defaultValue: "false"
+      section: GPU Stack
+    - variable: gpuOperatorVersion
+      label: GPU Operator Version
+      type: string
+      required: true
+      section: Versions
+      # renovate: datasource=helm depName=gpu-operator registryUrl=https://helm.ngc.nvidia.com/nvidia
+      defaultValue: v26.3.3
+    - variable: nvsentinelVersion
+      label: NVSentinel Chart and Image Version
+      type: string
+      required: true
+      section: Versions
+      # renovate: datasource=github-releases depName=NVIDIA/NVSentinel
+      defaultValue: v1.13.0
+  template:
+    pro:
+      enabled: true
+    helmRelease:
+      chart:
+        name: vcluster
+        repo: https://charts.loft.sh
+        # deploy.stacks needs 0.37 or later.
+        # renovate: datasource=github-releases depName=loft-sh/vcluster extractVersion=^v(?<version>.+)$
+        version: "0.37.2"
+      values: |-
+        privateNodes:
+          enabled: true
+          # Workers reach the control plane through the Platform VPN.
+          vpn:
+            enabled: true
+          # Pools inherit OS image, SSH keys and network configuration from their provider.
+          # One autoNodes entry per provider: both pools share an entry when one provider
+          # serves both.
+          autoNodes:
+            - provider: {{ .Values.gpuNodeProvider | quote }}
+              static:
+                - name: gpu
+                  profile: nvidia-gpu-operator-gpu-compute
+                  quantity: {{ .Values.gpuNodeCount }}
+                  nodeTypeSelector:
+                    - property: vcluster.com/profile
+                      operator: In
+                      values:
+                        - {{ .Values.gpuNodeType | quote }}
+        {{- if ne .Values.gpuNodeProvider .Values.cpuNodeProvider }}
+            - provider: {{ .Values.cpuNodeProvider | quote }}
+              static:
+        {{- end }}
+                # The CPU pool carries the GPU Operator controller, NFD master and gc, the
+                # NVSentinel labeler, the gate Jobs and the system pods. In testing, with
+                # cert-manager on the same pool, 2 cpu / 4Gi hit a 5 minute load average of 4.10
+                # during image extraction, and the operator lost its leader election lease and
+                # restarted three times.
+                - name: cpu
+                  profile: nvidia-gpu-operator-cpu-services
+                  quantity: 1
+                  nodeTypeSelector:
+                    - property: vcluster.com/profile
+                      operator: In
+                      values:
+                        - {{ .Values.cpuNodeType | quote }}
+
+        controlPlane:
+          backingStore:
+            etcd:
+              embedded:
+                enabled: true
+          distro:
+            k8s:
+              version: "{{ .Values.kubernetesVersion }}"
+
+        integrations:
+          argoCD:
+            enabled: true
+            connector: {{ .Values.argoConnector | quote }}
+
+        deploy:
+          cni:
+            flannel:
+              enabled: true
+          stacks:
+            - name: gpu
+              displayName: NVIDIA GPU Operator and NVSentinel
+              templateRef:
+                name: nvidia-gpu-operator
+              parameters:
+                argoProject: {{ .Values.argoProject | quote }}
+                cpuNodePool: {{ .Values.cpuNodePool | quote }}
+                minGPUs: {{ .Values.minGPUs | toString | quote }}
+                driverPreinstalled: {{ .Values.driverPreinstalled | toString | quote }}
+                waitForClusterPolicy: {{ .Values.waitForClusterPolicy | toString | quote }}
+                gpuOperatorVersion: {{ .Values.gpuOperatorVersion | quote }}
+                nvsentinelVersion: {{ .Values.nvsentinelVersion | quote }}
