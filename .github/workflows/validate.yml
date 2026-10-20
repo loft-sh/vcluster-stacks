@@ -64,7 +64,7 @@ jobs:
             fi
           done
       - name: Set up vind
-        uses: loft-sh/setup-vind@1ffff82986c3afff90ba8f357f69541b24e3a8f0 # v1
+        uses: loft-sh/setup-vind@v1 # v1
         with:
           version: ${{ env.VCLUSTER_VERSION }}
       - name: Set up Helm
