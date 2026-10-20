@@ -1,5 +1,5 @@
 # Apply App and StackTemplate manifests before this template.
-apiVersion: storage.loft.sh/v1
+apiVersion: management.loft.sh/v1
 kind: VirtualClusterTemplate
 metadata:
   name: saturn-enterprise-tenant
@@ -50,18 +50,15 @@ spec:
         labels:
           loft.sh/stacks-sync: "true"
     helmRelease:
+      chart:
+        version: "0.37.3"
       values: |-
-        controlPlane:
-          advanced:
-            workloadServiceAccount:
-              imagePullSecrets:
-                - name: engnode
         deploy:
           stacks:
             - name: saturn
               templateRef:
                 name: saturn-enterprise
-              inputs:
+              parameters:
                 nodeNames: {{ .Values.nodeNames }}
                 nodeRole: {{ .Values.nodeRole }}
                 taintSystemNodes: {{ .Values.taintSystemNodes }}

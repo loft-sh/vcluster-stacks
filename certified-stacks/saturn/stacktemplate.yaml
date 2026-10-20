@@ -1,11 +1,13 @@
-apiVersion: storage.loft.sh/v1
+apiVersion: management.loft.sh/v1
 kind: StackTemplate
 metadata:
   name: saturn-enterprise
+  annotations:
+    vcluster.com/certified: "true"
 spec:
   displayName: Saturn Cloud Enterprise
   description: Installs Saturn Cloud Enterprise Helm operator, then labels and optionally taints configured system nodes.
-  inputs:
+  parameters:
     - variable: nodeNames
       type: multiline
       description: Label nodes for system components. Leave empty to disable node scheduling.
@@ -51,7 +53,7 @@ spec:
       description: 'Derived from organization name during registration. Docs example: `ssh.my-org.saturnenterprise.io`.'
   tasks:
     - name: helm
-      taskTimeout: 30m
+      timeout: 35m
       app:
         templateRef:
           name: saturn-step-01-helm-operator
@@ -72,7 +74,7 @@ spec:
           taintSystemNodes: "{{ .Values.taintSystemNodes }}"
     - name: bash
       dependsOn: [helm]
-      taskTimeout: 10m
+      timeout: 15m
       app:
         templateRef:
           name: saturn-step-02-node-scheduling

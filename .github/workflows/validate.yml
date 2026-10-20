@@ -18,6 +18,7 @@ on:
     paths:
       - 'certified-stacks/run-ai/**'
       - 'certified-stacks/nvidia-dynamo/**'
+      - 'certified-stacks/saturn/**'
       - 'community-stacks/openclaw/**'
       - 'community-stacks/metered-inference/**'
       - 'community-stacks/nvidia-gpu-operator/**'
@@ -27,6 +28,7 @@ on:
     paths:
       - 'certified-stacks/run-ai/**'
       - 'certified-stacks/nvidia-dynamo/**'
+      - 'certified-stacks/saturn/**'
       - 'community-stacks/openclaw/**'
       - 'community-stacks/metered-inference/**'
       - 'community-stacks/nvidia-gpu-operator/**'
@@ -75,6 +77,8 @@ jobs:
         run: ./certified-stacks/run-ai/render.sh --check
       - name: Check NVIDIA Dynamo manifests
         run: ./certified-stacks/nvidia-dynamo/test-certified-manifests.sh
+      - name: Check Saturn Cloud Enterprise manifests
+        run: ./certified-stacks/saturn/test-certified-manifests.sh
       - name: Check OpenClaw manifests
         run: ./community-stacks/openclaw/test-manifests.sh
       - name: Check metered inference manifests
@@ -132,6 +136,7 @@ jobs:
             certified-stacks/run-ai/dedicated-control-plane
             certified-stacks/run-ai/central-control-plane
             certified-stacks/nvidia-dynamo
+            certified-stacks/saturn
             community-stacks/openclaw
             community-stacks/metered-inference
             community-stacks/nvidia-gpu-operator

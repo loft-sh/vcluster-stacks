@@ -55,6 +55,7 @@ Install the Stack at most once per destination. The CRDs are cluster-scoped, and
 | [`virtualclustertemplate.yaml`](virtualclustertemplate.yaml) | The `saturn-enterprise-tenant` VirtualClusterTemplate. Creates a tenant cluster and installs the Stack into it. |
 | [`apps/01-saturn-helm-operator.yaml`](apps/01-saturn-helm-operator.yaml) | The `saturn-step-01-helm-operator` App. Installs the `saturn-helm-operator` chart. |
 | [`apps/02-node-scheduling.yaml`](apps/02-node-scheduling.yaml) | The `saturn-step-02-node-scheduling` App. Labels and optionally taints the system nodes. |
+| [`test-certified-manifests.sh`](test-certified-manifests.sh) | Static checks that CI runs on every change in this directory. |
 
 ## Configure parameters
 
@@ -136,7 +137,7 @@ kubectl apply -n p-default -f stackinstance.yaml
 
 Do not commit a StackInstance that contains a real bootstrap token.
 
-The `helm` task waits up to 30 minutes for the operator release. The `bash` task waits up to 10 minutes for the node-scheduling Job.
+Helm waits up to 30 minutes for the operator release, and the `helm` task fails after 35 minutes. The node-scheduling Job gets 10 minutes, and the `bash` task fails after 15 minutes. Each task deadline sits above the App's own timeout, so a failed install reports Helm's error instead of a bare task timeout.
 
 ## Verify
 
@@ -210,7 +211,13 @@ Saturn Cloud's documentation does not cover uninstalling. Confirm the clean-up s
 
 ## Test changes
 
-This directory has no static checks yet. Validate the manifests with a server-side dry run against a non-production vCluster Platform:
+Run the static checks. They need `python3` with PyYAML and `helm`:
+
+```bash
+./certified-stacks/saturn/test-certified-manifests.sh
+```
+
+Then validate the manifests with a server-side dry run against a non-production vCluster Platform:
 
 ```bash
 vcluster platform connect management
