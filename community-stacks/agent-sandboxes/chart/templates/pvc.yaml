@@ -1,0 +1,22 @@
+{{- if and .Values.persistence.enabled (not .Values.persistence.existingClaim) }}
+# The audit trail (audit.db) and sign-in sessions (auth.db). "keep": deleting the
+# release does not delete the audit trail.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "vbox.dataClaim" . }}
+  namespace: {{ include "vbox.namespace" . }}
+  labels:
+    {{- include "vbox.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/resource-policy: keep
+spec:
+  accessModes:
+    {{- toYaml .Values.persistence.accessModes | nindent 4 }}
+  {{- with .Values.persistence.storageClassName }}
+  storageClassName: {{ . }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.persistence.size }}
+{{- end }}

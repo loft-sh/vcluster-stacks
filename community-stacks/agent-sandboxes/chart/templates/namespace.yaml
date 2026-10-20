@@ -1,0 +1,26 @@
+{{- include "vbox.checkNamespace" . }}
+{{- if .Values.namespace.create }}
+# vBox's dedicated namespace, created by the chart. Helm installs Namespaces
+# before everything else in a release, so the objects below land in it.
+#
+# Pod Security "restricted", like agent-sandbox-system and the sandbox namespace.
+# "keep": uninstalling leaves it, and with it the settings Secret and the audit
+# trail's PVC (both "keep" too). Delete it by hand to remove those for good.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ include "vbox.namespace" . }}
+  labels:
+    {{- include "vbox.labels" . | nindent 4 }}
+    pod-security.kubernetes.io/enforce: {{ .Values.namespace.podSecurity }}
+    pod-security.kubernetes.io/audit: {{ .Values.namespace.podSecurity }}
+    pod-security.kubernetes.io/warn: {{ .Values.namespace.podSecurity }}
+    {{- with .Values.namespace.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  annotations:
+    helm.sh/resource-policy: keep
+    {{- with .Values.namespace.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+{{- end }}

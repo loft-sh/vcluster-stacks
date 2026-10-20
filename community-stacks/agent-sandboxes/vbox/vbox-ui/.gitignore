@@ -1,0 +1,12 @@
+/node_modules
+/.next/
+/out/
+/build
+/coverage
+npm-debug.log*
+.env*
+*.tsbuildinfo
+next-env.d.ts
+.DS_Store
+# Audit trail database written by the collector (VBOX_DATA_DIR).
+/data/
