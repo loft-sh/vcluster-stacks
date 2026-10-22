@@ -1,0 +1,324 @@
+# A temporary tenant cluster for qualifying one GPU server. Its only private node is that server,
+# claimed from a node provider, and it installs the gpu-burn-in Stack through deploy.stacks.
+# Delete the tenant cluster when the qualification is recorded; that releases the server back to
+# its provider.
+#
+# Apply apps/ and stacktemplate.yaml before this template. Needs vCluster Platform 4.12 or later
+# and vCluster 0.37 or later for deploy.stacks.
+#
+# The pool picks its server by one node type property. To qualify a specific machine, select a
+# property only that machine's node type carries, so the claim cannot land on another server.
+apiVersion: management.loft.sh/v1
+kind: VirtualClusterTemplate
+metadata:
+  name: gpu-burn-in-private-nodes
+  labels:
+    app.kubernetes.io/part-of: gpu-burn-in-stack
+  annotations:
+    vcluster.com/template-icon: gpu.svg
+spec:
+  displayName: GPU Burn-In - Private Node
+  description: A temporary tenant cluster that claims one GPU server and qualifies it with the gpu-burn-in
+    Stack.
+  owner:
+    team: loft-admins
+  parameters:
+    - variable: kubernetesVersion
+      label: Kubernetes Version
+      type: string
+      options:
+        - v1.34.11
+        - v1.35.8
+        - v1.36.4
+        - v1.37.0
+      defaultValue: v1.36.4
+      section: Control Plane
+    - variable: argoConnector
+      label: Argo CD Connector
+      description: Existing Platform Argo CD connector name.
+      type: string
+      required: true
+      section: Argo CD
+    - variable: argoProject
+      label: Argo CD Project
+      type: string
+      required: true
+      defaultValue: default
+      section: Argo CD
+    - variable: chartRepoURL
+      label: Test Chart Repository
+      type: string
+      required: true
+      defaultValue: https://github.com/loft-sh/vcluster-stacks.git
+      section: Argo CD
+    - variable: chartRevision
+      label: Test Chart Revision
+      type: string
+      required: true
+      defaultValue: main
+      section: Argo CD
+    - variable: gpuNodeProvider
+      label: Node Provider
+      description: Node provider that supplies the GPU server.
+      type: string
+      required: true
+      section: Server
+    - variable: nodeTypeProperty
+      label: Node Type Property
+      description: Node type property that selects the server, for example vcluster.com/profile or
+        vcluster.com/accelerator.
+      type: string
+      required: true
+      defaultValue: vcluster.com/profile
+      section: Server
+    - variable: nodeTypeValue
+      label: Node Type Value
+      description: Value of that property on the server's node type.
+      type: string
+      required: true
+      defaultValue: xlarge-gpu
+      section: Server
+    - variable: expectedGPUs
+      label: Expected GPUs
+      type: number
+      required: true
+      defaultValue: '8'
+      min: 1
+      section: Server
+    - variable: gpuModel
+      label: GPU Model
+      description: Case-insensitive substring every GPU name must contain, for example B300.
+      type: string
+      section: Server
+    - variable: nvlinkFabric
+      label: NVLink Fabric
+      description: auto checks the NVLink fabric of GPUs that report one, required also fails GPUs without one, off skips it.
+      type: string
+      options: [auto, required, "off"]
+      defaultValue: auto
+      section: Server
+    - variable: assetID
+      label: Asset ID
+      description: The server's inventory name, for example its BareMetalHost or NetBox device.
+      type: string
+      section: Server
+    - variable: profile
+      label: Qualification Profile
+      type: string
+      required: true
+      defaultValue: default
+      section: Server
+    - variable: driverPreinstalled
+      label: NVIDIA Driver Preinstalled
+      type: boolean
+      defaultValue: 'false'
+      section: Server
+    - variable: driverVersion
+      label: NVIDIA Driver Version
+      description: The driver the GPU Operator builds, for example 580.126.20. Empty uses its default. Pin a 580 driver for V100.
+      type: string
+      section: Server
+    - variable: nvmlMock
+      label: Simulated GPUs (nvml-mock)
+      description: The server's GPUs come from NVIDIA nvml-mock. Adjusts the GPU Operator's validator and GPU
+        Feature Discovery for simulated GPUs. Never enable it on real GPUs.
+      type: boolean
+      defaultValue: 'false'
+      section: Server
+    - variable: telemetry
+      label: DCGM Telemetry During Burn-In
+      description: Standalone DCGM and dcgm-exporter, so the burn-in shows on the Fleet Observability GPU dashboards.
+      type: boolean
+      defaultValue: 'true'
+      section: Server
+    - variable: stopOnFailure
+      label: Stop On First Failure
+      type: boolean
+      defaultValue: 'true'
+      section: Tests
+    - variable: runDCGMDiag
+      label: Run DCGM Diagnostics
+      description: Needs CUDA. Disable on simulated GPUs (nvml-mock).
+      type: boolean
+      defaultValue: 'true'
+      section: Tests
+    - variable: dcgmDiagLevel
+      label: DCGM Diagnostic Level
+      type: string
+      options: ['1', '2', '3', '4']
+      defaultValue: '3'
+      section: Tests
+    - variable: dcgmExtraTests
+      label: Extra DCGM Tests
+      type: string
+      section: Tests
+    - variable: failOnSkip
+      label: Fail On Skipped DCGM Tests
+      type: boolean
+      defaultValue: 'false'
+      section: Tests
+    - variable: runNCCL
+      label: Run NCCL Tests
+      description: Needs CUDA. Disable on simulated GPUs (nvml-mock).
+      type: boolean
+      defaultValue: 'true'
+      section: Tests
+    - variable: ncclMaxBytes
+      label: NCCL Maximum Message Size
+      type: string
+      defaultValue: 1G
+      section: Tests
+    - variable: ncclMinBusBandwidthGBps
+      label: NCCL Minimum Bus Bandwidth (GB/s)
+      type: number
+      defaultValue: '0'
+      min: 0
+      section: Tests
+    - variable: soakMinutes
+      label: Soak Minutes
+      type: number
+      defaultValue: '60'
+      min: 0
+      max: 1440
+      section: Tests
+    - variable: soakLoad
+      label: Soak Load
+      type: string
+      options: [dcgm, none]
+      defaultValue: dcgm
+      section: Tests
+    - variable: maxGPUTempC
+      label: Maximum GPU Temperature (C)
+      type: number
+      defaultValue: '90'
+      section: Tests
+    - variable: maxNVLinkErrors
+      label: Maximum NVLink Errors
+      type: number
+      defaultValue: '0'
+      section: Tests
+    - variable: reportS3URI
+      label: Report S3 URI
+      type: string
+      section: Report
+    - variable: s3CredentialsSecret
+      label: S3 Credentials Secret
+      type: string
+      section: Report
+    - variable: s3Endpoint
+      label: S3 Endpoint
+      type: string
+      section: Report
+    - variable: recordResult
+      label: Record The Result
+      description: Lets the gpu-burn-in-recorder controller, if installed, record the result on the server's
+        Machine or BareMetalHost. No effect without the controller.
+      type: boolean
+      defaultValue: 'true'
+      section: Recording
+    - variable: netboxUpdate
+      label: Update NetBox
+      description: Lets the recorder also update the server's NetBox device. A failure sets the device status to
+        failed and removes the tag that brings it into vCluster Platform.
+      type: boolean
+      defaultValue: 'false'
+      section: Recording
+    - variable: releaseServer
+      label: Release The Server When Recorded
+      description: Lets the recorder delete this tenant cluster once the result is recorded, which returns the
+        server to its node provider.
+      type: boolean
+      defaultValue: 'false'
+      section: Recording
+    - variable: gpuOperatorVersion
+      label: GPU Operator Version
+      type: string
+      required: true
+      section: Versions
+      # renovate: datasource=helm depName=gpu-operator registryUrl=https://helm.ngc.nvidia.com/nvidia
+      defaultValue: v26.3.3
+    - variable: toolsImage
+      label: Tools Image
+      type: string
+      required: true
+      section: Versions
+      # renovate: datasource=docker depName=alpine/k8s
+      defaultValue: alpine/k8s:1.36.5
+    - variable: dcgmImage
+      label: DCGM Image
+      type: string
+      required: true
+      section: Versions
+      # renovate: datasource=docker depName=nvcr.io/nvidia/cloud-native/dcgm
+      defaultValue: nvcr.io/nvidia/cloud-native/dcgm:4.5.3-1-ubuntu24.04
+    - variable: ncclImage
+      label: NCCL Tests Image
+      type: string
+      required: true
+      section: Versions
+      # renovate: datasource=docker depName=nvcr.io/nvidia/pytorch
+      defaultValue: nvcr.io/nvidia/pytorch:26.09-py3
+  template:
+    pro:
+      enabled: true
+    helmRelease:
+      chart:
+        name: vcluster
+        repo: https://charts.loft.sh
+        # deploy.stacks needs 0.37 or later.
+        # renovate: datasource=github-releases depName=loft-sh/vcluster extractVersion=^v(?<version>.+)$
+        version: "0.37.2"
+      # A parameter used directly below falls back to its own defaultValue, so a tenant cluster created
+      # with kubectl, which gets no parameter defaults, renders the same as one created in the UI. The
+      # Platform compares the two and otherwise reports the tenant cluster out of date. test-manifests.sh
+      # checks that each fallback matches its parameter's defaultValue.
+      values: |-
+        privateNodes:
+          enabled: true
+          vpn:
+            enabled: true
+          autoNodes:
+            - provider: {{ .Values.gpuNodeProvider | quote }}
+              static:
+                # Exactly one server, untainted: CoreDNS and the GPU Operator controllers run on
+                # it too, and the tests have it to themselves.
+                - name: gpu
+                  quantity: 1
+                  nodeTypeSelector:
+                    - property: {{ .Values.nodeTypeProperty | default "vcluster.com/profile" | quote }}
+                      operator: In
+                      values:
+                        - {{ .Values.nodeTypeValue | default "xlarge-gpu" | quote }}
+
+        controlPlane:
+          backingStore:
+            etcd:
+              embedded:
+                enabled: true
+          distro:
+            k8s:
+              version: "{{ .Values.kubernetesVersion | default "v1.36.4" }}"
+
+        integrations:
+          argoCD:
+            enabled: true
+            connector: {{ .Values.argoConnector | quote }}
+
+        deploy:
+          cni:
+            flannel:
+              enabled: true
+          stacks:
+            - name: burnin
+              displayName: GPU Burn-In and Qualification
+              templateRef:
+                name: gpu-burn-in
+              # Only the parameters the instance sets. A VirtualClusterInstance created with kubectl
+              # carries no template defaults, and an unset value renders as <nil>, which the
+              # Stack rejects. An omitted parameter takes the StackTemplate default instead.
+              parameters:
+              {{- range $k := list "argoProject" "chartRepoURL" "chartRevision" "expectedGPUs" "gpuModel" "nvlinkFabric" "assetID" "profile" "driverPreinstalled" "driverVersion" "telemetry" "nvmlMock" "stopOnFailure" "runDCGMDiag" "dcgmDiagLevel" "dcgmExtraTests" "failOnSkip" "runNCCL" "ncclMaxBytes" "ncclMinBusBandwidthGBps" "soakMinutes" "soakLoad" "maxGPUTempC" "maxNVLinkErrors" "reportS3URI" "s3CredentialsSecret" "s3Endpoint" "recordResult" "netboxUpdate" "releaseServer" "gpuOperatorVersion" "toolsImage" "dcgmImage" "ncclImage" }}
+              {{- if not (kindIs "invalid" (index $.Values $k)) }}
+                {{ $k }}: {{ index $.Values $k | toString | quote }}
+              {{- end }}
+              {{- end }}

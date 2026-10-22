@@ -1,0 +1,44 @@
+{{- $f := (.Values.metrics | default dict).fleetObservability | default dict }}
+{{- if $f.enabled }}
+{{- if or (not $f.endpoint) (not $f.cluster) }}
+{{- fail "metrics.fleetObservability needs endpoint and cluster" }}
+{{- end }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "recorder.name" . }}-fleet-collector
+  labels:
+    {{- include "recorder.labels" . | nindent 4 }}
+data:
+  config.yaml: |
+    receivers:
+      prometheus:
+        config:
+          scrape_configs:
+            - job_name: gpu-burn-in-recorder
+              scrape_interval: {{ $f.scrapeInterval }}
+              static_configs:
+                - targets: [localhost:8080]
+              metric_relabel_configs:
+                - source_labels: [__name__]
+                  regex: gpu_qualification_.*
+                  action: keep
+    processors:
+      memory_limiter:
+        check_interval: 5s
+        limit_percentage: 80
+        spike_limit_percentage: 25
+      batch: {}
+    exporters:
+      otlp_http:
+        endpoint: {{ $f.endpoint }}
+        headers:
+          X-Vcluster-Platform-Cluster: {{ $f.cluster }}
+          Authorization: ${env:FLEET_AUTHORIZATION}
+    service:
+      pipelines:
+        metrics:
+          receivers: [prometheus]
+          processors: [memory_limiter, batch]
+          exporters: [otlp_http]
+{{- end }}

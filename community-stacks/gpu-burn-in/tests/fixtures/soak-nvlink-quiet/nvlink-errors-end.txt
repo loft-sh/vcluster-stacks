@@ -1,0 +1,72 @@
+GPU 0: NVIDIA B300 SXM6 AC (UUID: GPU-00000000-aaaa-bbbb-cccc-000000000000)
+	 Link 0: Replay Errors: 0
+	 Link 0: Recovery Errors: 0
+	 Link 0: CRC Errors: 0
+	 Link 0: FEC Errors - 0: 98000
+	 Link 1: Replay Errors: 0
+	 Link 1: Recovery Errors: 0
+	 Link 1: CRC Errors: 0
+	 Link 1: FEC Errors - 0: 98000
+GPU 1: NVIDIA B300 SXM6 AC (UUID: GPU-00000001-aaaa-bbbb-cccc-000000000001)
+	 Link 0: Replay Errors: 0
+	 Link 0: Recovery Errors: 0
+	 Link 0: CRC Errors: 0
+	 Link 0: FEC Errors - 0: 98000
+	 Link 1: Replay Errors: 0
+	 Link 1: Recovery Errors: 0
+	 Link 1: CRC Errors: 0
+	 Link 1: FEC Errors - 0: 98000
+GPU 2: NVIDIA B300 SXM6 AC (UUID: GPU-00000002-aaaa-bbbb-cccc-000000000002)
+	 Link 0: Replay Errors: 0
+	 Link 0: Recovery Errors: 0
+	 Link 0: CRC Errors: 0
+	 Link 0: FEC Errors - 0: 98000
+	 Link 1: Replay Errors: 0
+	 Link 1: Recovery Errors: 0
+	 Link 1: CRC Errors: 0
+	 Link 1: FEC Errors - 0: 98000
+GPU 3: NVIDIA B300 SXM6 AC (UUID: GPU-00000003-aaaa-bbbb-cccc-000000000003)
+	 Link 0: Replay Errors: 7
+	 Link 0: Recovery Errors: 0
+	 Link 0: CRC Errors: 0
+	 Link 0: FEC Errors - 0: 98000
+	 Link 1: Replay Errors: 0
+	 Link 1: Recovery Errors: 0
+	 Link 1: CRC Errors: 0
+	 Link 1: FEC Errors - 0: 98000
+GPU 4: NVIDIA B300 SXM6 AC (UUID: GPU-00000004-aaaa-bbbb-cccc-000000000004)
+	 Link 0: Replay Errors: 0
+	 Link 0: Recovery Errors: 0
+	 Link 0: CRC Errors: 0
+	 Link 0: FEC Errors - 0: 98000
+	 Link 1: Replay Errors: 0
+	 Link 1: Recovery Errors: 0
+	 Link 1: CRC Errors: 0
+	 Link 1: FEC Errors - 0: 98000
+GPU 5: NVIDIA B300 SXM6 AC (UUID: GPU-00000005-aaaa-bbbb-cccc-000000000005)
+	 Link 0: Replay Errors: 0
+	 Link 0: Recovery Errors: 0
+	 Link 0: CRC Errors: 0
+	 Link 0: FEC Errors - 0: 98000
+	 Link 1: Replay Errors: 0
+	 Link 1: Recovery Errors: 0
+	 Link 1: CRC Errors: 0
+	 Link 1: FEC Errors - 0: 98000
+GPU 6: NVIDIA B300 SXM6 AC (UUID: GPU-00000006-aaaa-bbbb-cccc-000000000006)
+	 Link 0: Replay Errors: 0
+	 Link 0: Recovery Errors: 0
+	 Link 0: CRC Errors: 0
+	 Link 0: FEC Errors - 0: 98000
+	 Link 1: Replay Errors: 0
+	 Link 1: Recovery Errors: 0
+	 Link 1: CRC Errors: 0
+	 Link 1: FEC Errors - 0: 98000
+GPU 7: NVIDIA B300 SXM6 AC (UUID: GPU-00000007-aaaa-bbbb-cccc-000000000007)
+	 Link 0: Replay Errors: 0
+	 Link 0: Recovery Errors: 0
+	 Link 0: CRC Errors: 0
+	 Link 0: FEC Errors - 0: 98000
+	 Link 1: Replay Errors: 0
+	 Link 1: Recovery Errors: 0
+	 Link 1: CRC Errors: 0
+	 Link 1: FEC Errors - 0: 98000

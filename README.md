@@ -40,7 +40,8 @@ Copy a bundled StackTemplate when you need to customize it. Give the copy a diff
 
 - See the README included in a Community stack (if present).
 - Create a new Stack Template, then copy-and-paste the stacktemplate.yaml.
-- Or apply the Stack's `apps/` (Apps or ArgoCDApplicationTemplates), its `stacktemplate.yaml` and any supporting resources, such as NodeProfiles or a tenant cluster template, to the Platform management API as its README describes. See, for example, the [OpenClaw install steps](community-stacks/openclaw/README.md#install) or the [NVIDIA GPU Operator install steps](community-stacks/nvidia-gpu-operator/README.md#install).
+- Or apply the Stack's `apps/` (Apps or ArgoCDApplicationTemplates), its `stacktemplate.yaml` and any supporting resources, such as NodeProfiles or a tenant cluster template, to the Platform management API as its README describes. See, for example, the [OpenClaw install steps](community-stacks/openclaw/README.md#install), the [NVIDIA GPU Operator install steps](community-stacks/nvidia-gpu-operator/README.md#install) or the [GPU burn-in install steps](community-stacks/gpu-burn-in/README.md#install).
+- Some Stacks have Argo CD read a chart from this repository, such as the [GPU burn-in Stack](community-stacks/gpu-burn-in/), whose steps run longer than the 30 minute limit on a Platform App deploy. Their Argo CD project must permit this repository, or your fork, as a source.
 
 ## Build a Custom Stack
 

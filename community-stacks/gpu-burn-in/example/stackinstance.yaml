@@ -1,0 +1,41 @@
+# Qualifies the GPU server in an existing tenant cluster. Apply it in the project namespace that
+# owns the tenant cluster, for example
+# `kubectl apply -n p-default -f example/stackinstance.yaml`.
+#
+# The tenant cluster must have the Argo CD integration enabled and exactly one GPU node, the server
+# under test, with nothing else using its GPUs. A tenant cluster created from
+# virtualclustertemplate.yaml has both, and installs this Stack itself.
+#
+# These values are a starting point for an 8-GPU HGX B300. Set ncclMinBusBandwidthGBps from a
+# known-good server of the same model before relying on the NCCL result.
+#
+# spec.owner is required and, like spec.destination, immutable.
+apiVersion: management.loft.sh/v1
+kind: StackInstance
+metadata:
+  name: gpu-burn-in
+  labels:
+    app.kubernetes.io/part-of: gpu-burn-in-stack
+spec:
+  displayName: GPU Burn-In and Qualification
+  owner:
+    user: admin
+  destination:
+    virtualCluster:
+      name: my-qualification-cluster
+  templateRef:
+    name: gpu-burn-in
+  parameters:
+    argoProject: default
+    expectedGPUs: "8"
+    gpuModel: B300
+    assetID: b300-rack-a-u12
+    profile: b300-burnin-v1
+    driverPreinstalled: "true"
+    dcgmDiagLevel: "4"
+    dcgmExtraTests: nvbandwidth,pulse_test
+    failOnSkip: "true"
+    ncclMaxBytes: 8G
+    ncclMinBusBandwidthGBps: "0"
+    soakMinutes: "720"
+    maxGPUTempC: "85"

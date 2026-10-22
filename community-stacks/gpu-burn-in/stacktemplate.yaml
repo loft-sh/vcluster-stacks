@@ -1,0 +1,533 @@
+# GPU burn-in and qualification for one GPU server, run in a temporary tenant cluster whose only
+# private node is that server.
+#
+# Every step is an argoCDApplication task. A Platform App deploy stops at 30 minutes, and DCGM
+# level 4 or a soak runs for hours; an Argo CD task waits as long as its own timeout. The steps
+# are one chart (chart/, read from Git) deployed once per task by gpu-burn-in-test.
+#
+# Tasks run one after another, because GPU tests interfere with each other's measurements:
+#   gpu-operator  the NVIDIA GPU Operator; with telemetry, its DCGM and dcgm-exporter feed the
+#                 Fleet Observability dashboards and the DCGM tests share that host engine
+#   gpuready      waits for allocatable nvidia.com/gpu and publishes the count as an output
+#   inventory     nvidia-smi: GPU count, model, uncorrected ECC, NVLink link state, DMI identity
+#   dcgmdiag      dcgmi diag -r <level>, plus optional named tests such as nvbandwidth
+#   nccl          nccl-tests all_reduce, all_gather and reduce_scatter with correctness checks
+#   soak          DCGM targeted_stress and targeted_power for soakMinutes, with dmon telemetry
+#   report        collects every result into ConfigMap gpu-burn-in-report, optionally to S3
+#   verdict       fails when the report says failed, so the Stack fails with the reason
+#
+# A test records failed, skipped or error in its result ConfigMap and still completes, so a bad
+# server still gets a report. With stopOnFailure, the tests after a failure record skipped
+# without running. Only verdict fails its Job; by then report has captured its outputs, so the
+# result stays readable from the StackInstance.
+#
+# GPU tests request the GPUs gpuready saw, not expectedGPUs: a server with a missing GPU fails
+# inventory instead of leaving every later pod Pending until a timeout.
+#
+# Write durations with seconds (15m0s): metav1.Duration normalizes on write, and a GitOps copy
+# written as 15m drifts forever. Tasks that declare outputs have no hyphen in their names.
+apiVersion: management.loft.sh/v1
+kind: StackTemplate
+metadata:
+  name: gpu-burn-in
+  labels:
+    app.kubernetes.io/part-of: gpu-burn-in-stack
+spec:
+  displayName: GPU Burn-In and Qualification
+  description: Qualifies one GPU server before it joins tenant capacity. GPU inventory, DCGM diagnostics,
+    NCCL collectives and a sustained power and thermal soak, with a structured pass or fail report.
+  icon: https://assets.nvidiagrid.net/ngc/logos/GPUoperator.png
+  owner:
+    team: loft-admins
+  parameters:
+    - variable: argoProject
+      label: Argo CD Project
+      description: Must permit the GPU Operator chart, the chart repository below, and the namespaces gpu-operator
+        and gpu-burn-in.
+      type: string
+      required: true
+      defaultValue: default
+      section: Argo CD
+    - variable: chartRepoURL
+      label: Test Chart Repository
+      description: Git repository holding community-stacks/gpu-burn-in/chart. Point it at a fork to test changes.
+      type: string
+      required: true
+      defaultValue: https://github.com/loft-sh/vcluster-stacks.git
+      section: Argo CD
+    - variable: chartRevision
+      label: Test Chart Revision
+      type: string
+      required: true
+      defaultValue: main
+      section: Argo CD
+    - variable: expectedGPUs
+      label: Expected GPUs
+      description: GPUs the server must have. Fewer fails inventory.
+      type: number
+      required: true
+      defaultValue: '8'
+      min: 1
+      section: Server
+    - variable: gpuModel
+      label: GPU Model
+      description: Case-insensitive substring every GPU name must contain, for example B300. Empty skips the check.
+      type: string
+      section: Server
+    - variable: nvlinkFabric
+      label: NVLink Fabric
+      description: auto checks the NVLink fabric of GPUs that report one (GB200 and GB300 NVL trays) and
+        skips the rest. required also fails GPUs with no fabric attachment. off skips the check.
+      type: string
+      options: [auto, required, "off"]
+      defaultValue: auto
+      section: Server
+    - variable: assetID
+      label: Asset ID
+      description: How the inventory knows this server, for example its BareMetalHost or NetBox device name.
+        Recorded in the report for the automation that marks the server qualified or quarantined.
+      type: string
+      section: Server
+    - variable: profile
+      label: Qualification Profile
+      description: A name for this set of thresholds, recorded in the report, for example b300-burnin-v1.
+      type: string
+      required: true
+      defaultValue: default
+      section: Server
+    - variable: stopOnFailure
+      label: Stop On First Failure
+      description: Skip the remaining tests once one fails, so a bad server is not stressed for hours.
+      type: boolean
+      defaultValue: 'true'
+      section: Tests
+    - variable: runDCGMDiag
+      label: Run DCGM Diagnostics
+      description: Needs CUDA. Disable on simulated GPUs (nvml-mock).
+      type: boolean
+      defaultValue: 'true'
+      section: Tests
+    - variable: dcgmDiagLevel
+      label: DCGM Diagnostic Level
+      description: 1 quick (seconds), 2 medium (about 2 minutes), 3 long (about 30 minutes), 4 extended (hours).
+      type: string
+      options: ['1', '2', '3', '4']
+      defaultValue: '3'
+      section: Tests
+    - variable: dcgmExtraTests
+      label: Extra DCGM Tests
+      description: Comma-separated DCGM tests run after the level, for example nvbandwidth,pulse_test. They must
+        be supported by the DCGM version and the GPU.
+      type: string
+      section: Tests
+    - variable: failOnSkip
+      label: Fail On Skipped DCGM Tests
+      description: Fail when DCGM skips a subtest. A skip is always recorded in the report.
+      type: boolean
+      defaultValue: 'false'
+      section: Tests
+    - variable: runNCCL
+      label: Run NCCL Tests
+      description: Needs CUDA. Disable on simulated GPUs (nvml-mock).
+      type: boolean
+      defaultValue: 'true'
+      section: Tests
+    - variable: ncclMaxBytes
+      label: NCCL Maximum Message Size
+      type: string
+      defaultValue: 1G
+      section: Tests
+    - variable: ncclMinBusBandwidthGBps
+      label: NCCL Minimum Bus Bandwidth (GB/s)
+      description: Each collective's average bus bandwidth must reach this. Set it from a known-good server of
+        the same model. 0 records the bandwidth without judging it.
+      type: number
+      defaultValue: '0'
+      min: 0
+      section: Tests
+    - variable: soakMinutes
+      label: Soak Minutes
+      description: Sustained load duration. 0 skips the soak. At most 1440; the soak task times out at 25 hours.
+      type: number
+      defaultValue: '60'
+      min: 0
+      max: 1440
+      section: Tests
+    - variable: soakLoad
+      label: Soak Load
+      description: dcgm runs DCGM targeted_stress and targeted_power. none only records telemetry, for simulated
+        GPUs (nvml-mock) or to watch an idle server.
+      type: string
+      options: [dcgm, none]
+      defaultValue: dcgm
+      section: Tests
+    - variable: maxGPUTempC
+      label: Maximum GPU Temperature (C)
+      description: The soak fails when any GPU exceeds this.
+      type: number
+      defaultValue: '90'
+      section: Tests
+    - variable: maxNVLinkErrors
+      label: Maximum NVLink Errors
+      description: The soak fails when a GPU's NVLink error counters grow by more than this during the soak.
+        Counters that grow on healthy links, such as corrected FEC and symbol errors, are not counted.
+      type: number
+      defaultValue: '0'
+      min: 0
+      section: Tests
+    - variable: reportS3URI
+      label: Report S3 URI
+      description: Optional, for example s3://gpu-reports/qualification. The report lands at
+        <uri>/<assetID or node>/<timestamp>.json.
+      type: string
+      section: Report
+    - variable: s3CredentialsSecret
+      label: S3 Credentials Secret
+      description: Optional Secret in the gpu-burn-in namespace of the tenant cluster, with AWS_ACCESS_KEY_ID,
+        AWS_SECRET_ACCESS_KEY and optionally AWS_DEFAULT_REGION.
+      type: string
+      section: Report
+    - variable: s3Endpoint
+      label: S3 Endpoint
+      description: Optional endpoint URL for an S3-compatible store.
+      type: string
+      section: Report
+    - variable: recordResult
+      label: Record The Result
+      description: Lets the gpu-burn-in-recorder controller, if installed, record the result on the server's
+        Machine or BareMetalHost. No effect without the controller.
+      type: boolean
+      defaultValue: 'true'
+      section: Recording
+    - variable: netboxUpdate
+      label: Update NetBox
+      description: Lets the recorder also update the server's NetBox device. A failure sets the device status to
+        failed and removes the tag that brings it into vCluster Platform.
+      type: boolean
+      defaultValue: 'false'
+      section: Recording
+    - variable: releaseServer
+      label: Release The Server When Recorded
+      description: Lets the recorder delete this tenant cluster once the result is recorded, which returns the
+        server to its node provider.
+      type: boolean
+      defaultValue: 'false'
+      section: Recording
+    - variable: driverPreinstalled
+      label: NVIDIA Driver Preinstalled
+      description: Enable when the node image already contains the NVIDIA driver.
+      type: boolean
+      defaultValue: 'false'
+      section: GPU Operator
+    - variable: driverVersion
+      label: NVIDIA Driver Version
+      description: The driver the GPU Operator builds, for example 580.126.20. Empty uses the GPU Operator release's
+        default. Pin a 580 driver for Volta (V100), which newer branches do not support. Ignored when the driver
+        is preinstalled.
+      type: string
+      section: GPU Operator
+    - variable: nvmlMock
+      label: Simulated GPUs (nvml-mock)
+      description: The server's GPUs come from NVIDIA nvml-mock. Adjusts the GPU Operator's validator and GPU
+        Feature Discovery for simulated GPUs. Never enable it on real GPUs.
+      type: boolean
+      defaultValue: 'false'
+      section: GPU Operator
+    - variable: telemetry
+      label: DCGM Telemetry During Burn-In
+      description: Runs standalone DCGM and dcgm-exporter, so the burn-in shows on the Fleet Observability GPU
+        dashboards. The DCGM tests run through that host engine and pause its profiling metrics while they run.
+        Disable to give each test a private host engine and export nothing.
+      type: boolean
+      defaultValue: 'true'
+      section: GPU Operator
+    - variable: gpuOperatorVersion
+      label: GPU Operator Version
+      type: string
+      required: true
+      section: Versions
+      # renovate: datasource=helm depName=gpu-operator registryUrl=https://helm.ngc.nvidia.com/nvidia
+      defaultValue: v26.3.3
+    - variable: toolsImage
+      label: Tools Image
+      description: Runs the gates, publishers, report and verdict. Needs sh, kubectl, jq and, for S3, aws.
+      type: string
+      required: true
+      section: Versions
+      # renovate: datasource=docker depName=alpine/k8s
+      defaultValue: alpine/k8s:1.36.5
+    - variable: dcgmImage
+      label: DCGM Image
+      type: string
+      required: true
+      section: Versions
+      # renovate: datasource=docker depName=nvcr.io/nvidia/cloud-native/dcgm
+      defaultValue: nvcr.io/nvidia/cloud-native/dcgm:4.5.3-1-ubuntu24.04
+    - variable: ncclImage
+      label: NCCL Tests Image
+      description: Must contain nccl-tests binaries in /usr/local/bin and a CUDA version the driver supports.
+      type: string
+      required: true
+      section: Versions
+      # renovate: datasource=docker depName=nvcr.io/nvidia/pytorch
+      defaultValue: nvcr.io/nvidia/pytorch:26.09-py3
+  # Readable from the StackInstance by the automation that updates the server's inventory record.
+  publishedOutputs:
+    - name: result
+      fromTask:
+        task: report
+        output: result
+    - name: failedtests
+      fromTask:
+        task: report
+        output: failedtests
+    - name: summary
+      fromTask:
+        task: report
+        output: summary
+    - name: host
+      fromTask:
+        task: report
+        output: host
+    - name: assetid
+      fromTask:
+        task: report
+        output: assetid
+    - name: gpucount
+      fromTask:
+        task: report
+        output: gpucount
+    - name: reporturi
+      fromTask:
+        task: report
+        output: reporturi
+    - name: finishedat
+      fromTask:
+        task: report
+        output: finishedat
+  tasks:
+    - name: gpu-operator
+      timeout: 45m0s
+      argoCDApplication:
+        templateRef:
+          name: gpu-burn-in-gpu-operator
+        parameters:
+          version: '{{ .Values.gpuOperatorVersion }}'
+          project: '{{ .Values.argoProject }}'
+          driverPreinstalled: '{{ .Values.driverPreinstalled | toString }}'
+          driverVersion: '{{ .Values.driverVersion }}'
+          telemetry: '{{ .Values.telemetry | toString }}'
+          nvmlMock: '{{ .Values.nvmlMock | toString }}'
+    # The GPU Operator Application is Healthy long before a driver is loaded and the device plugin
+    # advertises GPUs. This step waits up to readyWaitSeconds for that.
+    - name: gpuready
+      dependsOn:
+        - gpu-operator
+      timeout: 50m0s
+      argoCDApplication:
+        templateRef:
+          name: gpu-burn-in-test
+        parameters:
+          project: '{{ .Values.argoProject }}'
+          repoURL: '{{ .Values.chartRepoURL }}'
+          revision: '{{ .Values.chartRevision }}'
+          test: gpuready
+          expectedGPUs: '{{ .Values.expectedGPUs }}'
+          readyWaitSeconds: '2400'
+          toolsImage: '{{ .Values.toolsImage }}'
+      outputs:
+        - name: gpus
+          fromResource:
+            apiVersion: v1
+            kind: ConfigMap
+            namespace: gpu-burn-in
+            name: gpu-burn-in-result-gpuready
+            jsonPath: '{.data.gpus}'
+    - name: inventory
+      dependsOn:
+        - gpuready
+      timeout: 20m0s
+      argoCDApplication:
+        templateRef:
+          name: gpu-burn-in-test
+        parameters:
+          project: '{{ .Values.argoProject }}'
+          repoURL: '{{ .Values.chartRepoURL }}'
+          revision: '{{ .Values.chartRevision }}'
+          test: inventory
+          expectedGPUs: '{{ .Values.expectedGPUs }}'
+          gpus: '{{ .Outputs.gpuready.gpus }}'
+          gpuModel: '{{ .Values.gpuModel }}'
+          nvlinkFabric: '{{ .Values.nvlinkFabric }}'
+          stopOnFailure: '{{ .Values.stopOnFailure | toString }}'
+          runTimeoutSeconds: '600'
+          toolsImage: '{{ .Values.toolsImage }}'
+          dcgmImage: '{{ .Values.dcgmImage }}'
+    - name: dcgmdiag
+      dependsOn:
+        - inventory
+      timeout: 4h30m0s
+      argoCDApplication:
+        templateRef:
+          name: gpu-burn-in-test
+        parameters:
+          project: '{{ .Values.argoProject }}'
+          repoURL: '{{ .Values.chartRepoURL }}'
+          revision: '{{ .Values.chartRevision }}'
+          test: dcgmdiag
+          dcgmHost: '{{ if eq (.Values.telemetry | toString) "false" }}{{ else }}nvidia-dcgm.gpu-operator.svc:5555{{ end }}'
+          enabled: '{{ .Values.runDCGMDiag | toString }}'
+          gpus: '{{ .Outputs.gpuready.gpus }}'
+          stopOnFailure: '{{ .Values.stopOnFailure | toString }}'
+          failOnSkip: '{{ .Values.failOnSkip | toString }}'
+          dcgmDiagLevel: '{{ .Values.dcgmDiagLevel }}'
+          dcgmExtraTests: '{{ .Values.dcgmExtraTests }}'
+          runTimeoutSeconds: '14400'
+          toolsImage: '{{ .Values.toolsImage }}'
+          dcgmImage: '{{ .Values.dcgmImage }}'
+    # The NGC PyTorch image is large; the timeout leaves room for the first pull.
+    - name: nccl
+      dependsOn:
+        - dcgmdiag
+      timeout: 1h30m0s
+      argoCDApplication:
+        templateRef:
+          name: gpu-burn-in-test
+        parameters:
+          project: '{{ .Values.argoProject }}'
+          repoURL: '{{ .Values.chartRepoURL }}'
+          revision: '{{ .Values.chartRevision }}'
+          test: nccl
+          enabled: '{{ .Values.runNCCL | toString }}'
+          gpus: '{{ .Outputs.gpuready.gpus }}'
+          stopOnFailure: '{{ .Values.stopOnFailure | toString }}'
+          ncclMaxBytes: '{{ .Values.ncclMaxBytes }}'
+          ncclMinBusBandwidthGBps: '{{ .Values.ncclMinBusBandwidthGBps }}'
+          runTimeoutSeconds: '3600'
+          toolsImage: '{{ .Values.toolsImage }}'
+          ncclImage: '{{ .Values.ncclImage }}'
+    # The chart sets the soak's own deadline from soakMinutes (at most 1440) plus 15 minutes.
+    - name: soak
+      dependsOn:
+        - nccl
+      timeout: 25h0m0s
+      argoCDApplication:
+        templateRef:
+          name: gpu-burn-in-test
+        parameters:
+          project: '{{ .Values.argoProject }}'
+          repoURL: '{{ .Values.chartRepoURL }}'
+          revision: '{{ .Values.chartRevision }}'
+          test: soak
+          dcgmHost: '{{ if eq (.Values.telemetry | toString) "false" }}{{ else }}nvidia-dcgm.gpu-operator.svc:5555{{ end }}'
+          enabled: '{{ if gt (int .Values.soakMinutes) 0 }}true{{ else }}false{{ end }}'
+          gpus: '{{ .Outputs.gpuready.gpus }}'
+          stopOnFailure: '{{ .Values.stopOnFailure | toString }}'
+          failOnSkip: '{{ .Values.failOnSkip | toString }}'
+          soakMinutes: '{{ .Values.soakMinutes }}'
+          soakLoad: '{{ .Values.soakLoad }}'
+          maxGPUTempC: '{{ .Values.maxGPUTempC }}'
+          maxNVLinkErrors: '{{ .Values.maxNVLinkErrors }}'
+          toolsImage: '{{ .Values.toolsImage }}'
+          dcgmImage: '{{ .Values.dcgmImage }}'
+    - name: report
+      dependsOn:
+        - soak
+      timeout: 15m0s
+      argoCDApplication:
+        templateRef:
+          name: gpu-burn-in-test
+        parameters:
+          project: '{{ .Values.argoProject }}'
+          repoURL: '{{ .Values.chartRepoURL }}'
+          revision: '{{ .Values.chartRevision }}'
+          test: report
+          tests: gpuready,inventory,dcgmdiag,nccl,soak
+          expectedGPUs: '{{ .Values.expectedGPUs }}'
+          assetID: '{{ .Values.assetID }}'
+          profile: '{{ .Values.profile }}'
+          reportS3URI: '{{ .Values.reportS3URI }}'
+          s3CredentialsSecret: '{{ .Values.s3CredentialsSecret }}'
+          s3Endpoint: '{{ .Values.s3Endpoint }}'
+          toolsImage: '{{ .Values.toolsImage }}'
+      outputs:
+        - name: result
+          fromResource:
+            apiVersion: v1
+            kind: ConfigMap
+            namespace: gpu-burn-in
+            name: gpu-burn-in-report
+            jsonPath: '{.data.result}'
+        - name: failedtests
+          fromResource:
+            apiVersion: v1
+            kind: ConfigMap
+            namespace: gpu-burn-in
+            name: gpu-burn-in-report
+            jsonPath: '{.data.failedTests}'
+        - name: summary
+          fromResource:
+            apiVersion: v1
+            kind: ConfigMap
+            namespace: gpu-burn-in
+            name: gpu-burn-in-report
+            jsonPath: '{.data.summary}'
+        - name: host
+          fromResource:
+            apiVersion: v1
+            kind: ConfigMap
+            namespace: gpu-burn-in
+            name: gpu-burn-in-report
+            jsonPath: '{.data.host}'
+        - name: assetid
+          fromResource:
+            apiVersion: v1
+            kind: ConfigMap
+            namespace: gpu-burn-in
+            name: gpu-burn-in-report
+            jsonPath: '{.data.assetID}'
+        - name: gpucount
+          fromResource:
+            apiVersion: v1
+            kind: ConfigMap
+            namespace: gpu-burn-in
+            name: gpu-burn-in-report
+            jsonPath: '{.data.gpuCount}'
+        - name: reporturi
+          fromResource:
+            apiVersion: v1
+            kind: ConfigMap
+            namespace: gpu-burn-in
+            name: gpu-burn-in-report
+            jsonPath: '{.data.reportURI}'
+        - name: finishedat
+          fromResource:
+            apiVersion: v1
+            kind: ConfigMap
+            namespace: gpu-burn-in
+            name: gpu-burn-in-report
+            jsonPath: '{.data.finishedAt}'
+        # The whole report, for the gpu-burn-in-recorder to turn into a QualificationReport on the
+        # Platform cluster. Not published: it is read from the instance's outputs Secret.
+        - name: reportjson
+          fromResource:
+            apiVersion: v1
+            kind: ConfigMap
+            namespace: gpu-burn-in
+            name: gpu-burn-in-report
+            jsonPath: '{.data.report\.json}'
+    - name: verdict
+      dependsOn:
+        - report
+      timeout: 10m0s
+      argoCDApplication:
+        templateRef:
+          name: gpu-burn-in-test
+        parameters:
+          project: '{{ .Values.argoProject }}'
+          repoURL: '{{ .Values.chartRepoURL }}'
+          revision: '{{ .Values.chartRevision }}'
+          test: verdict
+          result: '{{ .Outputs.report.result }}'
+          failedTests: '{{ .Outputs.report.failedtests }}'
+          toolsImage: '{{ .Values.toolsImage }}'

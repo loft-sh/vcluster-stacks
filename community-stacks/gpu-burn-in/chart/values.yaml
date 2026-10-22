@@ -1,0 +1,72 @@
+# Defaults for one qualification step. The gpu-burn-in StackTemplate passes every value it relies
+# on through the gpu-burn-in-test ArgoCDApplicationTemplate, as strings. The templates guard each
+# value with `default`, so an empty string behaves like an unset value.
+
+# The step: gpuready, inventory, dcgmdiag, nccl, soak, report or verdict.
+test: inventory
+# "false" records the step as disabled without running it. GPU tests only.
+enabled: "true"
+
+# GPUs the server must have. `gpus` is what the device plugin advertised when gpuready passed; GPU
+# tests see every GPU the driver does, through the NVIDIA runtime class.
+expectedGPUs: "8"
+gpus: "1"
+runtimeClassName: nvidia
+# Case-insensitive substring every GPU name must contain, for example B300. Empty skips the check.
+gpuModel: ""
+# NVLink fabric check in inventory: auto checks GPUs that report a fabric (GB200 and GB300 NVL
+# trays) and skips the rest, required also fails GPUs with no fabric attachment, off skips it.
+nvlinkFabric: auto
+
+# Identity recorded in the report, for the automation that updates the inventory.
+assetID: ""
+profile: default
+
+# "true" skips every later test once one has failed, so a bad server is not stressed for hours.
+stopOnFailure: "true"
+# "true" fails a DCGM test that reports Skip for any subtest, for example an NVLink test on PCIe GPUs.
+failOnSkip: "false"
+
+dcgmDiagLevel: "3"
+# Extra DCGM tests run after the level, for example nvbandwidth,pulse_test. Empty runs none.
+dcgmExtraTests: ""
+
+ncclMaxBytes: 1G
+# Minimum average bus bandwidth, GB/s, for each NCCL collective. 0 records without judging.
+ncclMinBusBandwidthGBps: "0"
+
+# Sustained load. soakLoad dcgm runs DCGM targeted_stress and targeted_power; none only records
+# telemetry, which is what a simulated GPU (nvml-mock) supports.
+soakMinutes: "60"
+soakLoad: dcgm
+maxGPUTempC: "90"
+# The soak fails when a GPU's NVLink error counters grow by more than this. Counters that grow on
+# healthy links, such as corrected FEC and symbol errors, are not counted.
+maxNVLinkErrors: "0"
+
+# DCGM tests: the shared host engine, host:port, when telemetry is on. Empty starts one in the pod.
+dcgmHost: ""
+
+# gpuready: how long to wait for the device plugin to advertise a GPU.
+readyWaitSeconds: "2400"
+# Budget for the test command. The soak computes its own from soakMinutes.
+runTimeoutSeconds: "3600"
+
+# report: the steps it expects results from.
+tests: gpuready,inventory,dcgmdiag,nccl,soak
+# Optional S3 copy of the report. The Secret, in this namespace, holds AWS_ACCESS_KEY_ID,
+# AWS_SECRET_ACCESS_KEY and optionally AWS_DEFAULT_REGION. Set s3Endpoint for S3-compatible stores.
+reportS3URI: ""
+s3CredentialsSecret: ""
+s3Endpoint: ""
+
+# verdict: the report's result and failed tests, read from the report task's outputs.
+result: ""
+failedTests: ""
+
+# renovate: datasource=docker depName=alpine/k8s
+toolsImage: alpine/k8s:1.36.5
+# renovate: datasource=docker depName=nvcr.io/nvidia/cloud-native/dcgm
+dcgmImage: nvcr.io/nvidia/cloud-native/dcgm:4.5.3-1-ubuntu24.04
+# renovate: datasource=docker depName=nvcr.io/nvidia/pytorch
+ncclImage: nvcr.io/nvidia/pytorch:26.09-py3

@@ -1,0 +1,9 @@
+apiVersion: v2
+name: gpu-burn-in-recorder
+description: >-
+  Records gpu-burn-in Stack results on the servers they qualified: a label and annotations on the
+  vCluster Platform Machine or the Metal3 BareMetalHost, optionally NetBox, and optionally the
+  release of the server. Install on the vCluster Platform cluster.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

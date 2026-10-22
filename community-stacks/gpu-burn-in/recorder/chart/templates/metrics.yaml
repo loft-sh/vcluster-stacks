@@ -1,0 +1,36 @@
+{{- $m := .Values.metrics | default dict }}
+{{- if ($m.service | default dict).enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "recorder.name" . }}-metrics
+  labels:
+    {{- include "recorder.labels" . | nindent 4 }}
+spec:
+  selector:
+    {{- include "recorder.selector" . | nindent 4 }}
+  ports:
+    - name: metrics
+      port: 8080
+      targetPort: metrics
+{{- end }}
+{{- if ($m.serviceMonitor | default dict).enabled }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "recorder.name" . }}
+  labels:
+    {{- include "recorder.labels" . | nindent 4 }}
+    {{- with $m.serviceMonitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "recorder.selector" . | nindent 6 }}
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: {{ $m.serviceMonitor.interval | default "60s" }}
+{{- end }}

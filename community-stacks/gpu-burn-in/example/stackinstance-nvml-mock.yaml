@@ -1,0 +1,34 @@
+# The Stack on simulated GPUs: NVIDIA nvml-mock on a node that joined with its "driver" already
+# running. nvml-mock gives nvidia-smi, the device plugin and DCGM telemetry, but no CUDA, so the
+# DCGM diagnostics and NCCL tests are disabled and the soak only records telemetry.
+#
+# What this exercises: the whole task graph, the gpuready output, inventory (count, model, ECC,
+# NVLink), stop-on-failure, the soak's thermal and XID checks, the report, its outputs and the
+# verdict. tests/nvml-mock-e2e.sh runs it with injected faults.
+apiVersion: management.loft.sh/v1
+kind: StackInstance
+metadata:
+  name: gpu-burn-in-mock
+  labels:
+    app.kubernetes.io/part-of: gpu-burn-in-stack
+spec:
+  displayName: GPU Burn-In (nvml-mock)
+  owner:
+    user: admin
+  destination:
+    virtualCluster:
+      name: my-nvml-mock-cluster
+  templateRef:
+    name: gpu-burn-in
+  parameters:
+    argoProject: default
+    expectedGPUs: "8"
+    gpuModel: B200
+    assetID: mock-b200-001
+    profile: nvml-mock
+    driverPreinstalled: "true"
+    nvmlMock: "true"
+    runDCGMDiag: "false"
+    runNCCL: "false"
+    soakMinutes: "5"
+    soakLoad: none

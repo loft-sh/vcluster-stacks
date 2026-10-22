@@ -1,0 +1,87 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "recorder.name" . }}
+  labels:
+    {{- include "recorder.labels" . | nindent 4 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "recorder.name" . }}
+  labels:
+    {{- include "recorder.labels" . | nindent 4 }}
+rules:
+  # The run, its parameter defaults, the server it held and that server's provider.
+  - apiGroups: ["storage.loft.sh"]
+    resources: ["stackinstances", "stacktemplates", "nodeclaims", "machines", "nodeproviders"]
+    verbs: ["get", "list", "watch"]
+  # The history: one report per run, the oldest pruned past keepReports.
+  - apiGroups: ["qualification.vcluster-stacks.io"]
+    resources: ["qualificationreports"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+  # Only get: the controller reads each run's outputs Secret by its name and never lists Secrets.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get"]
+  {{- if eq .Values.target "machine" }}
+  - apiGroups: ["management.loft.sh"]
+    resources: ["machines"]
+    verbs: ["get", "patch"]
+  {{- end }}
+  {{- if and (eq .Values.target "bmh") .Values.localCluster }}
+  - apiGroups: ["metal3.io"]
+    resources: ["baremetalhosts"]
+    verbs: ["get", "patch"]
+  {{- end }}
+  {{- if .Values.rbac.releaseServer }}
+  - apiGroups: ["management.loft.sh"]
+    resources: ["virtualclusterinstances"]
+    verbs: ["delete"]
+  {{- end }}
+  - apiGroups: ["", "events.k8s.io"]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "recorder.name" . }}
+  labels:
+    {{- include "recorder.labels" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "recorder.name" . }}
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "recorder.name" . }}
+{{- if .Values.leaderElection }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "recorder.name" . }}-leader-election
+  labels:
+    {{- include "recorder.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "recorder.name" . }}-leader-election
+  labels:
+    {{- include "recorder.labels" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "recorder.name" . }}
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "recorder.name" . }}-leader-election
+{{- end }}

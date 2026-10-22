@@ -1,0 +1,221 @@
+# One qualification step: the chart in ../chart, deployed by Argo CD from this repository. Every
+# test task in the StackTemplate uses this template, with `test` choosing the step.
+#
+# Why Argo CD and not a Platform App: a Platform App deploy stops after 30 minutes, and a DCGM
+# level 4 run or a soak takes hours. An argoCDApplication task waits as long as its own timeout.
+# Argo CD reports a running Job as Progressing, a completed one as Healthy and a failed one as
+# Degraded, which fails the task at once.
+#
+# The chart is read from Git, so the Argo CD project must permit repoURL. Point repoURL and
+# revision at a fork to test changes to the chart.
+apiVersion: management.loft.sh/v1
+kind: ArgoCDApplicationTemplate
+metadata:
+  name: gpu-burn-in-test
+  labels:
+    app.kubernetes.io/part-of: gpu-burn-in-stack
+spec:
+  displayName: GPU Burn-In - Qualification Step
+  owner:
+    team: loft-admins
+  parameters:
+    - variable: project
+      label: Argo CD Project
+      type: string
+      required: true
+      defaultValue: default
+    - variable: repoURL
+      label: Chart Repository
+      type: string
+      required: true
+      defaultValue: https://github.com/loft-sh/vcluster-stacks.git
+    - variable: revision
+      label: Chart Revision
+      type: string
+      required: true
+      defaultValue: main
+    - variable: test
+      label: Step
+      description: gpuready, inventory, dcgmdiag, nccl, soak, report or verdict.
+      type: string
+      required: true
+      options: [gpuready, inventory, dcgmdiag, nccl, soak, report, verdict]
+      defaultValue: inventory
+    - variable: enabled
+      label: Enabled
+      type: boolean
+      defaultValue: 'true'
+    - variable: expectedGPUs
+      label: Expected GPUs
+      type: number
+      defaultValue: '8'
+    - variable: gpus
+      label: GPUs Requested
+      description: Supplied by the gpuready task's outputs inside the gpu-burn-in Stack.
+      type: number
+      defaultValue: '1'
+    - variable: runtimeClassName
+      label: NVIDIA Runtime Class
+      description: RuntimeClass GPU tests run with, so they see every GPU the driver does.
+      type: string
+      defaultValue: nvidia
+    - variable: gpuModel
+      label: GPU Model
+      type: string
+    - variable: nvlinkFabric
+      label: NVLink Fabric
+      type: string
+      options: [auto, required, "off"]
+      defaultValue: auto
+    - variable: assetID
+      label: Asset ID
+      type: string
+    - variable: profile
+      label: Qualification Profile
+      type: string
+      defaultValue: default
+    - variable: stopOnFailure
+      label: Stop On First Failure
+      type: boolean
+      defaultValue: 'true'
+    - variable: failOnSkip
+      label: Fail On Skipped DCGM Tests
+      type: boolean
+      defaultValue: 'false'
+    - variable: dcgmDiagLevel
+      label: DCGM Diagnostic Level
+      type: string
+      options: ['1', '2', '3', '4']
+      defaultValue: '3'
+    - variable: dcgmExtraTests
+      label: Extra DCGM Tests
+      type: string
+    - variable: ncclMaxBytes
+      label: NCCL Maximum Message Size
+      type: string
+      defaultValue: 1G
+    - variable: ncclMinBusBandwidthGBps
+      label: NCCL Minimum Bus Bandwidth (GB/s)
+      type: number
+      defaultValue: '0'
+    - variable: soakMinutes
+      label: Soak Minutes
+      type: number
+      defaultValue: '60'
+    - variable: soakLoad
+      label: Soak Load
+      type: string
+      options: [dcgm, none]
+      defaultValue: dcgm
+    - variable: maxGPUTempC
+      label: Maximum GPU Temperature (C)
+      type: number
+      defaultValue: '90'
+    - variable: maxNVLinkErrors
+      label: Maximum NVLink Errors
+      type: number
+      defaultValue: '0'
+    - variable: dcgmHost
+      label: DCGM Host Engine
+      description: host:port of the shared DCGM host engine when telemetry is on. Empty starts one in the test pod.
+      type: string
+    - variable: readyWaitSeconds
+      label: GPU Ready Wait (seconds)
+      type: number
+      defaultValue: '2400'
+    - variable: runTimeoutSeconds
+      label: Test Timeout (seconds)
+      type: number
+      defaultValue: '3600'
+    - variable: tests
+      label: Steps The Report Expects
+      type: string
+      defaultValue: gpuready,inventory,dcgmdiag,nccl,soak
+    - variable: reportS3URI
+      label: Report S3 URI
+      type: string
+    - variable: s3CredentialsSecret
+      label: S3 Credentials Secret
+      type: string
+    - variable: s3Endpoint
+      label: S3 Endpoint
+      type: string
+    - variable: result
+      label: Qualification Result
+      description: Supplied by the report task's outputs inside the gpu-burn-in Stack.
+      type: string
+    - variable: failedTests
+      label: Failed Tests
+      type: string
+    - variable: toolsImage
+      label: Tools Image
+      type: string
+      # renovate: datasource=docker depName=alpine/k8s
+      defaultValue: alpine/k8s:1.36.5
+    - variable: dcgmImage
+      label: DCGM Image
+      type: string
+      # renovate: datasource=docker depName=nvcr.io/nvidia/cloud-native/dcgm
+      defaultValue: nvcr.io/nvidia/cloud-native/dcgm:4.5.3-1-ubuntu24.04
+    - variable: ncclImage
+      label: NCCL Tests Image
+      type: string
+      # renovate: datasource=docker depName=nvcr.io/nvidia/pytorch
+      defaultValue: nvcr.io/nvidia/pytorch:26.09-py3
+  template:
+    spec:
+      destination:
+        namespace: gpu-burn-in
+      project: '{{ .Values.project }}'
+      source:
+        repoURL: '{{ .Values.repoURL }}'
+        targetRevision: '{{ .Values.revision }}'
+        path: community-stacks/gpu-burn-in/chart
+        helm:
+          releaseName: 'gpu-burn-in-{{ .Values.test }}'
+          # Every value is quoted: the chart compares strings.
+          values: |
+            test: {{ .Values.test | quote }}
+            enabled: {{ .Values.enabled | toString | quote }}
+            expectedGPUs: {{ .Values.expectedGPUs | toString | quote }}
+            gpus: {{ .Values.gpus | toString | quote }}
+            runtimeClassName: {{ .Values.runtimeClassName | quote }}
+            gpuModel: {{ .Values.gpuModel | quote }}
+            nvlinkFabric: {{ .Values.nvlinkFabric | default "auto" | quote }}
+            assetID: {{ .Values.assetID | quote }}
+            profile: {{ .Values.profile | quote }}
+            stopOnFailure: {{ .Values.stopOnFailure | toString | quote }}
+            failOnSkip: {{ .Values.failOnSkip | toString | quote }}
+            dcgmDiagLevel: {{ .Values.dcgmDiagLevel | toString | quote }}
+            dcgmExtraTests: {{ .Values.dcgmExtraTests | quote }}
+            ncclMaxBytes: {{ .Values.ncclMaxBytes | quote }}
+            ncclMinBusBandwidthGBps: {{ .Values.ncclMinBusBandwidthGBps | toString | quote }}
+            soakMinutes: {{ .Values.soakMinutes | toString | quote }}
+            soakLoad: {{ .Values.soakLoad | quote }}
+            maxGPUTempC: {{ .Values.maxGPUTempC | toString | quote }}
+            maxNVLinkErrors: {{ .Values.maxNVLinkErrors | default "0" | toString | quote }}
+            dcgmHost: {{ .Values.dcgmHost | quote }}
+            readyWaitSeconds: {{ .Values.readyWaitSeconds | toString | quote }}
+            runTimeoutSeconds: {{ .Values.runTimeoutSeconds | toString | quote }}
+            tests: {{ .Values.tests | quote }}
+            reportS3URI: {{ .Values.reportS3URI | quote }}
+            s3CredentialsSecret: {{ .Values.s3CredentialsSecret | quote }}
+            s3Endpoint: {{ .Values.s3Endpoint | quote }}
+            result: {{ .Values.result | quote }}
+            failedTests: {{ .Values.failedTests | quote }}
+            toolsImage: {{ .Values.toolsImage | quote }}
+            dcgmImage: {{ .Values.dcgmImage | quote }}
+            ncclImage: {{ .Values.ncclImage | quote }}
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+        retry:
+          backoff:
+            duration: 30s
+            factor: 2
+            maxDuration: 5m
+          limit: 10
+        syncOptions:
+          - CreateNamespace=true
+          - ServerSideApply=true

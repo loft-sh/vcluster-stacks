@@ -1,0 +1,116 @@
+GPU 0: NVIDIA GB300 NVL (UUID: GPU-b300b300-0000-0000-0000-000000000000)
+	 Link 0: Tx packets: 932577493582
+	 Link 0: Rx bytes: 80201664937397
+	 Link 0: Malformed packet Errors: 0
+	 Link 0: Buffer overrun Errors: 0
+	 Link 0: Rx Errors: 0
+	 Link 0: Rx remote Errors: 0
+	 Link 0: Rx General Errors: 0
+	 Link 0: Local link integrity Errors: 0
+	 Link 0: Tx discards: 0
+	 Link 0: Link recovery successful events: 5
+	 Link 0: Link recovery failed events: 0
+	 Link 0: Symbol Errors: 5
+	 Link 0: Effective BER: 0
+	 Link 0: FEC Errors - 0: 5
+	 Link 1: Tx packets: 932577493582
+	 Link 1: Rx bytes: 80201664937397
+	 Link 1: Malformed packet Errors: 0
+	 Link 1: Buffer overrun Errors: 0
+	 Link 1: Rx Errors: 0
+	 Link 1: Rx remote Errors: 0
+	 Link 1: Rx General Errors: 0
+	 Link 1: Local link integrity Errors: 0
+	 Link 1: Tx discards: 0
+	 Link 1: Link recovery successful events: 5
+	 Link 1: Link recovery failed events: 0
+	 Link 1: Symbol Errors: 5
+	 Link 1: Effective BER: 0
+	 Link 1: FEC Errors - 0: 5
+GPU 1: NVIDIA GB300 NVL (UUID: GPU-b300b300-0000-0000-0000-000000000001)
+	 Link 0: Tx packets: 932577493582
+	 Link 0: Rx bytes: 80201664937397
+	 Link 0: Malformed packet Errors: 0
+	 Link 0: Buffer overrun Errors: 0
+	 Link 0: Rx Errors: 0
+	 Link 0: Rx remote Errors: 0
+	 Link 0: Rx General Errors: 0
+	 Link 0: Local link integrity Errors: 0
+	 Link 0: Tx discards: 0
+	 Link 0: Link recovery successful events: 5
+	 Link 0: Link recovery failed events: 0
+	 Link 0: Symbol Errors: 5
+	 Link 0: Effective BER: 0
+	 Link 0: FEC Errors - 0: 5
+	 Link 1: Tx packets: 932577493582
+	 Link 1: Rx bytes: 80201664937397
+	 Link 1: Malformed packet Errors: 0
+	 Link 1: Buffer overrun Errors: 0
+	 Link 1: Rx Errors: 0
+	 Link 1: Rx remote Errors: 0
+	 Link 1: Rx General Errors: 0
+	 Link 1: Local link integrity Errors: 0
+	 Link 1: Tx discards: 0
+	 Link 1: Link recovery successful events: 5
+	 Link 1: Link recovery failed events: 0
+	 Link 1: Symbol Errors: 5
+	 Link 1: Effective BER: 0
+	 Link 1: FEC Errors - 0: 5
+GPU 2: NVIDIA GB300 NVL (UUID: GPU-b300b300-0000-0000-0000-000000000002)
+	 Link 0: Tx packets: 932577493582
+	 Link 0: Rx bytes: 80201664937397
+	 Link 0: Malformed packet Errors: 0
+	 Link 0: Buffer overrun Errors: 0
+	 Link 0: Rx Errors: 0
+	 Link 0: Rx remote Errors: 0
+	 Link 0: Rx General Errors: 0
+	 Link 0: Local link integrity Errors: 0
+	 Link 0: Tx discards: 0
+	 Link 0: Link recovery successful events: 5
+	 Link 0: Link recovery failed events: 0
+	 Link 0: Symbol Errors: 5
+	 Link 0: Effective BER: 0
+	 Link 0: FEC Errors - 0: 5
+	 Link 1: Tx packets: 932577493582
+	 Link 1: Rx bytes: 80201664937397
+	 Link 1: Malformed packet Errors: 0
+	 Link 1: Buffer overrun Errors: 0
+	 Link 1: Rx Errors: 0
+	 Link 1: Rx remote Errors: 0
+	 Link 1: Rx General Errors: 0
+	 Link 1: Local link integrity Errors: 0
+	 Link 1: Tx discards: 0
+	 Link 1: Link recovery successful events: 5
+	 Link 1: Link recovery failed events: 0
+	 Link 1: Symbol Errors: 5
+	 Link 1: Effective BER: 0
+	 Link 1: FEC Errors - 0: 5
+GPU 3: NVIDIA GB300 NVL (UUID: GPU-b300b300-0000-0000-0000-000000000003)
+	 Link 0: Tx packets: 932577493582
+	 Link 0: Rx bytes: 80201664937397
+	 Link 0: Malformed packet Errors: 0
+	 Link 0: Buffer overrun Errors: 0
+	 Link 0: Rx Errors: 0
+	 Link 0: Rx remote Errors: 0
+	 Link 0: Rx General Errors: 0
+	 Link 0: Local link integrity Errors: 0
+	 Link 0: Tx discards: 0
+	 Link 0: Link recovery successful events: 5
+	 Link 0: Link recovery failed events: 0
+	 Link 0: Symbol Errors: 5
+	 Link 0: Effective BER: 0
+	 Link 0: FEC Errors - 0: 5
+	 Link 1: Tx packets: 932577493582
+	 Link 1: Rx bytes: 80201664937397
+	 Link 1: Malformed packet Errors: 0
+	 Link 1: Buffer overrun Errors: 0
+	 Link 1: Rx Errors: 0
+	 Link 1: Rx remote Errors: 0
+	 Link 1: Rx General Errors: 0
+	 Link 1: Local link integrity Errors: 0
+	 Link 1: Tx discards: 0
+	 Link 1: Link recovery successful events: 5
+	 Link 1: Link recovery failed events: 0
+	 Link 1: Symbol Errors: 5
+	 Link 1: Effective BER: 0
+	 Link 1: FEC Errors - 0: 5

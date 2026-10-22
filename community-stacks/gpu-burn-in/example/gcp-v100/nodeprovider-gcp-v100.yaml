@@ -1,0 +1,51 @@
+# A Google Cloud node provider with one GPU node type: an N1 VM with one NVIDIA V100. Google Cloud
+# still offers V100 on N1 in asia-east1-c, europe-west4-a/b/c, us-central1-a/b/c/f, us-east1-b and
+# us-west1-a/b (as of 2026-10-21).
+#
+# It needs a node template that attaches GPUs, which the public loft-sh/vcluster-auto-nodes-gcp
+# template does not do yet. node-gpu.patch adds it to v0.2.0; apply it on a branch of a fork and
+# point nodeTemplate below at it. The network environment comes from the public repository.
+#
+# Before the first run:
+#   - Request V100 quota in the region: NVIDIA_V100_GPUS, and GPUS_ALL_REGIONS for the project.
+#   - Give the provider credentials: a Secret in vcluster-platform with GOOGLE_CREDENTIALS (a
+#     service account key with the auto nodes role) and the label
+#     terraform.vcluster.com/provider: auto-nodes-gcp-gpu. See the vcluster-auto-nodes-gcp README.
+#   - Set project to your project ID. Project and region must be concrete: the template rejects
+#     wildcards.
+#   - Create the network: networkenvironment-gcp-v100.yaml, with the same project and region.
+# NetworkEnvironment and networkEnvironmentTemplate are not in vCluster Platform 4.12; they arrived
+# in the 4.13 alphas and ship in 5.0.
+# min-platform-version: 4.13.0-alpha.2
+apiVersion: management.loft.sh/v1
+kind: NodeProvider
+metadata:
+  name: auto-nodes-gcp-gpu
+spec:
+  terraform:
+    networkEnvironmentTemplate:
+      infrastructure:
+        git:
+          repository: https://github.com/loft-sh/vcluster-auto-nodes-gcp.git
+          tag: v0.2.0
+          subPath: environment/infrastructure
+    nodeTemplate:
+      git:
+        # Your fork, with node-gpu.patch applied on a branch.
+        repository: https://github.com/<your-org>/vcluster-auto-nodes-gcp.git
+        branch: gpu
+        subPath: node
+    nodeTypes:
+      - name: n1-standard-8-v100
+        resources:
+          cpu: "8"
+          memory: 30Gi
+        properties:
+          instance-type: n1-standard-8
+          gpu-type: nvidia-tesla-v100
+          gpu-count: "1"
+          project: <your-gcp-project>
+          region: us-central1
+          zone: us-central1-a,us-central1-b,us-central1-c,us-central1-f
+          terraform.vcluster.com/credentials: "*"
+          vcluster.com/accelerator: v100

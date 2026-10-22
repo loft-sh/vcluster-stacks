@@ -1,0 +1,6 @@
+# nThread 1 nGpus 1 minBytes 8 maxBytes 1073741824 step: 2(factor) warmup iters: 5 iters: 20 agg iters: 1 validation: 1 graph: 0
+#       size         count      type   redop    root     time   algbw   busbw #wrong     time   algbw   busbw #wrong
+  1073741824     268435456     float     sum      -1   2311.4  464.54  812.95      0   2309.8  464.86  813.51      0
+# Out of bounds values : 3 FAILED
+# Avg bus bandwidth    : 412.1
+#

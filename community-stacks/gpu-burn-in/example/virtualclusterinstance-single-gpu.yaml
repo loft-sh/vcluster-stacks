@@ -1,0 +1,40 @@
+# A qualification tenant cluster for a single real GPU, for example a workstation card such as an
+# RTX 2000 Ada. Real CUDA, so every step runs, but one GPU and no NVLink:
+#   - nccl runs with one rank. It proves the image, CUDA and NCCL work; the bandwidth means little.
+#   - DCGM diagnostics target data center GPUs. On a workstation GPU some tests may report Skip;
+#     the report records them, and the soak fails if DCGM skips every load test, because then it
+#     never loaded the GPU.
+#   - driverPreinstalled is false: the GPU Operator builds the driver, which needs a node OS and
+#     kernel it supports.
+#
+# Set the namespace (p-<project>), owner, provider and node type to match your installation, then
+#   kubectl apply -f example/virtualclusterinstance-single-gpu.yaml
+# on the Platform management API.
+apiVersion: management.loft.sh/v1
+kind: VirtualClusterInstance
+metadata:
+  name: gpu-burn-in-single-gpu
+  namespace: p-default
+  labels:
+    app.kubernetes.io/part-of: gpu-burn-in-stack
+spec:
+  owner:
+    user: admin
+  templateRef:
+    name: gpu-burn-in-private-nodes
+  parameters: |
+    argoConnector: argocd
+    gpuNodeProvider: my-metal3-provider
+    nodeTypeProperty: vcluster.com/accelerator
+    nodeTypeValue: rtx-2000-ada
+    expectedGPUs: "1"
+    gpuModel: RTX 2000
+    assetID: rtx-2000-ada-01
+    profile: single-gpu-smoke
+    driverPreinstalled: "false"
+    dcgmDiagLevel: "2"
+    runNCCL: "true"
+    ncclMaxBytes: 256M
+    soakMinutes: "15"
+    soakLoad: dcgm
+    maxGPUTempC: "85"

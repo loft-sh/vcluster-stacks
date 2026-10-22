@@ -1,0 +1,35 @@
+Attach GPUs to Google Cloud nodes from the node type's gpu-type and gpu-count properties.
+
+Against loft-sh/vcluster-auto-nodes-gcp v0.2.0. Apply it on a branch of your fork:
+  git checkout -b gpu v0.2.0 && git apply node-gpu.patch
+
+A node type without gpu-type is unchanged. The instance_template module (~> 13.6.0) attaches the
+GPU as a guest accelerator and switches on_host_maintenance to TERMINATE by itself, as Google Cloud
+requires for GPU VMs.
+
+diff --git a/node/locals.tf b/node/locals.tf
+index 281a117..17a7444 100644
+--- a/node/locals.tf
++++ b/node/locals.tf
+@@ -18,4 +18,9 @@ locals {
+   service_account_email = nonsensitive(local.infrastructure["service_account_email"])
+ 
+   instance_type = nonsensitive(var.vcluster.nodeType.spec.properties["instance-type"])
++
++  # Optional GPUs, for example gpu-type nvidia-tesla-v100 and gpu-count 1.
++  gpu_type  = try(nonsensitive(var.vcluster.nodeType.spec.properties["gpu-type"]), "")
++  gpu_count = try(tonumber(nonsensitive(var.vcluster.nodeType.spec.properties["gpu-count"])), 1)
++  gpu       = local.gpu_type == "" ? null : { type = local.gpu_type, count = local.gpu_count }
+ }
+diff --git a/node/main.tf b/node/main.tf
+index 03729d2..38e3553 100644
+--- a/node/main.tf
++++ b/node/main.tf
+@@ -59,6 +59,7 @@ module "instance_template" {
+   tags               = ["allow-iap-ssh", local.cluster_id] # for IAP SSH access
+ 
+   machine_type = local.instance_type
++  gpu          = local.gpu
+ 
+   source_image         = data.google_compute_image.img.self_link
+   source_image_family  = data.google_compute_image.img.family

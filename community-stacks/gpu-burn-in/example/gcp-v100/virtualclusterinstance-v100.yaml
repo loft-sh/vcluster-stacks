@@ -1,0 +1,45 @@
+# A qualification tenant cluster for one NVIDIA V100 (Volta), on a Google Cloud N1 VM from the node
+# provider in nodeprovider-gcp-v100.yaml. The values differ from the defaults only where Volta needs
+# it (see GPU_SUPPORT.md):
+#   - driverVersion pins a 580 driver, the last branch that supports Volta. Newer GPU Operator
+#     releases default to 595, which does not. 580.178.04 builds on Google Cloud's 7.0 kernel; the
+#     GPU Operator's default 580.126.20 does not.
+#   - ncclImage is NGC PyTorch 24.12, the last release that supports Volta. The default image is
+#     built with CUDA 13, which has no Volta code.
+#   - DCGM: the default image holds DCGM's CUDA 12 and 13 builds, and passed level 2 on a V100.
+#
+# One GPU, so nccl runs with one rank (it proves CUDA and NCCL work, not bandwidth), and the NVLink
+# fabric check skips the V100, which reports no fabric.
+#
+# Set the namespace (p-<project>), owner and Argo CD connector, then, on the Platform management API:
+#   kubectl create -f example/gcp-v100/virtualclusterinstance-v100.yaml
+apiVersion: management.loft.sh/v1
+kind: VirtualClusterInstance
+metadata:
+  name: gpu-burn-in-v100
+  namespace: p-default
+  labels:
+    app.kubernetes.io/part-of: gpu-burn-in-stack
+spec:
+  owner:
+    user: admin
+  templateRef:
+    name: gpu-burn-in-private-nodes
+  parameters: |
+    argoConnector: argocd
+    gpuNodeProvider: auto-nodes-gcp-gpu
+    nodeTypeProperty: vcluster.com/accelerator
+    nodeTypeValue: v100
+    expectedGPUs: "1"
+    gpuModel: V100
+    profile: v100-smoke
+    driverPreinstalled: "false"
+    driverVersion: "580.178.04"
+    ncclImage: nvcr.io/nvidia/pytorch:24.12-py3
+    dcgmDiagLevel: "2"
+    runNCCL: "true"
+    ncclMaxBytes: 256M
+    soakMinutes: "15"
+    soakLoad: dcgm
+    maxGPUTempC: "85"
+    releaseServer: "true"

@@ -1,0 +1,179 @@
+# QualificationReport: one hardware qualification run of one machine, from any source: the
+# gpu-burn-in Stack (through the gpu-burn-in-recorder), NICo Machine Validation, or another test
+# suite. The spec is the record and is never changed after it is written; reports form a history
+# per machine. Cluster-scoped, beside the vCluster Platform Machine it names.
+#
+# Helm installs this from crds/ on first install only. Apply it directly to upgrade it:
+#   kubectl apply -f community-stacks/gpu-burn-in/recorder/chart/crds/
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: qualificationreports.qualification.vcluster-stacks.io
+  labels:
+    app.kubernetes.io/part-of: gpu-burn-in-stack
+spec:
+  group: qualification.vcluster-stacks.io
+  scope: Cluster
+  names:
+    kind: QualificationReport
+    listKind: QualificationReportList
+    plural: qualificationreports
+    singular: qualificationreport
+    shortNames: [qr]
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      additionalPrinterColumns:
+        - name: Machine
+          type: string
+          jsonPath: .spec.machineRef
+        - name: Result
+          type: string
+          jsonPath: .spec.result
+        - name: Failed
+          type: string
+          jsonPath: .spec.failedTests
+        - name: Profile
+          type: string
+          jsonPath: .spec.profile
+        - name: Rack
+          type: string
+          jsonPath: .spec.topology.rack
+          priority: 1
+        - name: Source
+          type: string
+          jsonPath: .spec.source.kind
+        - name: Finished
+          type: date
+          jsonPath: .spec.finishedAt
+      schema:
+        openAPIV3Schema:
+          type: object
+          required: [spec]
+          properties:
+            apiVersion:
+              type: string
+            kind:
+              type: string
+            metadata:
+              type: object
+            spec:
+              type: object
+              x-kubernetes-validations:
+                - rule: self == oldSelf
+                  message: a QualificationReport is a record and cannot be changed
+              required: [machineRef, source, result]
+              properties:
+                machineRef:
+                  description: The vCluster Platform Machine qualified, <provider>.<machine id>.
+                  type: string
+                providerRef:
+                  description: The Machine's node provider.
+                  type: string
+                assetID:
+                  description: The inventory's name for the machine, when the source knows one.
+                  type: string
+                inventoryURL:
+                  description: The machine's page in the inventory, for example its NetBox device.
+                  type: string
+                topology:
+                  description: Where the machine is, by name, for example site, location and rack, so
+                    failures can be grouped by shared power, cooling and network.
+                  type: object
+                  additionalProperties:
+                    type: string
+                source:
+                  description: What ran the qualification.
+                  type: object
+                  required: [kind]
+                  properties:
+                    kind:
+                      type: string
+                      enum: [Stack, NICoValidation, vMetalAgent, Other]
+                    namespace:
+                      type: string
+                    name:
+                      type: string
+                    uid:
+                      type: string
+                    template:
+                      description: For kind Stack, the StackTemplate.
+                      type: string
+                profile:
+                  description: The thresholds the run was judged against, for example b300-burnin-v1.
+                  type: string
+                group:
+                  description: The node group the run tested together, for example a rack, when it
+                    tested more than one node. Reports of one run share it.
+                  type: string
+                result:
+                  type: string
+                  enum: [passed, failed, error]
+                failedTests:
+                  type: array
+                  items:
+                    type: string
+                summary:
+                  type: string
+                startedAt:
+                  type: string
+                  format: date-time
+                finishedAt:
+                  type: string
+                  format: date-time
+                reportURI:
+                  description: Where the full report is stored, for example s3://bucket/key.
+                  type: string
+                hardware:
+                  type: object
+                  properties:
+                    node:
+                      type: string
+                    gpuModel:
+                      type: string
+                    gpuCount:
+                      type: integer
+                    expectedGPUs:
+                      type: integer
+                    driver:
+                      type: string
+                    gpus:
+                      type: array
+                      items:
+                        type: object
+                        properties:
+                          index:
+                            type: integer
+                          uuid:
+                            type: string
+                          name:
+                            type: string
+                          serial:
+                            type: string
+                    dmi:
+                      type: object
+                      additionalProperties:
+                        type: string
+                tests:
+                  type: array
+                  items:
+                    type: object
+                    required: [name, status]
+                    properties:
+                      name:
+                        type: string
+                      status:
+                        description: passed, failed, error, skipped, disabled or missing.
+                        type: string
+                      summary:
+                        type: string
+                      startedAt:
+                        type: string
+                      finishedAt:
+                        type: string
+                      metrics:
+                        description: Measurements by name, the same names across sources.
+                        type: object
+                        additionalProperties:
+                          type: number

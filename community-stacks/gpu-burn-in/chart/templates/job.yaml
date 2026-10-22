@@ -1,0 +1,167 @@
+{{- $test := include "burnin.test" . -}}
+{{- $gpuTest := include "burnin.gpuTest" . -}}
+{{- $run := and $gpuTest (ne (toString .Values.enabled) "false") -}}
+{{- $tools := .Values.toolsImage | default "alpine/k8s:1.36.5" -}}
+{{- /* A Job spec is immutable. Changing any value or the chart version names a new Job, which also
+  re-runs the step; bump the chart version when a template change alters the Job spec. Not
+  sync-options Replace=true: Argo CD then replaces completed Jobs, whose controller-set selector
+  makes the replace fail on every retry. */ -}}
+{{- $hash := printf "%s|%s" (toJson .Values) .Chart.Version | sha256sum | trunc 8 -}}
+{{- define "burnin.env" -}}
+- name: TEST
+  value: {{ include "burnin.test" . | quote }}
+- name: NODE_NAME
+  valueFrom:
+    fieldRef:
+      fieldPath: spec.nodeName
+- name: HOME
+  value: /tmp
+- name: WORK
+  value: /work
+- name: EXPECTED_GPUS
+  value: {{ .Values.expectedGPUs | default "8" | toString | quote }}
+- name: GPUS
+  value: {{ .Values.gpus | default "1" | toString | quote }}
+- name: GPU_MODEL
+  value: {{ .Values.gpuModel | default "" | quote }}
+- name: NVLINK_FABRIC
+  value: {{ .Values.nvlinkFabric | default "auto" | quote }}
+- name: ASSET_ID
+  value: {{ .Values.assetID | default "" | quote }}
+- name: PROFILE
+  value: {{ .Values.profile | default "default" | quote }}
+- name: STOP_ON_FAILURE
+  value: {{ .Values.stopOnFailure | default "true" | toString | quote }}
+- name: FAIL_ON_SKIP
+  value: {{ .Values.failOnSkip | default "false" | toString | quote }}
+- name: DCGM_DIAG_LEVEL
+  value: {{ .Values.dcgmDiagLevel | default "3" | toString | quote }}
+- name: DCGM_EXTRA_TESTS
+  value: {{ .Values.dcgmExtraTests | default "" | quote }}
+- name: NCCL_MAX_BYTES
+  value: {{ .Values.ncclMaxBytes | default "1G" | quote }}
+- name: NCCL_MIN_BUS_BW
+  value: {{ .Values.ncclMinBusBandwidthGBps | default "0" | toString | quote }}
+- name: DCGM_HOST
+  value: {{ .Values.dcgmHost | default "" | quote }}
+- name: SOAK_MINUTES
+  value: {{ include "burnin.soakMinutes" . | quote }}
+- name: SOAK_LOAD
+  value: {{ .Values.soakLoad | default "dcgm" | quote }}
+- name: MAX_GPU_TEMP_C
+  value: {{ .Values.maxGPUTempC | default "90" | toString | quote }}
+- name: MAX_NVLINK_ERRORS
+  value: {{ .Values.maxNVLinkErrors | default "0" | toString | quote }}
+- name: READY_WAIT_SECONDS
+  value: {{ .Values.readyWaitSeconds | default "2400" | toString | quote }}
+- name: RUN_TIMEOUT_SECONDS
+  value: {{ include "burnin.runTimeout" . | quote }}
+- name: TESTS
+  value: {{ .Values.tests | default "gpuready,inventory,dcgmdiag,nccl,soak" | quote }}
+- name: REPORT_S3_URI
+  value: {{ .Values.reportS3URI | default "" | quote }}
+- name: S3_ENDPOINT
+  value: {{ .Values.s3Endpoint | default "" | quote }}
+- name: RESULT
+  value: {{ .Values.result | default "" | quote }}
+- name: FAILED_TESTS
+  value: {{ .Values.failedTests | default "" | quote }}
+- name: ENABLED
+  value: {{ .Values.enabled | default "true" | toString | quote }}
+{{- end }}
+# No ttlSecondsAfterFinished: Argo CD would recreate a deleted Job, and the completed Job and its
+# logs are the evidence. backoffLimit 0: a test is never silently retried. Every test container
+# records its outcome and exits 0, so a pod failure means the step itself broke.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ .Release.Name | trunc 50 | trimSuffix "-" }}-{{ $hash }}
+  labels:
+    {{- include "burnin.labels" . | nindent 4 }}
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        {{- include "burnin.labels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ .Release.Name }}
+      restartPolicy: Never
+      {{- if $run }}
+      # GPU tests take every GPU the driver sees through the NVIDIA runtime, not a device plugin
+      # request. A GPU the device plugin marks unhealthy mid-run (an XID, an ECC error) would leave
+      # a pod requesting the full count Pending until the task times out, with no report. The
+      # qualification cluster has the server to itself, so nothing else competes for the GPUs,
+      # and inventory compares the driver's count with what the device plugin still advertises.
+      runtimeClassName: {{ .Values.runtimeClassName | default "nvidia" | quote }}
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      initContainers:
+        # Records a skip when an earlier test failed and stopOnFailure is on.
+        - name: gate
+          image: {{ $tools | quote }}
+          command: ["sh", "/scripts/gate.sh"]
+          env:
+            {{- include "burnin.env" . | nindent 12 }}
+          volumeMounts:
+            - { name: scripts, mountPath: /scripts }
+            - { name: work, mountPath: /work }
+        # Runs the test in the NVIDIA tool image and keeps its raw output. Never fails the pod.
+        - name: run
+          image: {{ include "burnin.image" . | quote }}
+          command: ["sh", "/scripts/run.sh"]
+          env:
+            {{- include "burnin.env" . | nindent 12 }}
+            - name: NVIDIA_VISIBLE_DEVICES
+              value: all
+            - name: NVIDIA_DRIVER_CAPABILITIES
+              value: compute,utility
+          {{- if has $test (list "dcgmdiag" "soak") }}
+          # DCGM diagnostics and profiling need SYS_ADMIN, as in NVIDIA's container instructions.
+          securityContext:
+            capabilities:
+              add: ["SYS_ADMIN"]
+          {{- end }}
+          volumeMounts:
+            - { name: scripts, mountPath: /scripts }
+            - { name: work, mountPath: /work }
+            {{- if eq $test "nccl" }}
+            - { name: shm, mountPath: /dev/shm }
+            {{- end }}
+      {{- end }}
+      containers:
+        - name: {{ if $gpuTest }}publish{{ else }}{{ $test }}{{ end }}
+          image: {{ $tools | quote }}
+          command: ["sh", "/scripts/{{ if $gpuTest }}publish{{ else }}{{ $test }}{{ end }}.sh"]
+          env:
+            {{- include "burnin.env" . | nindent 12 }}
+          {{- if and (eq $test "report") .Values.s3CredentialsSecret }}
+          envFrom:
+            - secretRef:
+                name: {{ .Values.s3CredentialsSecret | quote }}
+                optional: true
+          {{- end }}
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 512Mi
+          volumeMounts:
+            - { name: scripts, mountPath: /scripts }
+            - { name: work, mountPath: /work }
+      volumes:
+        - name: scripts
+          configMap:
+            name: {{ .Release.Name }}-scripts
+        - name: work
+          emptyDir: {}
+        {{- if and $run (eq $test "nccl") }}
+        # NCCL falls back to shared memory between ranks; the container default of 64Mi is too small.
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: {{ .Values.shmSize | default "16Gi" }}
+        {{- end }}

@@ -1,0 +1,78 @@
+<?xml version="1.0" ?>
+<!DOCTYPE nvidia_smi_log SYSTEM "nvsmi_device_v13.dtd">
+<nvidia_smi_log>
+	<driver_version>580.173.02</driver_version>
+	<attached_gpus>4</attached_gpus>
+	<gpu id="00000000:01:00.0">
+		<product_name>NVIDIA GB300</product_name>
+		<fabric>
+			<state>Completed</state>
+			<status>Success</status>
+			<cliqueId>32766</cliqueId>
+			<clusterUuid>00000001-0000-0000-0000-000000000001</clusterUuid>
+			<health>
+				<summary>Healthy</summary>
+				<bandwidth>Full</bandwidth>
+				<route_recovery_in_progress>False</route_recovery_in_progress>
+				<route_unhealthy>False</route_unhealthy>
+				<access_timeout_recovery>False</access_timeout_recovery>
+				<incorrect_configuration>None</incorrect_configuration>
+				<partition_assigned>N/A</partition_assigned>
+			</health>
+		</fabric>
+	</gpu>
+	<gpu id="00000001:01:00.0">
+		<product_name>NVIDIA GB300</product_name>
+		<fabric>
+			<state>Completed</state>
+			<status>Success</status>
+			<cliqueId>32766</cliqueId>
+			<clusterUuid>00000001-0000-0000-0000-000000000001</clusterUuid>
+			<health>
+				<summary>Healthy</summary>
+				<bandwidth>Full</bandwidth>
+				<route_recovery_in_progress>False</route_recovery_in_progress>
+				<route_unhealthy>False</route_unhealthy>
+				<access_timeout_recovery>False</access_timeout_recovery>
+				<incorrect_configuration>None</incorrect_configuration>
+				<partition_assigned>N/A</partition_assigned>
+			</health>
+		</fabric>
+	</gpu>
+	<gpu id="00000002:01:00.0">
+		<product_name>NVIDIA GB300</product_name>
+		<fabric>
+			<state>Completed</state>
+			<status>Success</status>
+			<cliqueId>32766</cliqueId>
+			<clusterUuid>00000001-0000-0000-0000-000000000001</clusterUuid>
+			<health>
+				<summary>Healthy</summary>
+				<bandwidth>Full</bandwidth>
+				<route_recovery_in_progress>False</route_recovery_in_progress>
+				<route_unhealthy>False</route_unhealthy>
+				<access_timeout_recovery>False</access_timeout_recovery>
+				<incorrect_configuration>None</incorrect_configuration>
+				<partition_assigned>N/A</partition_assigned>
+			</health>
+		</fabric>
+	</gpu>
+	<gpu id="00000003:01:00.0">
+		<product_name>NVIDIA GB300</product_name>
+		<fabric>
+			<state>Completed</state>
+			<status>Success</status>
+			<cliqueId>32766</cliqueId>
+			<clusterUuid>00000001-0000-0000-0000-000000000001</clusterUuid>
+			<health>
+				<summary>Healthy</summary>
+				<bandwidth>Full</bandwidth>
+				<route_recovery_in_progress>False</route_recovery_in_progress>
+				<route_unhealthy>False</route_unhealthy>
+				<access_timeout_recovery>False</access_timeout_recovery>
+				<incorrect_configuration>None</incorrect_configuration>
+				<partition_assigned>N/A</partition_assigned>
+			</health>
+		</fabric>
+	</gpu>
+</nvidia_smi_log>

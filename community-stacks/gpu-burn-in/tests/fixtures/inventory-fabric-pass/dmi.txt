@@ -1,0 +1,4 @@
+sys_vendor=Supermicro
+product_name=SYS-A22GA-NBRT
+product_serial=S123456X
+board_serial=B987654

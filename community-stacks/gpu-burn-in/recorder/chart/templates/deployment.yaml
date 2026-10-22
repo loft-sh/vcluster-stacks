@@ -1,0 +1,155 @@
+{{- if not (has .Values.target (list "machine" "bmh")) }}
+{{- fail (printf "target must be machine or bmh, not %q" .Values.target) }}
+{{- end }}
+{{- if regexMatch "(^|\\.)(vcluster\\.com|loft\\.sh)$" .Values.labelDomain }}
+{{- fail (printf "labelDomain %s: NodeType selection ignores labels in vcluster.com and loft.sh domains" .Values.labelDomain) }}
+{{- end }}
+{{- if and (gt (int .Values.replicas) 1) (not .Values.leaderElection) }}
+{{- fail "more than one replica needs leaderElection: true" }}
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "recorder.name" . }}
+  labels:
+    {{- include "recorder.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicas }}
+  selector:
+    matchLabels:
+      {{- include "recorder.selector" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "recorder.labels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "recorder.name" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: recorder
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - --templates={{ join "," .Values.templates }}
+            - --label-domain={{ .Values.labelDomain }}
+            - --target={{ .Values.target }}
+            {{- with .Values.localCluster }}
+            - --local-cluster={{ . }}
+            {{- end }}
+            {{- if .Values.clusterKubeconfigs.existingSecret }}
+            - --cluster-kubeconfig-dir=/etc/gpu-burn-in-recorder/clusters
+            {{- end }}
+            {{- if .Values.netbox.tokenSecret.name }}
+            - --netbox-token-file=/etc/gpu-burn-in-recorder/netbox/{{ .Values.netbox.tokenSecret.key }}
+            {{- end }}
+            {{- with .Values.netbox.admitTag }}
+            - --netbox-admit-tag={{ . }}
+            {{- end }}
+            {{- with .Values.netbox.qualifiedTag }}
+            - --netbox-qualified-tag={{ . }}
+            {{- end }}
+            - --keep-reports={{ .Values.keepReports }}
+            - --max-report-age={{ .Values.maxReportAge | default "0s" }}
+            {{- $topology := list }}
+            {{- range $name, $label := .Values.topology }}
+            {{- $topology = append $topology (printf "%s=%s" $name $label) }}
+            {{- end }}
+            - --topology={{ join "," $topology }}
+            - --dry-run={{ .Values.dryRun }}
+            - --leader-elect={{ .Values.leaderElection }}
+            - --zap-log-level={{ .Values.logLevel }}
+          ports:
+            - name: metrics
+              containerPort: 8080
+            - name: probes
+              containerPort: 8081
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: probes
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: probes
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            {{- if .Values.clusterKubeconfigs.existingSecret }}
+            - name: clusters
+              mountPath: /etc/gpu-burn-in-recorder/clusters
+              readOnly: true
+            {{- end }}
+            {{- if .Values.netbox.tokenSecret.name }}
+            - name: netbox
+              mountPath: /etc/gpu-burn-in-recorder/netbox
+              readOnly: true
+            {{- end }}
+        {{- with (.Values.metrics | default dict).fleetObservability }}
+        {{- if .enabled }}
+        # Scrapes the controller's metrics and pushes them to Fleet Observability.
+        - name: fleet-collector
+          image: {{ .image | quote }}
+          args: ["--config=/etc/otelcol/config.yaml"]
+          env:
+            - name: FLEET_AUTHORIZATION
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .authSecret.name | quote }}
+                  key: {{ .authSecret.key | quote }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+          volumeMounts:
+            - name: fleet-collector
+              mountPath: /etc/otelcol
+              readOnly: true
+        {{- end }}
+        {{- end }}
+      volumes:
+        {{- if ((.Values.metrics | default dict).fleetObservability | default dict).enabled }}
+        - name: fleet-collector
+          configMap:
+            name: {{ include "recorder.name" . }}-fleet-collector
+        {{- end }}
+        {{- with .Values.clusterKubeconfigs.existingSecret }}
+        - name: clusters
+          secret:
+            secretName: {{ . }}
+        {{- end }}
+        {{- with .Values.netbox.tokenSecret.name }}
+        - name: netbox
+          secret:
+            secretName: {{ . }}
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

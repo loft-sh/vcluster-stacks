@@ -1,0 +1,8 @@
+apiVersion: v2
+name: gpu-burn-in-test
+description: >-
+  One step of the gpu-burn-in Stack: a Job that runs a GPU qualification test, records its result
+  in a ConfigMap, and completes. The gpu-burn-in-test ArgoCDApplicationTemplate deploys this chart
+  once per Stack task, with `test` choosing the step.
+type: application
+version: 0.2.0

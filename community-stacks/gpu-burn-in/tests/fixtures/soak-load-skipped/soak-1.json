@@ -1,0 +1,1 @@
+{"DCGM Diagnostic":{"test_categories":[{"category":"Stress","tests":[{"name":"targeted_stress","results":[{"entity_group":"GPU","entity_id":0,"status":"Skip","info":["GPU is not supported"]}]},{"name":"targeted_power","results":[{"entity_group":"GPU","entity_id":0,"status":"Skip"}]}]}]},"version":"4.5.3"}

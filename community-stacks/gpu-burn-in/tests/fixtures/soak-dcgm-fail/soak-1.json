@@ -1,0 +1,5 @@
+{"DCGM Diagnostic":{"test_categories":[
+ {"category":"Deployment","tests":[{"name":"software","results":[{"entity_group":"GPU","entity_group_id":1,"entity_id":0,"status":"Pass"}],"test_summary":{"status":"Pass"}}]},
+ {"category":"Hardware","tests":[{"name":"memtest","results":[{"entity_group":"GPU","entity_group_id":1,"entity_id":0,"status":"Pass"},{"entity_group":"GPU","entity_group_id":1,"entity_id":1,"status":"Pass","warnings":[{"warning":"Memory error detected"}]}],"test_summary":{"status":"Pass"}}]},
+ {"category":"Integration","tests":[{"name":"pcie","results":[{"entity_group":"GPU","entity_group_id":1,"entity_id":0,"status":"Fail"}],"test_summary":{"status":"Fail"}}]}]},
+ "version":"4.5.3"}

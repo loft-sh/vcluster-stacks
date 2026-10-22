@@ -1,0 +1,124 @@
+# Install on the cluster that runs vCluster Platform, in any namespace. The controller reads
+# Platform storage objects there and writes through the Platform management API.
+
+image:
+  # Published by .github/workflows/gpu-burn-in-recorder-image.yml.
+  repository: ghcr.io/loft-demos/gpu-burn-in-recorder
+  # Defaults to the chart appVersion, published from tag gpu-burn-in-recorder-v<appVersion>.
+  # Until then, use a branch tag (gpu-burn-in) or sha-<short sha>.
+  tag: ""
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+# StackTemplates whose instances are recorded.
+templates:
+  - gpu-burn-in
+
+# Domain of the result label (<domain>/result) and annotations. Use one your organization owns.
+# Never a vcluster.com or loft.sh domain: newer Platform builds keep labels in those domains out of
+# NodeType selection, and the controller refuses them.
+labelDomain: gpu-qualification.example.com
+
+# Where to record:
+#   machine  the vCluster Platform Machine, through the management API. Provider-neutral (Metal3 and
+#            NICo). NodeTypes select on Machine labels from Platform v5.0.0-alpha.5; before that the
+#            label is accepted, but Metal3 NodeTypes select on BareMetalHost labels only.
+#   bmh      the Metal3 BareMetalHost, on the cluster its NodeProvider's clusterRef names. Works on
+#            any build; from v5.0.0-alpha.5 the Platform copies the label to the Machine.
+target: machine
+
+# bmh only. The Platform name of this cluster: a Metal3 provider whose clusterRef names it is
+# written with the controller's own credentials, and the chart grants it BareMetalHost access.
+localCluster: ""
+# bmh only. A Secret with one kubeconfig per other cluster, the key named after the Platform
+# cluster, for example spark-cluster. Each needs get and patch on baremetalhosts.metal3.io.
+clusterKubeconfigs:
+  existingSecret: ""
+
+netbox:
+  # A Secret with the NetBox API token. Without it, runs that set netboxUpdate skip NetBox.
+  tokenSecret:
+    name: ""
+    key: token
+  # Removed from a device that fails: the tag that brings the device into vCluster Platform.
+  admitTag: ""
+  # Added to a device that passes.
+  qualifiedTag: ""
+
+# Report retention per machine: at most keepReports reports, none finished more than maxReportAge
+# ago. A machine's latest report is always kept, whatever its age: it is the machine's current
+# state. 0 turns either limit off. Keep long-term history in the S3 copy of each report. Sizing: at
+# about 4 KB a report, 10,000 machines x 5 reports is about 200 MB in the cluster's etcd.
+keepReports: 5
+maxReportAge: 2160h # 90 days
+
+# Topology names recorded in each report and added as labels to every metric, each read from a
+# Machine label, so dashboards can group failures by shared power, cooling and network. The
+# defaults are what vCluster Platform's NetBox import puts on every Machine; missing labels stay
+# empty. The dashboards use site, location and rack.
+topology:
+  site: netbox.vcluster.com/site
+  location: netbox.vcluster.com/location
+  rack: netbox.vcluster.com/rack
+
+# Log every write instead of making it.
+dryRun: false
+
+# Prometheus metrics computed from QualificationReports, on port 8080 at /metrics.
+metrics:
+  service:
+    enabled: true
+  # Needs the Prometheus Operator's ServiceMonitor CRD.
+  serviceMonitor:
+    enabled: false
+    interval: 60s
+    labels: {}
+  # Pushes the metrics to vCluster Platform Fleet Observability: an OpenTelemetry collector sidecar
+  # scrapes the controller and writes to the Fleet gateway with a cluster's metrics-writer key,
+  # like Fleet Observability's own collectors. Use it where nothing scrapes the Platform cluster.
+  fleetObservability:
+    enabled: false
+    # The Fleet gateway, for example https://otel.<platform host>.
+    endpoint: ""
+    # The Platform cluster the metrics are attributed to, for example loft-cluster.
+    cluster: ""
+    # Secret in this release's namespace holding the Authorization header value, as the bundled
+    # collectors use it (on the Platform cluster, Secret otel-otlp-auth in namespace observability).
+    authSecret:
+      name: otel-otlp-auth
+      key: authorization
+    scrapeInterval: 60s
+    # renovate: datasource=docker depName=otel/opentelemetry-collector-contrib
+    image: otel/opentelemetry-collector-contrib:0.154.0
+
+# The GPU Burn-In Grafana dashboard, as a ConfigMap the Grafana dashboard sidecar loads. vCluster
+# Platform's bundled Grafana loads ConfigMaps labelled grafana_dashboard: "1" in vcluster-platform.
+dashboard:
+  enabled: true
+  namespace: vcluster-platform
+  # The Prometheus datasource the dashboard queries. Empty finds it at install, in the namespace
+  # above: the control plane datasource of metrics.fleetObservability.cluster, else Fleet
+  # Observability's. Found or set, the selector is hidden.
+  datasourceUID: ""
+  labels:
+    grafana_dashboard: "1"
+
+rbac:
+  # Grants delete on VirtualClusterInstances, so runs that set releaseServer can delete their
+  # tenant cluster. Without it, releaseServer fails with Forbidden.
+  releaseServer: true
+
+replicas: 1
+# Needed for more than one replica.
+leaderElection: false
+logLevel: info
+
+resources:
+  requests:
+    cpu: 10m
+    memory: 64Mi
+  limits:
+    memory: 256Mi
+nodeSelector: {}
+tolerations: []
+affinity: {}

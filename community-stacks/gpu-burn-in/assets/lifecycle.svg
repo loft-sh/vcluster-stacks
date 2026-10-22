@@ -1,0 +1,56 @@
+<svg viewBox="0 0 760 392" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="The GPU burn-in lifecycle. A short-lived tenant cluster claims one server, installs the GPU Operator, runs the tests and writes a report, pass or fail. The result is recorded on the server, the tenant cluster is deleted and the server is wiped. Production NodeTypes select a passed server; a failed one is held back.">
+  <defs>
+    <style><![CDATA[
+      text { font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; }
+    ]]></style>
+    <marker id="gpu-burn-in-lifecycle-arrow" markerWidth="9" markerHeight="8" refX="7" refY="4" orient="auto">
+      <polygon points="0 0, 7 4, 0 8" fill="#B4B6BD"/>
+    </marker>
+  </defs>
+
+  <rect x="0" y="0" width="760" height="392" fill="#FFFFFF"/>
+
+  <rect x="24.0" y="24.0" width="216" height="84" rx="8" fill="#FFFFFF" stroke="#B4B6BD" stroke-width="1.5"/>
+  <text x="132.0" y="54.0" font-size="15" font-weight="600" fill="#050B24" text-anchor="middle">Claim the server</text>
+  <text x="132.0" y="78.0" font-size="13" fill="#828592" text-anchor="middle">A short-lived tenant cluster</text>
+  <text x="132.0" y="96.0" font-size="13" fill="#828592" text-anchor="middle">takes it as its only node</text>
+  <rect x="260.0" y="24.0" width="216" height="84" rx="8" fill="#FFFFFF" stroke="#B4B6BD" stroke-width="1.5"/>
+  <text x="368.0" y="54.0" font-size="15" font-weight="600" fill="#050B24" text-anchor="middle">Install GPU Operator</text>
+  <text x="368.0" y="78.0" font-size="13" fill="#828592" text-anchor="middle">Driver, device plugin, DCGM</text>
+  <text x="368.0" y="96.0" font-size="13" fill="#828592" text-anchor="middle">and dcgm-exporter</text>
+  <rect x="496.0" y="24.0" width="216" height="84" rx="8" fill="#FFFFFF" stroke="#B4B6BD" stroke-width="1.5"/>
+  <text x="604.0" y="54.0" font-size="15" font-weight="600" fill="#050B24" text-anchor="middle">Run the tests</text>
+  <text x="604.0" y="78.0" font-family="'Roboto Mono', ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12.5" fill="#828592" text-anchor="middle">gpuready, inventory,</text>
+  <text x="604.0" y="96.0" font-family="'Roboto Mono', ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12.5" fill="#828592" text-anchor="middle">dcgmdiag, nccl, soak</text>
+  <rect x="496.0" y="154.0" width="216" height="84" rx="8" fill="#FFFFFF" stroke="#B4B6BD" stroke-width="1.5"/>
+  <text x="604.0" y="184.0" font-size="15" font-weight="600" fill="#050B24" text-anchor="middle">Write the report</text>
+  <text x="604.0" y="208.0" font-size="13" fill="#828592" text-anchor="middle">Pass or fail, failed tests,</text>
+  <text x="604.0" y="226.0" font-size="13" fill="#828592" text-anchor="middle">metrics, Stack outputs</text>
+  <rect x="260.0" y="154.0" width="216" height="84" rx="8" fill="#FFFFFF" stroke="#B4B6BD" stroke-width="1.5"/>
+  <text x="368.0" y="184.0" font-size="15" font-weight="600" fill="#050B24" text-anchor="middle">Record the result</text>
+  <text x="368.0" y="208.0" font-size="13" fill="#828592" text-anchor="middle">Labels the BareMetalHost or</text>
+  <text x="368.0" y="226.0" font-size="13" fill="#828592" text-anchor="middle">Machine; QualificationReport</text>
+  <rect x="24.0" y="154.0" width="216" height="84" rx="8" fill="#FFFFFF" stroke="#B4B6BD" stroke-width="1.5"/>
+  <text x="132.0" y="184.0" font-size="15" font-weight="600" fill="#050B24" text-anchor="middle">Release the server</text>
+  <text x="132.0" y="208.0" font-size="13" fill="#828592" text-anchor="middle">Tenant cluster deleted,</text>
+  <text x="132.0" y="226.0" font-size="13" fill="#828592" text-anchor="middle">server wiped and returned</text>
+  <rect x="24.0" y="284.0" width="216" height="84" rx="8" fill="#FFFFFF" stroke="#FF6600" stroke-width="2"/>
+  <text x="132.0" y="314.0" font-size="15" font-weight="600" fill="#050B24" text-anchor="middle">Admitted</text>
+  <text x="132.0" y="338.0" font-size="13" fill="#828592" text-anchor="middle">Label passed: production</text>
+  <text x="132.0" y="356.0" font-size="13" fill="#828592" text-anchor="middle">NodeTypes select it</text>
+  <rect x="260.0" y="284.0" width="216" height="84" rx="8" fill="#FFFFFF" stroke="#B4B6BD" stroke-width="1.5" stroke-dasharray="6 4"/>
+  <text x="368.0" y="314.0" font-size="15" font-weight="600" fill="#050B24" text-anchor="middle">Held back</text>
+  <text x="368.0" y="338.0" font-size="13" fill="#828592" text-anchor="middle">Label failed: only the</text>
+  <text x="368.0" y="356.0" font-size="13" fill="#828592" text-anchor="middle">qualification NodeType</text>
+
+  <path d="M240.0 66 H256.0" fill="none" stroke="#B4B6BD" stroke-width="1.5" marker-end="url(#gpu-burn-in-lifecycle-arrow)"/>
+  <path d="M476.0 66 H492.0" fill="none" stroke="#B4B6BD" stroke-width="1.5" marker-end="url(#gpu-burn-in-lifecycle-arrow)"/>
+  <path d="M604 108.0 V150.0" fill="none" stroke="#B4B6BD" stroke-width="1.5" marker-end="url(#gpu-burn-in-lifecycle-arrow)"/>
+  <path d="M496.0 196 H480.0" fill="none" stroke="#B4B6BD" stroke-width="1.5" marker-end="url(#gpu-burn-in-lifecycle-arrow)"/>
+  <path d="M260.0 196 H244.0" fill="none" stroke="#B4B6BD" stroke-width="1.5" marker-end="url(#gpu-burn-in-lifecycle-arrow)"/>
+  <path d="M132 238.0 V280.0" fill="none" stroke="#B4B6BD" stroke-width="1.5" marker-end="url(#gpu-burn-in-lifecycle-arrow)"/>
+  <path d="M132 262.0 H368 V280.0" fill="none" stroke="#B4B6BD" stroke-width="1.5" marker-end="url(#gpu-burn-in-lifecycle-arrow)"/>
+  <text x="614" y="136.0" font-size="13" fill="#828592" text-anchor="start">always, pass or fail</text>
+  <text x="122" y="274.0" font-size="13" fill="#828592" text-anchor="end">passed</text>
+  <text x="250.0" y="254.0" font-size="13" fill="#828592" text-anchor="middle">failed</text>
+</svg>

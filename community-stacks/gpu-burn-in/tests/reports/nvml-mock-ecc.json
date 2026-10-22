@@ -1,0 +1,60 @@
+{
+  "schema": "gpu-burn-in.vcluster.com/v1",
+  "result": "failed",
+  "failedTests": [
+    "inventory",
+    "soak"
+  ],
+  "summary": "inventory failed: uncorrected ECC errors: GPU 0=2",
+  "assetID": "rack-b-u18-xlarge",
+  "profile": "nvml-mock-ecc",
+  "host": {
+    "name": "rack-b-u18-xlarge",
+    "labels": {},
+    "dmi": {
+      "product_name": "Ubuntu 24.04 PC"
+    }
+  },
+  "expectedGPUs": 8,
+  "detectedGPUs": 8,
+  "startedAt": "2026-10-20T22:05:00Z",
+  "reportURI": "",
+  "gpus": [
+    {
+      "index": 0,
+      "uuid": "GPU-0",
+      "name": "NVIDIA B200",
+      "serial": "1",
+      "driver": "580.65.06"
+    },
+    {
+      "index": 1,
+      "uuid": "GPU-1",
+      "name": "NVIDIA B200",
+      "serial": "2",
+      "driver": "580.65.06"
+    }
+  ],
+  "tests": [
+    {
+      "test": "inventory",
+      "status": "failed",
+      "summary": "ECC",
+      "startedAt": "2026-10-20T22:06:00Z",
+      "finishedAt": "2026-10-20T22:06:10Z",
+      "metrics": {
+        "gpus": 8,
+        "allocatable_gpus": 7,
+        "uncorrected_ecc_errors": 2
+      }
+    },
+    {
+      "test": "soak",
+      "status": "skipped",
+      "summary": "an earlier test failed",
+      "startedAt": "",
+      "finishedAt": "2026-10-20T22:07:00Z",
+      "metrics": {}
+    }
+  ]
+}

@@ -1,0 +1,25 @@
+# The network the V100 nodes join: a VPC, subnet, router and Cloud NAT in your project, created by
+# the node provider's networkEnvironmentTemplate. vCluster Platform runs that template for a
+# NetworkEnvironment object, not once per tenant cluster, so create this before the first run.
+# Without it the NodeClaim stays Pending with WaitingForNetworkEnvironment and nothing is created.
+#
+# The annotation makes it the provider's default, so claims that name no environment use it. The
+# label reserves it for the platform; set it to a tenant's name to lend it to that tenant instead.
+# NetworkEnvironment and networkEnvironmentTemplate are not in vCluster Platform 4.12; they arrived
+# in the 4.13 alphas and ship in 5.0.
+# min-platform-version: 4.13.0-alpha.2
+apiVersion: management.loft.sh/v1
+kind: NetworkEnvironment
+metadata:
+  name: gcp-gpu-us-central1
+  labels:
+    tenant.vcluster.com/exclusive-to: ""
+  annotations:
+    machines.vcluster.com/is-default-environment: "true"
+spec:
+  displayName: GCP GPU us-central1
+  providerRef: auto-nodes-gcp-gpu
+  properties:
+    project: <your-gcp-project>
+    region: us-central1
+    terraform.vcluster.com/credentials: "*"
