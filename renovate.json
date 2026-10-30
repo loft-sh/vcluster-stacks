@@ -18,6 +18,17 @@
       "matchManagers": ["terraform"],
       "matchDepTypes": ["provider"],
       "groupName": "terraform-providers"
+    },
+    {
+      "description": "Keep internal loft-sh actions on rolling version tags",
+      "matchManagers": [
+        "github-actions"
+      ],
+      "matchPackageNames": [
+        "loft-sh/**"
+      ],
+      "pinDigests": false,
+      "enabled": false
     }
   ],
   "customManagers": [
