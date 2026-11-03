@@ -1,0 +1,183 @@
+# NVKE's base configuration, reduced from NVKE's deploy/nico/nvke-base-config (v0.22.0): the
+# namespaces the charts expect, the shared database password Postgres and Temporal read, the image
+# pull secret for the controller and profiles images, the OIDC upstream CA chain cert-manager issues
+# for SPIRE's discovery provider, the nktp cluster-name ConfigMap, and the finalizers Role NVKE adds
+# for the OpenTelemetry operator.
+apiVersion: management.loft.sh/v1
+kind: App
+metadata:
+  name: nvidia-nvke-mgmt-base-config
+spec:
+  displayName: '[NVIDIA NVKE Step - 3] Base configuration'
+  description: Namespaces, the shared database secret, the registry pull secret, the OIDC upstream CA chain and the nktp cluster ConfigMap NVKE's charts expect.
+  defaultNamespace: nvke-base
+  wait: true
+  timeout: 5m
+  config:
+    manifests: |-
+      {{- $host := .Values.registryPrefix | splitList "/" | first -}}
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: nke-controller
+      ---
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: nvke-system
+      ---
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: nktp
+        labels:
+          pod-security.kubernetes.io/enforce: privileged
+      ---
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: postgres
+      ---
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: spire-server
+        labels:
+          pod-security.kubernetes.io/enforce: restricted
+      ---
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: spire-system
+        labels:
+          pod-security.kubernetes.io/enforce: privileged
+      ---
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: temporal
+      ---
+      # One password for Postgres and both of Temporal's datastores (NVKE: nvke-database).
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: nvke-database
+        namespace: postgres
+      type: Opaque
+      stringData:
+        password: {{ .Values.dbPassword | quote }}
+      ---
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: nvke-database
+        namespace: temporal
+      type: Opaque
+      stringData:
+        password: {{ .Values.dbPassword | quote }}
+      {{- if .Values.registryUsername }}
+      ---
+      # Pull secret for the controller and profiles images in the release registry.
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: nvke-registry
+        namespace: nke-controller
+      type: kubernetes.io/dockerconfigjson
+      data:
+        .dockerconfigjson: {{ dict "auths" (dict $host (dict "username" .Values.registryUsername "password" .Values.registryPassword "auth" (printf "%s:%s" .Values.registryUsername .Values.registryPassword | b64enc))) | toJson | b64enc | quote }}
+      {{- end }}
+      ---
+      # OIDC upstream CA chain, verbatim from NVKE deploy/nico/nvke-base-config/40-oidc-upstream-ca.yaml.
+      apiVersion: cert-manager.io/v1
+      kind: Issuer
+      metadata:
+        name: oidc-ca-bootstrap
+        namespace: spire-server
+      spec:
+        selfSigned: {}
+      ---
+      apiVersion: cert-manager.io/v1
+      kind: Certificate
+      metadata:
+        name: oidc-provider-upstream-ca
+        namespace: spire-server
+      spec:
+        isCA: true
+        commonName: "NKE OIDC Upstream CA"
+        subject:
+          organizations: ["NVIDIA"]
+          organizationalUnits: ["NKE"]
+        duration: 87600h
+        renewBefore: 720h
+        secretName: oidc-provider-upstream-ca
+        privateKey:
+          algorithm: ECDSA
+          size: 384
+        issuerRef:
+          name: oidc-ca-bootstrap
+          kind: Issuer
+          group: cert-manager.io
+      ---
+      apiVersion: cert-manager.io/v1
+      kind: Issuer
+      metadata:
+        name: nvke-oidc-upstream-ca
+        namespace: spire-server
+      spec:
+        ca:
+          secretName: oidc-provider-upstream-ca
+      ---
+      # nktp labels telemetry with the cluster name (NVKE 45-nktp-cluster.yaml.tmpl).
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: nktp-cluster
+        namespace: nktp
+      data:
+        name: {{ .Values.clusterName | default "nvke" | quote }}
+      ---
+      # Static form of the deployments/finalizers Role NVKE's nktp values add through
+      # opentelemetry-operator.extraObjects, whose templates the Stack cannot carry.
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: Role
+      metadata:
+        name: nktp-opentelemetry-operator-deployment-finalizers
+        namespace: nktp
+      rules:
+        - apiGroups: [apps]
+          resources: [deployments/finalizers]
+          resourceNames: [nktp-opentelemetry-operator]
+          verbs: [update]
+      ---
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: RoleBinding
+      metadata:
+        name: nktp-opentelemetry-operator-deployment-finalizers
+        namespace: nktp
+      roleRef:
+        apiGroup: rbac.authorization.k8s.io
+        kind: Role
+        name: nktp-opentelemetry-operator-deployment-finalizers
+      subjects:
+        - kind: ServiceAccount
+          name: nktp-opentelemetry-operator
+          namespace: nktp
+  parameters:
+    - variable: dbPassword
+      label: Database password
+      type: password
+      required: true
+    - variable: registryPrefix
+      label: Registry prefix
+      type: string
+      required: true
+    - variable: registryUsername
+      label: Registry username
+      type: string
+    - variable: registryPassword
+      label: Registry password or token
+      type: password
+    - variable: clusterName
+      label: Cluster name for nktp telemetry
+      type: string

@@ -1,0 +1,140 @@
+# Creates a tenant cluster with private nodes and installs the nvidia-nvke-mgmt Stack into it
+# through deploy.stacks with NVKE's full configuration (sharedNodes: "false": SPIFFE CSI driver,
+# OIDC discovery provider, controller with a SPIFFE identity). Storage comes from vCluster's
+# built-in local-path provisioner.
+#
+# Nodes: set nodeProvider and nodeType for an auto-node pool, or leave nodeProvider empty and join
+# machines through the Platform UI (cluster > Nodes > Join Node). Nodes need outbound HTTPS to the
+# Platform, the release registry, github.com and the public Sigstore services.
+#
+# Apply the Apps in apps/ and stacktemplate.yaml before this template. Needs vCluster Platform 4.12
+# or later and vCluster 0.37 or later for deploy.stacks.
+apiVersion: management.loft.sh/v1
+kind: VirtualClusterTemplate
+metadata:
+  name: nvidia-nvke-mgmt-private-nodes
+spec:
+  displayName: NVIDIA NVKE Management Plane - Private Nodes
+  description: Private-node tenant cluster with the NVKE management plane installed from a verified NVKR release, with NVKE's full SPIRE configuration.
+  owner:
+    user: admin
+  parameters:
+    - variable: nodeProvider
+      label: Node provider
+      description: Name of a Platform node provider for an auto-node pool. Empty means you join nodes yourself.
+      section: Nodes
+      type: string
+    - variable: nodeType
+      label: Node type
+      description: Node type of that provider. Required when a provider is set.
+      section: Nodes
+      type: string
+    - variable: nodeCount
+      label: Node count
+      section: Nodes
+      type: number
+      defaultValue: "1"
+      min: 1
+      max: 10
+    - variable: releaseRoot
+      label: NVKR release root
+      description: <registry>/<repository>@sha256:<digest> as published by your NVKR run.
+      section: NVKR release
+      type: string
+      required: true
+      validation: ^[a-z0-9.:-]+(/[A-Za-z0-9._-]+)+@sha256:[0-9a-f]{64}$
+    - variable: registryPrefix
+      label: Registry prefix
+      description: The release's publication prefix (every output is at <prefix>/<output>).
+      section: NVKR release
+      type: string
+      required: true
+      validation: ^[a-z0-9.:-]+(/[A-Za-z0-9._-]+)+$
+    - variable: signerIdentity
+      label: Signer identity (regexp)
+      description: Certificate identity of the pipeline that signed the release, for example ^https://github\.com/<org>/<repo>/\.github/workflows/nvkr-run\.yml@refs/heads/main$.
+      section: NVKR release
+      type: string
+    - variable: oidcIssuer
+      label: OIDC issuer
+      section: NVKR release
+      type: string
+      required: true
+      defaultValue: https://token.actions.githubusercontent.com
+    - variable: verifyMode
+      label: Verification mode
+      description: root verifies signatures and provenance; off only checks chart tags against the root (dry-run-signed local releases).
+      section: NVKR release
+      type: string
+      options: ["root", "off"]
+      required: true
+      defaultValue: root
+    - variable: registryUsername
+      label: Registry username
+      description: Empty means anonymous.
+      section: Credentials
+      type: string
+    - variable: registryPassword
+      label: Registry password or token
+      section: Credentials
+      type: password
+    - variable: dbPassword
+      label: Database password
+      description: Shared by PostgreSQL, Temporal and the controller.
+      section: Credentials
+      type: password
+      required: true
+      validation: ^[A-Za-z0-9_-]{8,64}$
+    - variable: clusterName
+      label: Cluster name for telemetry
+      section: Cluster
+      type: string
+      required: true
+      defaultValue: nvke
+  template:
+    metadata: {}
+    instanceTemplate:
+      metadata: {}
+    pro:
+      enabled: true
+    helmRelease:
+      chart:
+        # renovate: datasource=github-releases depName=loft-sh/vcluster extractVersion=^v(?<version>.+)$
+        version: 0.37.2
+      values: |
+        privateNodes:
+          enabled: true
+          vpn:
+            enabled: true
+        {{- if .Values.nodeProvider }}
+          autoNodes:
+            - provider: {{ .Values.nodeProvider }}
+              static:
+                - name: nvke
+                  quantity: {{ .Values.nodeCount }}
+                  nodeTypeSelector:
+                    - property: vcluster.com/node-type
+                      value: {{ .Values.nodeType }}
+        {{- end }}
+        deploy:
+          localPathProvisioner:
+            enabled: true
+          stacks:
+            - name: nvke
+              templateRef:
+                name: nvidia-nvke-mgmt
+              prunePolicy: Prune
+              defaults:
+                taskTimeout: 20m
+              parameters:
+                releaseRoot: "{{ .Values.releaseRoot }}"
+                registryPrefix: "{{ .Values.registryPrefix }}"
+                signerIdentity: '{{ .Values.signerIdentity }}'
+                oidcIssuer: "{{ .Values.oidcIssuer }}"
+                verifyMode: "{{ .Values.verifyMode }}"
+                registryUsername: "{{ .Values.registryUsername }}"
+                registryPassword: "{{ .Values.registryPassword }}"
+                dbPassword: "{{ .Values.dbPassword }}"
+                clusterName: "{{ .Values.clusterName }}"
+                sharedNodes: "false"
+                storageClass: ""

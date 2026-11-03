@@ -1,0 +1,818 @@
+# Installs NVIDIA's NVKE management plane from an NVKR release, after verifying that release.
+#
+# Task graph (dependsOn):
+#   verify -> certmanager -> baseconfig -> { nktp, postgres, spirecrds }
+#   temporal   <- postgres, nktp
+#   spire      <- spirecrds, nktp, baseconfig
+#   controller <- temporal, spire, nktp
+# Every task depends on verify. The install order and the values are NVKE's own
+# (deploy/nico/nvke-deploy.yaml and deploy/nico/<item>/ at v0.22.0), reduced to what a cluster
+# without NICo, Cluster API or TPM hardware needs.
+#
+# The release root is the only release input. The verify task reads the digests and the chart
+# versions from it and records them; the chart tasks consume them as task outputs, so a newer NVKE
+# release needs no change here unless NVKE's own values change. See README.md for what the Stack
+# expects from the user's NVKR setup.
+#
+# Chart fields use Stack parameters and task outputs, which only inline App templates render; the
+# two Job and manifest steps are referenced Apps in apps/. Install the Stack at most once per
+# destination: the SPIRE CRDs, the nktp monitoring CRDs and the controller's CRDs are cluster-scoped.
+apiVersion: management.loft.sh/v1
+kind: StackTemplate
+metadata:
+  name: nvidia-nvke-mgmt
+  annotations:
+    vcluster.com/certified: "true"
+spec:
+  displayName: NVIDIA NVKE Management Plane
+  description: Verifies an NVKR release of NVKE with cosign, then installs the NVKE management plane (cert-manager, nktp, PostgreSQL, SPIRE, Temporal, controller) in NVKE's order. A failed verification blocks every install.
+  parameters:
+    - variable: releaseRoot
+      label: NVKR release root
+      description: The release root NVKR published, <registry>/<repository>@sha256:<digest>. Every output and its digest is read from it.
+      section: NVKR release
+      type: string
+      required: true
+      validation: ^[a-z0-9.:-]+(/[A-Za-z0-9._-]+)+@sha256:[0-9a-f]{64}$
+    - variable: registryPrefix
+      label: Registry prefix
+      description: The release's publication prefix; every output lives at <prefix>/<output>, and charts install from oci://<prefix>/<output>.
+      section: NVKR release
+      type: string
+      required: true
+      validation: ^[a-z0-9.:-]+(/[A-Za-z0-9._-]+)+$
+    - variable: signerIdentity
+      label: Signer identity (regexp)
+      description: Regular expression for the certificate identity that signed the release, for example ^https://github\.com/<org>/<repo>/\.github/workflows/nvkr-run\.yml@refs/heads/main$. Required in mode root.
+      section: NVKR release
+      type: string
+    - variable: oidcIssuer
+      label: OIDC issuer
+      description: The OIDC issuer of the signing identity.
+      section: NVKR release
+      type: string
+      required: true
+      defaultValue: https://token.actions.githubusercontent.com
+    - variable: verifyMode
+      label: Verification mode
+      description: root verifies cosign signatures and SLSA provenance on the release root and every output, then checks each chart's install tag against the root. off skips the signature checks for a dry-run-signed local release and still checks the tags.
+      section: NVKR release
+      type: string
+      options: ["root", "off"]
+      required: true
+      defaultValue: root
+    - variable: registryUsername
+      label: Registry username
+      description: Username for the release registry when it is private. Empty means anonymous.
+      section: Credentials
+      type: string
+    - variable: registryPassword
+      label: Registry password or token
+      description: Credential for that username, with read access to the release packages.
+      section: Credentials
+      type: password
+    - variable: dbPassword
+      label: Database password
+      description: One password shared by PostgreSQL, Temporal's datastores and the controller.
+      section: Credentials
+      type: password
+      required: true
+    - variable: sharedNodes
+      label: Cluster runs on shared nodes
+      description: >-
+        "true" for a cluster on the control plane cluster's shared nodes, where the SPIFFE CSI driver cannot run.
+        SPIRE then runs without the CSI driver and the OIDC discovery provider, and the controller without a
+        SPIFFE identity. "false" (private nodes) keeps NVKE's full configuration.
+      section: Cluster
+      type: string
+      options: ["false", "true"]
+      required: true
+      defaultValue: "false"
+    - variable: storageClass
+      label: Storage class
+      description: StorageClass for PostgreSQL and SPIRE. Empty uses the cluster default.
+      section: Cluster
+      type: string
+    - variable: clusterName
+      label: Cluster name for telemetry
+      description: Value nktp attaches as k8s.cluster.name.
+      section: Cluster
+      type: string
+      required: true
+      defaultValue: nvke
+    - variable: certManagerVersion
+      label: cert-manager chart version
+      description: cert-manager is the one component the release does not carry. Chart version from charts.jetstack.io.
+      section: Cluster
+      type: string
+      required: true
+      # renovate: datasource=helm depName=cert-manager registryUrl=https://charts.jetstack.io
+      defaultValue: v1.21.3
+      validation: ^v[0-9]+\.[0-9]+\.[0-9]+$
+  publishedOutputs:
+    - name: verifiedReleaseRoot
+      fromTask:
+        task: verify
+        output: root
+    - name: verifiedAt
+      fromTask:
+        task: verify
+        output: verifiedat
+    - name: verificationMode
+      fromTask:
+        task: verify
+        output: mode
+    - name: controllerChartVersion
+      fromTask:
+        task: verify
+        output: controllerchartversion
+    - name: controllerImageDigest
+      fromTask:
+        task: verify
+        output: cwedigest
+  tasks:
+    # 1. The gate. Its name has no hyphen: outputs are referenced as {{ .Outputs.verify.<name> }}.
+    - name: verify
+      timeout: 25m
+      app:
+        templateRef:
+          name: nvidia-nvke-mgmt-verify
+        parameters:
+          releaseRoot: "{{ .Values.releaseRoot }}"
+          registryPrefix: "{{ .Values.registryPrefix }}"
+          verifyMode: "{{ .Values.verifyMode }}"
+          signerIdentity: "{{ .Values.signerIdentity }}"
+          oidcIssuer: "{{ .Values.oidcIssuer }}"
+          registryUsername: "{{ .Values.registryUsername }}"
+          registryPassword: "{{ .Values.registryPassword }}"
+      outputs:
+        - name: root
+          fromResource:
+            apiVersion: v1
+            kind: ConfigMap
+            namespace: nvke-verify
+            name: nvke-release-verification
+            jsonPath: "{.data.root}"
+        - name: verifiedat
+          fromResource:
+            apiVersion: v1
+            kind: ConfigMap
+            namespace: nvke-verify
+            name: nvke-release-verification
+            jsonPath: "{.data.verifiedAt}"
+        - name: mode
+          fromResource:
+            apiVersion: v1
+            kind: ConfigMap
+            namespace: nvke-verify
+            name: nvke-release-verification
+            jsonPath: "{.data.mode}"
+        - name: controllerchartversion
+          fromResource:
+            apiVersion: v1
+            kind: ConfigMap
+            namespace: nvke-verify
+            name: nvke-release-verification
+            jsonPath: "{.data.controllerChartVersion}"
+        - name: postgresqlversion
+          fromResource:
+            apiVersion: v1
+            kind: ConfigMap
+            namespace: nvke-verify
+            name: nvke-release-verification
+            jsonPath: "{.data.postgresqlVersion}"
+        - name: spirecrdsversion
+          fromResource:
+            apiVersion: v1
+            kind: ConfigMap
+            namespace: nvke-verify
+            name: nvke-release-verification
+            jsonPath: "{.data.spireCrdsVersion}"
+        - name: spireversion
+          fromResource:
+            apiVersion: v1
+            kind: ConfigMap
+            namespace: nvke-verify
+            name: nvke-release-verification
+            jsonPath: "{.data.spireVersion}"
+        - name: temporalversion
+          fromResource:
+            apiVersion: v1
+            kind: ConfigMap
+            namespace: nvke-verify
+            name: nvke-release-verification
+            jsonPath: "{.data.temporalVersion}"
+        - name: nktpversion
+          fromResource:
+            apiVersion: v1
+            kind: ConfigMap
+            namespace: nvke-verify
+            name: nvke-release-verification
+            jsonPath: "{.data.nktpVersion}"
+        - name: cwedigest
+          fromResource:
+            apiVersion: v1
+            kind: ConfigMap
+            namespace: nvke-verify
+            name: nvke-release-verification
+            jsonPath: "{.data.cweDigest}"
+        - name: profilesdigest
+          fromResource:
+            apiVersion: v1
+            kind: ConfigMap
+            namespace: nvke-verify
+            name: nvke-release-verification
+            jsonPath: "{.data.profilesDigest}"
+
+    # 2. cert-manager: nktp's internal TLS and SPIRE's OIDC discovery provider need it.
+    - name: certmanager
+      dependsOn: [verify]
+      timeout: 15m
+      app:
+        template:
+          spec:
+            displayName: cert-manager
+            description: Installs cert-manager with its CRDs.
+            defaultNamespace: cert-manager
+            releaseName: cert-manager
+            wait: true
+            timeout: 10m
+            config:
+              chart:
+                name: cert-manager
+                version: "{{ .Values.certManagerVersion }}"
+                repoURL: https://charts.jetstack.io
+              values: |
+                crds:
+                  enabled: true
+
+    # 3. NVKE base configuration (namespaces, secrets, OIDC CA chain).
+    - name: baseconfig
+      dependsOn: [certmanager]
+      timeout: 10m
+      app:
+        templateRef:
+          name: nvidia-nvke-mgmt-base-config
+        parameters:
+          dbPassword: "{{ .Values.dbPassword }}"
+          registryPrefix: "{{ .Values.registryPrefix }}"
+          registryUsername: "{{ .Values.registryUsername }}"
+          registryPassword: "{{ .Values.registryPassword }}"
+          clusterName: "{{ .Values.clusterName }}"
+
+    # 4. nktp: NVKE's telemetry pipeline. First among the charts because it installs the monitoring
+    #    CRDs that Temporal, SPIRE and the controller create monitors for.
+    - name: nktp
+      dependsOn: [verify, baseconfig]
+      timeout: 20m
+      app:
+        template:
+          spec:
+            displayName: NKTP (telemetry)
+            description: NVKE's OpenTelemetry pipeline with the monitoring CRDs.
+            defaultNamespace: nktp
+            releaseName: nktp
+            wait: true
+            timeout: 15m
+            config:
+              chart:
+                name: nktp
+                version: "{{ .Outputs.verify.nktpversion }}"
+                repoURL: "oci://{{ .Values.registryPrefix }}"
+                username: "{{ .Values.registryUsername }}"
+                password: "{{ .Values.registryPassword }}"
+              # NVKE deploy/nico/nktp/values.yaml, minus the templated extraObjects (a static copy is
+              # in the base configuration), plus the trims NVKE applies on small demo nodes: otel-lgtm,
+              # node-exporter and metrics-server off.
+              values: |
+                metrics-server:
+                  enabled: false
+                node-exporter:
+                  enabled: false
+                otel-lgtm:
+                  enabled: false
+                opentelemetry-kube-stack:
+                  kubeScheduler:
+                    enabled: false
+                  kubeControllerManager:
+                    enabled: false
+                  kubeProxy:
+                    enabled: false
+                watchdog:
+                  kubernetes:
+                    autoscaler:
+                      minReplicas: 1
+                    resources:
+                      requests: {cpu: 100m, memory: 256Mi}
+                      limits: {cpu: 500m, memory: 512Mi}
+                    targetAllocator:
+                      resources:
+                        requests: {cpu: 100m, memory: 256Mi}
+                        limits: {cpu: "1", memory: 1Gi}
+                    env:
+                      - {name: GOMEMLIMIT, value: 448MiB}
+                      - {name: GOGC, value: "50"}
+                      - &cluster-name-env
+                        name: K8S_CLUSTER_NAME
+                        valueFrom:
+                          configMapKeyRef: {name: nktp-cluster, key: name}
+                  sidecar:
+                    kubernetes:
+                      env:
+                        - name: POD_NAME
+                          valueFrom:
+                            fieldRef: {fieldPath: metadata.name}
+                        - {name: GOMEMLIMIT, value: 192MiB}
+                        - *cluster-name-env
+                gateway_logs:
+                  kubernetes:
+                    autoscaler:
+                      minReplicas: 1
+                    resources:
+                      requests: {cpu: 200m, memory: 512Mi}
+                      limits: {cpu: "1", memory: 1Gi}
+                    env:
+                      - {name: GOMEMLIMIT, value: 896MiB}
+                      - {name: GOGC, value: "50"}
+                      - *cluster-name-env
+                gateway_metrics:
+                  kubernetes:
+                    autoscaler:
+                      minReplicas: 1
+                    resources:
+                      requests: {cpu: 200m, memory: 512Mi}
+                      limits: {cpu: "1", memory: 1Gi}
+                    env:
+                      - {name: GOMEMLIMIT, value: 896MiB}
+                      - {name: GOGC, value: "50"}
+                      - *cluster-name-env
+                gateway_traces:
+                  kubernetes:
+                    autoscaler:
+                      minReplicas: 1
+                    resources:
+                      requests: {cpu: 200m, memory: 512Mi}
+                      limits: {cpu: "1", memory: 1Gi}
+                    env:
+                      - {name: GOMEMLIMIT, value: 896MiB}
+                      - {name: GOGC, value: "50"}
+                      - *cluster-name-env
+                cluster_events:
+                  kubernetes:
+                    replicas: 1
+                    resources:
+                      requests: {cpu: 200m, memory: 512Mi}
+                      limits: {cpu: "1", memory: 1Gi}
+                large_target_metrics:
+                  kubernetes:
+                    autoscaler:
+                      minReplicas: 1
+                    resources:
+                      requests: {cpu: 100m, memory: 256Mi}
+                      limits: {cpu: "1", memory: 1Gi}
+                    env:
+                      - {name: GOMEMLIMIT, value: 512MiB}
+                      - {name: GOGC, value: "50"}
+                    targetAllocator:
+                      resources:
+                        requests: {cpu: 100m, memory: 256Mi}
+                        limits: {cpu: "1", memory: 1Gi}
+                  otelcol:
+                    config:
+                      exporters:
+                        otlp:
+                          sending_queue:
+                            queue_size: 67108864
+                      receivers:
+                        prometheus:
+                          config:
+                            global:
+                              body_size_limit: 64MiB
+                kube-state-metrics:
+                  kubernetes:
+                    resources:
+                      requests: {cpu: 25m, memory: 64Mi}
+                  deployments:
+                    workloads: {enabled: false}
+                    networking: {enabled: false}
+                    storage: {enabled: false}
+                    configuration: {enabled: false}
+                    cluster: {enabled: false}
+                    objects:
+                      enabled: true
+                      shards: 1
+                      track_unscheduled_pods: false
+                      kubernetes: {}
+                      resource_types:
+                        - deployments
+                        - statefulsets
+                        - daemonsets
+                        - replicasets
+                        - replicationcontrollers
+                        - jobs
+                        - cronjobs
+
+    # 5. PostgreSQL (Bitnami), backing the controller and Temporal. The release name is load-bearing:
+    #    Temporal and the controller dial postgres-postgresql.postgres.svc.cluster.local.
+    - name: postgres
+      dependsOn: [verify, baseconfig]
+      timeout: 20m
+      app:
+        template:
+          spec:
+            displayName: PostgreSQL
+            description: NVKE's database for the controller and Temporal.
+            defaultNamespace: postgres
+            releaseName: postgres
+            wait: true
+            timeout: 15m
+            config:
+              chart:
+                name: postgresql
+                version: "{{ .Outputs.verify.postgresqlversion }}"
+                repoURL: "oci://{{ .Values.registryPrefix }}"
+                username: "{{ .Values.registryUsername }}"
+                password: "{{ .Values.registryPassword }}"
+              # NVKE deploy/nico/postgresql/values.yaml. The image digest is NVKE's pin: bitnami/postgresql
+              # no longer publishes version tags.
+              values: |
+                global:
+                  security:
+                    allowInsecureImages: true
+                auth:
+                  username: postgres
+                  database: postgres
+                  existingSecret: nvke-database
+                  secretKeys:
+                    adminPasswordKey: password
+                primary:
+                  persistence:
+                    enabled: true
+                    size: 40Gi
+                    storageClass: "{{ .Values.storageClass }}"
+                  resources:
+                    limits:
+                      memory: 512Mi
+                    requests:
+                      memory: 256Mi
+                  initdb:
+                    scripts:
+                      init-cwe.sql: |
+                        CREATE DATABASE "nke-controller";
+                      init-temporal.sql: |
+                        CREATE DATABASE temporal;
+                        CREATE DATABASE temporal_visibility;
+                image:
+                  digest: "sha256:b74b23f091dcc87041bcae557d840c36458af46b955279cb13aedec4c32d7f71"
+
+    # 6. SPIRE CRDs, before spire so its controller manager has kinds to reconcile.
+    - name: spirecrds
+      dependsOn: [verify, baseconfig]
+      timeout: 15m
+      app:
+        template:
+          spec:
+            displayName: SPIRE CRDs
+            defaultNamespace: spire-server
+            releaseName: spire-crds
+            wait: true
+            timeout: 10m
+            config:
+              chart:
+                name: spire-crds
+                version: "{{ .Outputs.verify.spirecrdsversion }}"
+                repoURL: "oci://{{ .Values.registryPrefix }}"
+                username: "{{ .Values.registryUsername }}"
+                password: "{{ .Values.registryPassword }}"
+
+    # 7. Temporal. Its schema jobs create and migrate the databases in Postgres; its ServiceMonitors
+    #    need nktp's CRDs.
+    - name: temporal
+      dependsOn: [verify, postgres, nktp]
+      timeout: 25m
+      app:
+        template:
+          spec:
+            displayName: Temporal
+            description: NVKE's workflow engine, on the shared PostgreSQL.
+            defaultNamespace: temporal
+            releaseName: temporal
+            wait: true
+            timeout: 20m
+            config:
+              chart:
+                name: temporal
+                version: "{{ .Outputs.verify.temporalversion }}"
+                repoURL: "oci://{{ .Values.registryPrefix }}"
+                username: "{{ .Values.registryUsername }}"
+                password: "{{ .Values.registryPassword }}"
+              # NVKE deploy/nico/temporal/{values,overlay}.yaml with the shared password from nvke-database.
+              values: |
+                fullnameOverride: temporal
+                server:
+                  configMapsToMount: sprig
+                  setConfigFilePath: true
+                  config:
+                    persistence:
+                      driver: sql
+                      default:
+                        driver: sql
+                        sql:
+                          driver: postgres12
+                          host: postgres-postgresql.postgres.svc.cluster.local
+                          port: 5432
+                          database: temporal
+                          user: postgres
+                          existingSecret: nvke-database
+                          maxConns: 10
+                          maxIdleConns: 5
+                      visibility:
+                        driver: sql
+                        sql:
+                          driver: postgres12
+                          host: postgres-postgresql.postgres.svc.cluster.local
+                          port: 5432
+                          database: temporal_visibility
+                          user: postgres
+                          existingSecret: nvke-database
+                          maxConns: 10
+                          maxIdleConns: 5
+                  metrics:
+                    serviceMonitor:
+                      enabled: true
+                cassandra:
+                  enabled: false
+                mysql:
+                  enabled: false
+                postgresql:
+                  enabled: false
+                prometheus:
+                  enabled: false
+                grafana:
+                  enabled: false
+                elasticsearch:
+                  enabled: false
+                schema:
+                  createDatabase:
+                    enabled: true
+                  setup:
+                    enabled: true
+                  update:
+                    enabled: true
+
+    # 8. SPIRE: server, agents, CSI driver and OIDC discovery provider. On shared nodes the CSI node
+    #    plugin cannot mount the kubelet directories, so the driver and the provider are off there.
+    - name: spire
+      dependsOn: [verify, spirecrds, nktp, baseconfig]
+      timeout: 25m
+      app:
+        template:
+          spec:
+            displayName: SPIRE
+            description: NVKE's identity plane, with the OIDC discovery provider when the cluster has private nodes.
+            defaultNamespace: spire-server
+            releaseName: spire
+            wait: true
+            timeout: 20m
+            config:
+              chart:
+                name: spire
+                version: "{{ .Outputs.verify.spireversion }}"
+                repoURL: "oci://{{ .Values.registryPrefix }}"
+                username: "{{ .Values.registryUsername }}"
+                password: "{{ .Values.registryPassword }}"
+              # NVKE deploy/nico/spire/{values,overlay}.yaml. The nvke-service ClusterSPIFFEID uses a static
+              # ID instead of NVKE's Go-template form, which the Platform's own templating would render; for
+              # the only workload in nke-controller the result is the same and matches spire-server.adminIDs.
+              values: |
+                global:
+                  spire:
+                    recommendations:
+                      enabled: true
+                      strictMode: false
+                    trustDomain: example.org
+                    jwtIssuer: "https://nke.site-controller.internal"
+                  installAndUpgradeHooks:
+                    enabled: false
+                  deleteHooks:
+                    enabled: false
+                spiffe-csi-driver:
+                  enabled: {{ if eq .Values.sharedNodes "true" }}false{{ else }}true{{ end }}
+                spire-agent:
+                  serviceAccount:
+                    name: spire-agent
+                  server:
+                    namespaceOverride: spire-server
+                  workloadAttestors:
+                    k8s:
+                      enabled: true
+                      disableContainerSelectors: true
+                  telemetry:
+                    prometheus:
+                      podMonitor:
+                        enabled: true
+                spire-server:
+                  namespaceOverride: spire-server
+                  persistence:
+                    storageClass: "{{ .Values.storageClass }}"
+                  bundlePublisher:
+                    k8sConfigMap:
+                      namespace: spire-system
+                  adminIDs:
+                    - spiffe://example.org/nvke-service/nke-controller
+                  controllerManager:
+                    validatingWebhookConfiguration:
+                      failurePolicy: Ignore
+                    className: spire-mgmt-spire
+                    identities:
+                      clusterSPIFFEIDs:
+                        default:
+                          namespaceSelector:
+                            matchExpressions:
+                              - key: kubernetes.io/metadata.name
+                                operator: NotIn
+                                values:
+                                  - nke-controller
+                        nvke-service:
+                          type: raw
+                          spiffeIDTemplate: "spiffe://example.org/nvke-service/nke-controller"
+                          namespaceSelector:
+                            matchExpressions:
+                              - key: kubernetes.io/metadata.name
+                                operator: In
+                                values:
+                                  - nke-controller
+                          podSelector:
+                            matchLabels:
+                              app.kubernetes.io/name: nke-controller
+                  nodeAttestor:
+                    k8sPSAT:
+                      serviceAccountAllowList: ["spire-system:spire-agent"]
+                    tpmDirect:
+                      enabled: true
+                  extraVolumes:
+                    - name: tpm-pubhashes
+                      configMap:
+                        name: tpm-pubhashes
+                        optional: true
+                  extraVolumeMounts:
+                    - name: tpm-pubhashes
+                      mountPath: /run/spire/data/tpm-direct/hashes
+                      readOnly: true
+                  telemetry:
+                    prometheus:
+                      podMonitor:
+                        enabled: true
+                spiffe-oidc-discovery-provider:
+                  enabled: {{ if eq .Values.sharedNodes "true" }}false{{ else }}true{{ end }}
+                  namespaceOverride: spire-server
+                  replicaCount: 2
+                  tls:
+                    spire:
+                      enabled: false
+                    certManager:
+                      enabled: true
+                      issuer:
+                        create: false
+                      certificate:
+                        duration: 2160h
+                        privateKey:
+                          algorithm: ECDSA
+                          size: 256
+                        dnsNames:
+                          - nke.site-controller.internal
+                          - localhost
+                        issuerRef:
+                          group: cert-manager.io
+                          kind: Issuer
+                          name: nvke-oidc-upstream-ca
+                  config:
+                    additionalDomains:
+                      - "nke.site-controller.internal"
+                      - "localhost"
+                      - "127.0.0.1"
+
+    # 9. The controller, last: it needs its identity from SPIRE, Postgres and Temporal.
+    - name: controller
+      dependsOn: [verify, temporal, spire, nktp]
+      timeout: 25m
+      app:
+        template:
+          spec:
+            displayName: NVKE controller
+            description: NVKE's controller from the verified release, with the image digest NVKR bound into the chart.
+            defaultNamespace: nke-controller
+            releaseName: nke-controller
+            wait: true
+            timeout: 20m
+            config:
+              chart:
+                # The chart calls itself nvke-controller; NVKR publishes it at the output name.
+                name: controller-chart
+                version: "{{ .Outputs.verify.controllerchartversion }}"
+                repoURL: "oci://{{ .Values.registryPrefix }}"
+                username: "{{ .Values.registryUsername }}"
+                password: "{{ .Values.registryPassword }}"
+              # NVKE deploy/nico/controller/overlay.yaml minus site-only settings (NodePort service, DGXC
+              # tenant credentials, staged-image pins). image.digest is not set: NVKR binds the built
+              # controller image's digest into the chart. The profiles image comes from the release.
+              values: |
+                fullnameOverride: nke-controller
+                nameOverride: nke-controller
+                namespaceOverride: nke-controller
+                serviceAccount:
+                  name: nke-controller
+                nvkeSystemNamespace:
+                  create: false
+                image:
+                  repository: "{{ .Values.registryPrefix }}/cwe"
+                  pullPolicy: IfNotPresent
+                imagePullSecrets:
+                  - name: nvke-registry
+                podSecurityContext: null
+                securityContext:
+                  readOnlyRootFilesystem: false
+                apiAuth:
+                  enabled: false
+                  permissive: false
+                supportedInfraProviders: nico,infra
+                capi:
+                  rbac:
+                    create: true
+                tenantAccess:
+                  enabled: true
+                nvkeOIDCAuth:
+                  enabled: false
+                cni:
+                  installAfterInit: true
+                metrics:
+                  networkPolicy:
+                    enabled: true
+                    additionalNamespaces:
+                      - nktp
+                serviceMonitor:
+                  enabled: true
+                  name: nke-controller-metrics
+                tracing:
+                  enabled: true
+                  serviceName: nvke-controller
+                  endpoint: nktp-daemonset-collector.nktp.svc.cluster.local:4317
+                  insecure: true
+                # /readyz checks Postgres and Temporal reachability (NVKE overlay). Liveness starts late so
+                # the first-boot database migrations are not killed.
+                livenessProbe:
+                  httpGet:
+                    path: /healthz
+                    port: http
+                  initialDelaySeconds: 90
+                  periodSeconds: 20
+                readinessProbe:
+                  httpGet:
+                    path: /readyz
+                    port: http
+                  initialDelaySeconds: 5
+                  periodSeconds: 10
+                secrets:
+                  createDbSecret: true
+                  dbSecretName: nvke-database
+                appDb:
+                  url: postgres-postgresql.postgres.svc.cluster.local:5432
+                  dbName: nke-controller
+                  postgresUser: postgres
+                  postgresPassword: "{{ .Values.dbPassword }}"
+                  sslMode: disable
+                env:
+                  - name: NODE_AGENT_PORT
+                    value: "15005"
+                service:
+                  port: 8080
+                nodeAgent:
+                  spireAttestationMethod: tpm
+                temporal:
+                  host: temporal-frontend.temporal.svc.cluster.local
+                  port: 7233
+                  cloudWorkflow:
+                    namespace: nke-controller
+                    queue: nke-controller-tasks
+                profiles:
+                  path: /profiles
+                  image:
+                    enabled: true
+                    repository: "{{ .Values.registryPrefix }}/profiles"
+                    digest: "{{ .Outputs.verify.profilesdigest }}"
+                spiffe:
+                  enabled: {{ if eq .Values.sharedNodes "true" }}false{{ else }}true{{ end }}
+                  endpointSocket: unix:///spiffe-workload-api/spire-agent.sock
+                  spire:
+                    serverNamespace: spire-server
+                    className: spire-mgmt-spire
+                    tpmPubhashesConfigMapName: tpm-pubhashes
+                    serverPort: "30440"
+                identity:
+                  fieldManagerName: nke-controller
+                  fieldManagerRebootMachineName: nke-controller-reboot-machine
+                  fieldManagerMachineHealthIssueName: nke-controller-machine-health-issue
+                  managedByLabelValue: nke-controller
+                teleport:
+                  managedByLabelValue: nke-controller
+                  tokenNamePrefix: nke-controller-
