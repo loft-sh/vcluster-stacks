@@ -250,7 +250,7 @@ outputs = {"nktpversion": "0.22.0", "postgresqlversion": "18.5.15", "spirecrdsve
 
 def render(text, shared):
     values = dict(placeholders, sharedNodes=shared)
-    text = re.sub(r'\{\{ if eq \.Values\.sharedNodes "true" \}\}(.*?)\{\{ else \}\}(.*?)\{\{ end \}\}', lambda m: m.group(1) if shared == "true" else m.group(2), text)
+    text = re.sub(r'\{\{ if eq \.Values\.sharedNodes "true" \}\}(.*?)(?:\{\{ else \}\}(.*?))?\{\{ end \}\}', lambda m: (m.group(1) if shared == "true" else m.group(2)) or "", text, flags=re.S)
     text = re.sub(r"\{\{\s*\.Values\.(\w+)\s*\}\}", lambda m: str(values[m.group(1)]), text)
     return re.sub(r"\{\{\s*\.Outputs\.verify\.(\w+)\s*\}\}", lambda m: outputs[m.group(1)], text)
 
@@ -379,6 +379,10 @@ grep -q 'csi.spiffe.io' "$work/controller-false/rendered.yaml" || { echo "FAIL c
 if grep -q 'csi.spiffe.io' "$work/controller-true/rendered.yaml"; then echo "FAIL controller on shared nodes must not mount the SPIFFE workload API" >&2; exit 1; fi
 grep -q "registry.example/nvke/profiles@sha256:" "$work/controller-false/rendered.yaml" || { echo "FAIL controller must take the profiles image from the release" >&2; exit 1; }
 helm dependency update "$work/nvke/nktp/deploy/charts/nktp" > /dev/null
-render_chart nktp false "$work/nvke/nktp/deploy/charts/nktp"
+for shared in false true; do
+  render_chart nktp "$shared" "$work/nvke/nktp/deploy/charts/nktp"
+done
 grep -q 'kind: CustomResourceDefinition' "$work/nktp-false/rendered.yaml" || { echo "FAIL nktp must render the monitoring CRDs the other charts need" >&2; exit 1; }
+grep -q 'nvke.vcluster.com/node-collector' "$work/nktp-true/rendered.yaml" || { echo "FAIL nktp on shared nodes must keep the node collector off unlabeled nodes" >&2; exit 1; }
+if grep -q 'nvke.vcluster.com/node-collector' "$work/nktp-false/rendered.yaml"; then echo "FAIL nktp on private nodes must run the node collector everywhere" >&2; exit 1; fi
 echo "ok NVKE charts render ($nvke_tag)"

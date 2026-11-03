@@ -291,6 +291,15 @@ spec:
                   enabled: false
                 otel-lgtm:
                   enabled: false
+                {{ if eq .Values.sharedNodes "true" }}
+                # The node collector reads /var/log, /proc and journalctl from the node, which
+                # vCluster does not pass through on shared nodes. Keep it off every node unless
+                # one is labeled for it.
+                daemonset:
+                  kubernetes:
+                    nodeSelector:
+                      nvke.vcluster.com/node-collector: "true"
+                {{ end }}
                 opentelemetry-kube-stack:
                   kubeScheduler:
                     enabled: false

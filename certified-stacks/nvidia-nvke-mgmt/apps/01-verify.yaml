@@ -176,7 +176,7 @@ spec:
       [ "$VERIFY_MODE" = off ] || [ -n "$IDENTITY_RE" ] || fail "signerIdentity is required in mode root"
 
       # A brand-new cluster's DNS and egress can lag the first Job by a few seconds.
-      i=0; until curl -fsS -o /dev/null --max-time 10 "https://${HOST}/v2/" || [ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "https://${HOST}/v2/")" = 401 ]; do
+      i=0; until code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "https://${HOST}/v2/") && [ "$code" != 000 ]; do
         i=$((i+1)); [ "$i" -lt 30 ] || fail "registry ${HOST} unreachable"; sleep 2
       done
 
