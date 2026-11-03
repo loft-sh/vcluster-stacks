@@ -32,7 +32,7 @@ The `verify` task works like this:
 
 The Stack publishes `verifiedReleaseRoot`, `verifiedAt`, `verificationMode`, `controllerChartVersion`, and `controllerImageDigest` as outputs, so another Stack or a report can read what was installed.
 
-`sharedNodes` selects between NVKE's two shapes. On private nodes (`"false"`, the default) the Stack installs NVKE's full configuration: the SPIFFE CSI driver, the OIDC discovery provider, and the controller with a SPIFFE identity. On the control plane cluster's shared nodes (`"true"`) vCluster rewrites the hostPath mounts the CSI driver needs, so the Stack leaves out the CSI driver and the OIDC discovery provider and runs the controller without SPIFFE. nktp's node collector, which reads `/var/log`, `/proc`, and the journal from the node, is kept off shared nodes with a node selector; label a node `nvke.vcluster.com/node-collector=true` to run it there.
+`sharedNodes` selects between NVKE's two shapes. On private nodes (`"false"`, the default) the Stack installs NVKE's full configuration: the SPIFFE CSI driver, the OIDC discovery provider, and the controller with a SPIFFE identity. On the control plane cluster's shared nodes (`"true"`) vCluster rewrites the hostPath mounts the CSI driver needs, so the Stack leaves out the CSI driver, the SPIRE agent (workloads reach it only through the CSI driver, and its host port would collide with another tenant's agent on the same node) and the OIDC discovery provider, and runs the controller without SPIFFE. nktp's node collector, which reads `/var/log`, `/proc`, and the journal from the node, is kept off shared nodes with a node selector; label a node `nvke.vcluster.com/node-collector=true` to run it there.
 
 The two VirtualClusterTemplates create a tenant cluster and install the Stack through `deploy.stacks`, so one form creates the cluster and the management plane together. The private-node template enables private nodes with VPN and vCluster's local-path provisioner, and optionally creates an auto-node pool from a Platform node provider.
 
@@ -149,7 +149,7 @@ What stays in the tenant cluster after removal: the CRDs the charts installed (S
 ## Known limitations
 
 - `linux/amd64` only. The Definition builds for that platform, and the verify Job downloads the amd64 cosign.
-- On shared nodes, the controller runs without a SPIFFE identity, there is no OIDC discovery provider, and nktp collects no node-level logs or host metrics. Everything that NVKE issues workload identities for, and node telemetry, needs private nodes.
+- On shared nodes, the controller runs without a SPIFFE identity, SPIRE runs without agents and without the OIDC discovery provider, and nktp collects no node-level logs or host metrics. Everything that NVKE issues workload identities for, and node telemetry, needs private nodes.
 - Once per tenant cluster. The CRDs are cluster-scoped and the SPIRE trust domain is `example.org`, as in NVKE's own configuration.
 - `verifyMode: off` is not a security boundary. It exists for releases that NVKR signed in dry-run mode.
 - The Stack does not install NICo, Cluster API, or anything NVKE uses to provision nodes. It installs the management plane; what you connect to it is up to you.
@@ -164,3 +164,14 @@ Run the static checks and renders. They need `python3` with PyYAML, `helm`, `git
 ```
 
 The script checks the StackTemplate's parameters, task graph, outputs, and timeouts, renders the two Apps as Helm charts and parses the verify script with `sh -n`, then renders cert-manager, PostgreSQL, SPIRE, Temporal, nktp, and the controller chart with the Stack's values for both `sharedNodes` settings. CI runs it on every change in this directory, followed by a server-side dry run of every manifest against vCluster Platform.
+
+## Tested
+
+Tested on 2026-11-03 against vCluster Platform 5.0.0-alpha.9 on GKE (Kubernetes 1.36) with vCluster 0.37.2, using a keyless-signed NVKR release of NVKE v0.22.0 published to GHCR from GitHub Actions in per-output mode.
+
+| Test | Result |
+| --- | --- |
+| Shared nodes, from `nvidia-nvke-mgmt-shared-nodes`, `verifyMode: root` | Healthy, nine tasks, 4m46s from cluster creation. Charts installed at the versions the release names (nktp 0.22.0, postgresql 18.5.15, spire-crds 0.6.1, spire 0.30.1, temporal 0.74.0, controller 0.22.0); the controller runs at the signed `cwe` digest; no CSI driver, no OIDC provider; the five published outputs available. |
+| Private nodes, from `nvidia-nvke-mgmt-private-nodes`, one joined bare-metal node (28 CPU, H100) | Healthy, nine tasks, 5m35s from cluster creation including the node join. SPIRE server, agent, CSI driver and OIDC discovery provider running; the controller mounts the SPIFFE workload API and holds `spiffe://example.org/nvke-service/nke-controller`; the nktp node collector running. |
+| Negative: the example StackInstance on an existing shared-node cluster with one digit of the release digest changed | Degraded. `verify` Failed with `cannot read the release root manifest`; the eight other tasks Waiting; only the `nvke-verify` namespace in the cluster. |
+| Update: `releaseRoot` patched to the real root on that StackInstance | `verify` re-ran and went Healthy; the install proceeded to Healthy. |

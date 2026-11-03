@@ -362,9 +362,10 @@ for shared in false true; do
   render_chart spire "$shared" spire --repo https://spiffe.github.io/helm-charts-hardened/ --version "$(chart_version spire)"
 done
 grep -q 'kind: StatefulSet' "$work/spire-false/rendered.yaml" && grep -q 'spiffe-oidc-discovery-provider' "$work/spire-false/rendered.yaml" && grep -q 'csi.spiffe.io' "$work/spire-false/rendered.yaml" || { echo "FAIL spire on private nodes must render the server, the OIDC provider and the CSI driver" >&2; exit 1; }
-if grep -q 'kind: CSIDriver' "$work/spire-true/rendered.yaml" || grep -q 'spiffe-oidc-discovery-provider-[a-z]' "$work/spire-true/rendered.yaml"; then
-  echo "FAIL spire on shared nodes must not render the CSI driver or the OIDC provider" >&2; exit 1
+if grep -q 'kind: CSIDriver' "$work/spire-true/rendered.yaml" || grep -q 'spiffe-oidc-discovery-provider-[a-z]' "$work/spire-true/rendered.yaml" || grep -q 'kind: DaemonSet' "$work/spire-true/rendered.yaml"; then
+  echo "FAIL spire on shared nodes must not render the CSI driver, the OIDC provider or the agent DaemonSet" >&2; exit 1
 fi
+grep -q 'kind: DaemonSet' "$work/spire-false/rendered.yaml" || { echo "FAIL spire on private nodes must render the agent DaemonSet" >&2; exit 1; }
 grep -q 'postgres-postgresql' "$work/postgres-false/rendered.yaml" || { echo "FAIL postgres must render the postgres-postgresql Service Temporal and the controller dial" >&2; exit 1; }
 grep -q 'kind: Job' "$work/temporal-false/rendered.yaml" || { echo "FAIL temporal must render its schema Job" >&2; exit 1; }
 echo "ok acquired charts render"

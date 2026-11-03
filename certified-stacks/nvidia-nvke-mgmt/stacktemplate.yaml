@@ -608,6 +608,9 @@ spec:
                 spiffe-csi-driver:
                   enabled: {{ if eq .Values.sharedNodes "true" }}false{{ else }}true{{ end }}
                 spire-agent:
+                  # Workloads reach the agent through the CSI driver, which shared nodes cannot run,
+                  # and its host port would collide with another tenant's agent on the same node.
+                  enabled: {{ if eq .Values.sharedNodes "true" }}false{{ else }}true{{ end }}
                   serviceAccount:
                     name: spire-agent
                   server:
