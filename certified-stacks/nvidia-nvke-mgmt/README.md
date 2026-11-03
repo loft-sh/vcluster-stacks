@@ -142,9 +142,12 @@ cert-manager is the one component the release does not carry; change `certManage
 
 ## Remove
 
-Delete the StackInstance. With `prunePolicy: Prune`, the Platform uninstalls the seven Helm releases, the verification Job, and the base configuration, including the namespaces it created and the PersistentVolumeClaims in them. Deleting a cluster created from one of the VirtualClusterTemplates removes everything with it.
+Delete the StackInstance. With `prunePolicy: Prune`, the Platform uninstalls the seven Helm releases, the verification Job, and the base configuration, including the NVKE namespaces it created and the PersistentVolumeClaims in them. Deleting a cluster created from one of the VirtualClusterTemplates removes everything with it.
 
-What stays in the tenant cluster after removal: the CRDs the charts installed (SPIRE, the nktp monitoring CRDs, cert-manager, the controller's CRDs), because Helm does not delete CRDs. Remove them by hand if you reinstall with a different release of the CRDs.
+What stays in the tenant cluster after removal:
+
+- The 20 CRDs the charts installed (cert-manager, OpenTelemetry, Prometheus monitoring, SPIRE, and the controller's `internal.nvke.nvidia.com` group), because Helm does not delete CRDs. Remove them by hand if you reinstall with a different release of the CRDs.
+- The empty namespaces `cert-manager`, `nvke-base`, and `nvke-verify`, which the Platform creates for the Apps and does not delete.
 
 ## Known limitations
 
@@ -175,3 +178,4 @@ Tested on 2026-11-03 against vCluster Platform 5.0.0-alpha.9 on GKE (Kubernetes 
 | Private nodes, from `nvidia-nvke-mgmt-private-nodes`, one joined bare-metal node (28 CPU, H100) | Healthy, nine tasks, 5m35s from cluster creation including the node join. SPIRE server, agent, CSI driver and OIDC discovery provider running; the controller mounts the SPIFFE workload API and holds `spiffe://example.org/nvke-service/nke-controller`; the nktp node collector running. |
 | Negative: the example StackInstance on an existing shared-node cluster with one digit of the release digest changed | Degraded. `verify` Failed with `cannot read the release root manifest`; the eight other tasks Waiting; only the `nvke-verify` namespace in the cluster. |
 | Update: `releaseRoot` patched to the real root on that StackInstance | `verify` re-ran and went Healthy; the install proceeded to Healthy. |
+| Removal: that StackInstance deleted | All nine Helm releases, the NVKE namespaces, and both PersistentVolumeClaims removed within a minute. Left behind: the 20 CRDs and the empty `cert-manager`, `nvke-base`, and `nvke-verify` namespaces. Deleting the shared-node cluster removed everything with it. |
