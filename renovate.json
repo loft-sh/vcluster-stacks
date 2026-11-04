@@ -81,6 +81,22 @@
       "matchStrings": [
         "# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+)(?: extractVersion=(?<extractVersion>\\S+))?\\s+version: \"?(?<currentValue>[^\\s\"]+)\"?"
       ]
+    },
+    {
+      "customType": "regex",
+      "description": "NVIDIA NVKE management plane: cert-manager chart version pinned as a parameter default",
+      "fileMatch": ["^certified-stacks/nvidia-nvke-mgmt/stacktemplate\\.yaml$"],
+      "matchStrings": [
+        "# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+)(?: registryUrl=(?<registryUrl>\\S+))?\\s+defaultValue: [\"']?(?<currentValue>[^\\s\"']+)[\"']?"
+      ]
+    },
+    {
+      "customType": "regex",
+      "description": "NVIDIA NVKE management plane: vCluster version pinned in the tenant cluster templates",
+      "fileMatch": ["^certified-stacks/nvidia-nvke-mgmt/virtualclustertemplate-.+\\.yaml$"],
+      "matchStrings": [
+        "# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+)(?: extractVersion=(?<extractVersion>\\S+))?\\s+version: \"?(?<currentValue>[^\\s\"]+)\"?"
+      ]
     }
   ]
 }

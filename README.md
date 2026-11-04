@@ -23,6 +23,7 @@ The Certified Stacks catalog currently contains these integrations:
 | [NVIDIA Run:ai](certified-stacks/run-ai/) | Dedicated control plane and central control plane | vCluster, NVIDIA GPU components, and NVIDIA Run:ai |
 | [NVIDIA Dynamo](certified-stacks/nvidia-dynamo/) | One runtime per tenant cluster or control plane cluster | NVIDIA Dynamo operator, NATS, and etcd |
 | [Saturn Cloud Enterprise](certified-stacks/saturn) | One installation per tenant cluster or control plane cluster | Saturn Cloud Helm operator and the Saturn Cloud Enterprise components it installs |
+| [NVIDIA NVKE management plane](certified-stacks/nvidia-nvke-mgmt/) | One installation per tenant cluster, from your own NVKR release | Release verification, cert-manager, nktp, PostgreSQL, SPIRE, Temporal, and the NVKE controller |
 
 For Run:ai, see [NVIDIA Run:ai integration guide](https://www.vcluster.com/docs/platform/next/integrations/certified-stacks/runai) to choose a deployment model and understand its prerequisites.
 

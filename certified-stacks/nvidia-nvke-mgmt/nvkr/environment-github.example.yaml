@@ -1,0 +1,32 @@
+# Example NVKR Environment for a hosted, keyless-signed release of definition.yaml, published to
+# GitHub Container Registry in per-output mode. Replace <org>/<repo> with the repository that runs
+# the generated pipeline. The signing identity below is what the Stack's signerIdentity parameter
+# must match; the repositoryPrefix is the Stack's registryPrefix.
+#
+# Generate and commit the pipeline from an nvkr checkout that contains this file and definition.yaml:
+#   bin/nvkr run generate --definition nvkr-release/definition.yaml \
+#     --environment nvkr-release/environment-github.yaml --engine github --root .
+# Repository settings the generated workflow needs are listed in nvkr's docs/generate-pipeline.md.
+apiVersion: nvkr.dev/environment/v1
+kind: Environment
+metadata:
+  name: nvke-github
+  description: Hosted build, keyless signing, publication to GHCR.
+runtime:
+  runtime: docker
+publication:
+  mode: per-output-v1
+  repositoryPrefix: ghcr.io/<org-lowercase>/<repo>
+  credentialRef: github:NVKR_REGISTRY_WRITE
+signing:
+  mode: cosign
+  identity: ^https://github\.com/<org>/<repo>/\.github/workflows/nvkr-run\.yml@refs/heads/main$
+  issuer: https://token.actions.githubusercontent.com
+# nvke is a public repository. NVKR's pipeline still requires a source credential; any GitHub
+# token with public repo read works. Mirror points at the same repository.
+sourceAccess:
+  https://github.com/dsx-ai-factory/nvke:
+    credentialRef: github:NKE_SOURCE_TOKEN
+    mirror: https://github.com/dsx-ai-factory/nvke
+utilityContainer: busybox@sha256:29989570aeecad61a019f684218ea74d4b8c1c74f9e0abeb34ca926b81174ee1
+utilityPlatform: linux/amd64

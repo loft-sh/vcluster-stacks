@@ -1,0 +1,55 @@
+# The NVKR Definition this Stack expects a release to be built from. It is NVIDIA's
+# docs/examples/nvke-deploy Definition (github.com/dsx-ai-factory/nvkr) without the CLI outputs,
+# for linux/amd64, plus nktp from the release-components catalog. The eight output names are the
+# contract: the Stack reads them from the release root and installs oci://<prefix>/<output>.
+#
+# Place it inside an nvkr checkout (the CLI requires repository-relative paths), for example at
+# nvkr-release/definition.yaml, so the catalog paths below resolve. Both catalogs are already
+# pinned to NVKE v0.22.0 in nvkr.
+apiVersion: nvkr.dev/definition/v5
+kind: Definition
+metadata:
+  name: nvke-management-plane
+  description: NVKE management plane from pinned source; four acquired charts, nktp, controller image, chart and profiles.
+catalog:
+  base: ../inputs/catalogs/nvke/release
+sbomTool: syft
+cosignTool: cosign
+outputs:
+  - name: controller-chart
+    platform: linux/amd64
+    format: helm-oci
+    components: [nvke-controller-chart]
+    helm:
+      images:
+        controller: cwe
+  - name: cwe
+    platform: linux/amd64
+    format: oci
+    components: [nvke-controller]
+  - name: nktp
+    platform: linux/amd64
+    format: helm-oci
+    components: [nktp-chart]
+    catalog:
+      base: ../inputs/catalogs/nvke/release-components
+  - name: postgresql
+    platform: linux/amd64
+    format: helm-oci
+    components: [postgresql-chart]
+  - name: profiles
+    platforms: [linux/amd64]
+    format: oci
+    components: [nvke-controller-profiles-image]
+  - name: spire
+    platform: linux/amd64
+    format: helm-oci
+    components: [spire-chart]
+  - name: spire-crds
+    platform: linux/amd64
+    format: helm-oci
+    components: [spire-crds-chart]
+  - name: temporal
+    platform: linux/amd64
+    format: helm-oci
+    components: [temporal-chart]

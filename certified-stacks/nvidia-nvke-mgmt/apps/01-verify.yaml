@@ -1,0 +1,313 @@
+# Verifies an NVKR release before anything else installs.
+#
+# The Job reads the release root (an OCI index whose config is NVKR's publication-root v4), lists the
+# outputs it binds, and in mode "root" runs cosign against the root and every output: the signature
+# attestation and the SLSA provenance, both under the signer identity the Stack was given. It then
+# resolves the chart version NVKR tagged for each chart output and checks that the tag still points at
+# the digest in the root. Everything it accepted is written into the ConfigMap
+# nvke-release-verification, which the Stack captures as task outputs and the chart tasks consume.
+#
+# The Job runs the Platform's own image ({{ .Values.__image__ }}: sh, curl, jq, kubectl, openssl) and
+# downloads cosign from its GitHub release, checked against a pinned SHA-256. Helm blocks on the Job
+# through the post-install hook, so the task is healthy only after verification passed.
+apiVersion: management.loft.sh/v1
+kind: App
+metadata:
+  name: nvidia-nvke-mgmt-verify
+spec:
+  displayName: '[NVIDIA NVKE Step - 1] Verify the NVKR release'
+  description: Reads the NVKR release root, verifies cosign signatures and SLSA provenance of every output, and records the accepted digests and chart versions for the install tasks.
+  defaultNamespace: nvke-verify
+  wait: true
+  # Helm's deadline for the hook Job. The Job's own activeDeadlineSeconds fires first with a reason.
+  timeout: 20m
+  config:
+    manifests: |-
+      {{- $name := printf "%s-verify" .Release.Name -}}
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: nvke-release-verification
+        namespace: {{ .Release.Namespace }}
+      data:
+        root: ""
+        mode: ""
+        verifiedAt: ""
+      ---
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: {{ $name }}-registry
+        namespace: {{ .Release.Namespace }}
+      type: Opaque
+      stringData:
+        username: {{ .Values.registryUsername | default "" | quote }}
+        password: {{ .Values.registryPassword | default "" | quote }}
+      ---
+      apiVersion: v1
+      kind: ServiceAccount
+      metadata:
+        name: {{ $name }}
+        namespace: {{ .Release.Namespace }}
+      ---
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: Role
+      metadata:
+        name: {{ $name }}
+        namespace: {{ .Release.Namespace }}
+      rules:
+        - apiGroups: [""]
+          resources: ["configmaps"]
+          resourceNames: ["nvke-release-verification"]
+          verbs: ["get", "patch", "update"]
+      ---
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: RoleBinding
+      metadata:
+        name: {{ $name }}
+        namespace: {{ .Release.Namespace }}
+      subjects:
+        - kind: ServiceAccount
+          name: {{ $name }}
+          namespace: {{ .Release.Namespace }}
+      roleRef:
+        apiGroup: rbac.authorization.k8s.io
+        kind: Role
+        name: {{ $name }}
+      ---
+      apiVersion: batch/v1
+      kind: Job
+      metadata:
+        name: {{ $name }}
+        namespace: {{ .Release.Namespace }}
+        annotations:
+          "helm.sh/hook": post-install,post-upgrade
+          "helm.sh/hook-weight": "0"
+          "helm.sh/hook-delete-policy": before-hook-creation
+      spec:
+        backoffLimit: 0
+        activeDeadlineSeconds: 1080
+        template:
+          metadata:
+            labels:
+              app.kubernetes.io/name: nvidia-nvke-mgmt-verify
+          spec:
+            serviceAccountName: {{ $name }}
+            restartPolicy: Never
+            securityContext:
+              runAsNonRoot: true
+              runAsUser: 65532
+              seccompProfile:
+                type: RuntimeDefault
+            containers:
+              - name: verify
+                image: {{ .Values.__image__ | quote }}
+                securityContext:
+                  allowPrivilegeEscalation: false
+                  readOnlyRootFilesystem: true
+                  capabilities:
+                    drop: ["ALL"]
+                resources:
+                  requests:
+                    cpu: 100m
+                    memory: 128Mi
+                  limits:
+                    cpu: "1"
+                    memory: 512Mi
+                env:
+                  - name: HOME
+                    value: /tmp
+                  - name: RELEASE_ROOT
+                    value: {{ .Values.releaseRoot | quote }}
+                  - name: PREFIX
+                    value: {{ .Values.registryPrefix | quote }}
+                  - name: VERIFY_MODE
+                    value: {{ .Values.verifyMode | default "root" | quote }}
+                  - name: IDENTITY_RE
+                    value: {{ .Values.signerIdentity | quote }}
+                  - name: ISSUER
+                    value: {{ .Values.oidcIssuer | default "https://token.actions.githubusercontent.com" | quote }}
+                  - name: CONFIGMAP
+                    value: nvke-release-verification
+                  - name: COSIGN_VERSION
+                    value: "v3.1.3"
+                  # SHA-256 of cosign-linux-amd64 for COSIGN_VERSION. Update together.
+                  - name: COSIGN_SHA256
+                    value: "4629c757b7618056f8ddd7e2625ae9fdd94c0372a65049520bc7d9df9efc7f71"
+                  - name: REG_USER
+                    valueFrom:
+                      secretKeyRef:
+                        name: {{ $name }}-registry
+                        key: username
+                  - name: REG_TOKEN
+                    valueFrom:
+                      secretKeyRef:
+                        name: {{ $name }}-registry
+                        key: password
+                command: ["sh", "-c"]
+                args:
+                  - |
+      {{ include "nvke-verify.script" . | indent 14 }}
+                volumeMounts:
+                  - name: tmp
+                    mountPath: /tmp
+            volumes:
+              - name: tmp
+                emptyDir: {}
+
+      {{- define "nvke-verify.script" -}}
+      set -eu
+      cd /tmp
+
+      # Chart outputs: the install tasks pull oci://<prefix>/<output> at the version recorded below.
+      CHARTS="controller-chart postgresql spire-crds spire temporal nktp"
+      IMAGES="cwe profiles"
+      HOST=${PREFIX%%/*}
+      ROOT_PATH=${RELEASE_ROOT#*/}; ROOT_PATH=${ROOT_PATH%@*}
+      ROOT_DIGEST=${RELEASE_ROOT#*@}
+
+      fail() { echo "FAILED: $*" >&2; exit 1; }
+
+      echo "==> release root:    ${RELEASE_ROOT}"
+      echo "==> registry prefix: ${PREFIX}"
+      echo "==> mode:            ${VERIFY_MODE}"
+      case "$RELEASE_ROOT" in */*@sha256:*) ;; *) fail "releaseRoot must be <registry>/<repository>@sha256:<digest>";; esac
+      case "$VERIFY_MODE" in root|off) ;; *) fail "verifyMode must be root or off";; esac
+      [ "$VERIFY_MODE" = off ] || [ -n "$IDENTITY_RE" ] || fail "signerIdentity is required in mode root"
+
+      # A brand-new cluster's DNS and egress can lag the first Job by a few seconds.
+      i=0; until code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "https://${HOST}/v2/") && [ "$code" != 000 ]; do
+        i=$((i+1)); [ "$i" -lt 30 ] || fail "registry ${HOST} unreachable"; sleep 2
+      done
+
+      echo "==> fetching cosign ${COSIGN_VERSION}"
+      curl -fsSL --retry 3 --retry-delay 3 -o cosign "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-amd64"
+      if command -v sha256sum >/dev/null 2>&1; then got=$(sha256sum cosign | cut -d' ' -f1); else got=$(openssl dgst -sha256 cosign | sed 's/.*= //'); fi
+      [ "$got" = "$COSIGN_SHA256" ] || fail "cosign checksum mismatch: ${got}"
+      chmod +x cosign
+      if [ -n "$REG_USER" ]; then
+        printf '%s' "$REG_TOKEN" | ./cosign login "$HOST" -u "$REG_USER" --password-stdin >/dev/null 2>&1
+        echo "==> registry login as ${REG_USER}"
+      else
+        echo "==> anonymous registry access"
+      fi
+
+      # Bearer token for one repository from the registry's WWW-Authenticate challenge (GET, not HEAD).
+      bearer_for() {
+        challenge=$(curl -s -o /dev/null -D - "https://${HOST}/v2/" | tr -d '\r' | awk 'tolower($1)=="www-authenticate:"')
+        realm=$(printf '%s' "$challenge" | sed -n 's/.*realm="\([^"]*\)".*/\1/p')
+        service=$(printf '%s' "$challenge" | sed -n 's/.*service="\([^"]*\)".*/\1/p')
+        [ -n "$realm" ] || { echo "no bearer realm from https://${HOST}/v2/" >&2; return 1; }
+        url="${realm}?scope=repository:${1}:pull"; [ -n "$service" ] && url="${url}&service=${service}"
+        if [ -n "$REG_USER" ]; then curl -fsS -u "${REG_USER}:${REG_TOKEN}" "$url"; else curl -fsS "$url"; fi | jq -r '.token // .access_token'
+      }
+      ACCEPT='application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json'
+      get_manifest() { curl -fsS -H "Authorization: Bearer $(bearer_for "$1")" -H "Accept: ${ACCEPT}" "https://${HOST}/v2/${1}/manifests/${2}"; }
+      get_blob()     { curl -fsSL -H "Authorization: Bearer $(bearer_for "$1")" "https://${HOST}/v2/${1}/blobs/${2}"; }
+      head_digest()  { curl -fsSI -H "Authorization: Bearer $(bearer_for "$1")" -H "Accept: ${ACCEPT}" "https://${HOST}/v2/${1}/manifests/${2}" | tr -d '\r' | awk 'tolower($1)=="docker-content-digest:"{print $2}'; }
+      list_tags()    { curl -fsS -H "Authorization: Bearer $(bearer_for "$1")" "https://${HOST}/v2/${1}/tags/list?n=1000" | jq -r '.tags[]?'; }
+
+      # 1. Read the root: index -> metadata manifest -> publication-root v4 config -> objects[].
+      echo "==> reading the release root"
+      get_manifest "$ROOT_PATH" "$ROOT_DIGEST" > root-index.json || fail "cannot read the release root manifest"
+      META=$(jq -r '.manifests[0].digest // empty' root-index.json)
+      [ -n "$META" ] || fail "the release root is not an OCI index"
+      get_manifest "$ROOT_PATH" "$META" > root-manifest.json
+      CFG_TYPE=$(jq -r '.config.mediaType' root-manifest.json)
+      [ "$CFG_TYPE" = "application/vnd.nvkr.publication-root.config.v4+json" ] || fail "not an NVKR publication root: config is ${CFG_TYPE}"
+      get_blob "$ROOT_PATH" "$(jq -r '.config.digest' root-manifest.json)" > root-config.json
+      jq -r '.objects[] | select(.output != null) | "\(.name)|\(.descriptorDigest)"' root-config.json > outputs.txt
+      echo "    schema $(jq -r .schemaVersion root-config.json), qualification $(jq -r .qualification root-config.json), $(wc -l < outputs.txt | tr -d ' ') outputs"
+      for o in $CHARTS $IMAGES; do grep -q "^${o}|" outputs.txt || fail "output ${o} is not in the release root (see the reference Definition)"; done
+
+      verify_ref() { # prints "<sig> <prov>"
+        s=FAIL; p=FAIL
+        ./cosign verify-attestation --type https://sigstore.dev/cosign/sign/v1 --certificate-identity-regexp "$IDENTITY_RE" --certificate-oidc-issuer "$ISSUER" "$1" >/dev/null 2>err.txt && s=ok || sed 's/^/    /' err.txt
+        ./cosign verify-attestation --type slsaprovenance1 --certificate-identity-regexp "$IDENTITY_RE" --certificate-oidc-issuer "$ISSUER" "$1" >/dev/null 2>err.txt && p=ok || sed 's/^/    /' err.txt
+        echo "$s $p"
+      }
+
+      : > failures.txt; : > record.txt
+      printf '\n%-18s %-10s %-11s %s\n' OUTPUT SIGNATURE PROVENANCE VERSION
+      printf '%-18s %-10s %-11s %s\n' ------------------ --------- ----------- -------
+      # 2. Signatures: the root first, then every output.
+      if [ "$VERIFY_MODE" = root ]; then
+        echo "==> signer identity: ${IDENTITY_RE}"
+        set -- $(verify_ref "$RELEASE_ROOT")
+        printf '%-18s %-10s %-11s %s\n' "releases (root)" "$1" "$2" "-"
+        [ "$1" = ok ] && [ "$2" = ok ] || echo "root ${RELEASE_ROOT}" >> failures.txt
+      else
+        echo "==> mode off: signatures NOT checked"
+      fi
+      while IFS='|' read -r name digest; do
+        ref="${PREFIX}/${name}@${digest}"
+        sig="-"; prov="-"; version="-"
+        if [ "$VERIFY_MODE" = root ]; then
+          set -- $(verify_ref "$ref"); sig=$1; prov=$2
+          [ "$sig" = ok ] && [ "$prov" = ok ] || echo "${ref}" >> failures.txt
+        fi
+        # 3. Charts: NVKR tags each chart <version> and <version>-<manifest digest hex>. Recover the
+        #    version from the second tag and require the first to still resolve to the root's digest.
+        case " $CHARTS " in *" $name "*)
+          hex=${digest#sha256:}
+          version=$(list_tags "${PREFIX#*/}/${name}" | awk -v h="-${hex}" 'index($0, h) == length($0) - length(h) + 1 { print substr($0, 1, length($0) - length(h)); exit }')
+          if [ -z "$version" ]; then
+            version="MISSING"; echo "${name}: no <version>-${hex} tag" >> failures.txt
+          else
+            resolved=$(head_digest "${PREFIX#*/}/${name}" "$version" 2>/dev/null || true)
+            [ "$resolved" = "$digest" ] || { echo "${name}: tag ${version} resolves to ${resolved:-nothing}, root says ${digest}" >> failures.txt; version="${version} (MISMATCH)"; }
+          fi
+          ;;
+        esac
+        printf '%-18s %-10s %-11s %s\n' "$name" "$sig" "$prov" "$version"
+        echo "${name}|${digest}|${version}" >> record.txt
+      done < outputs.txt
+
+      echo
+      if [ -s failures.txt ]; then echo "==> VERIFICATION FAILED:"; sed 's/^/  /' failures.txt; exit 1; fi
+
+      # 4. Record what was accepted; the Stack captures these keys as task outputs.
+      key() { awk -F'|' -v n="$1" -v f="$2" '$1==n { print $f }' record.txt; }
+      jq -n --arg root "$RELEASE_ROOT" --arg mode "$VERIFY_MODE" --arg signer "$IDENTITY_RE" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        --arg controllerChartVersion "$(key controller-chart 3)" --arg postgresqlVersion "$(key postgresql 3)" \
+        --arg spireCrdsVersion "$(key spire-crds 3)" --arg spireVersion "$(key spire 3)" \
+        --arg temporalVersion "$(key temporal 3)" --arg nktpVersion "$(key nktp 3)" \
+        --arg cweDigest "$(key cwe 2)" --arg profilesDigest "$(key profiles 2)" \
+        '{data:{root:$root,mode:$mode,signer:$signer,verifiedAt:$at,controllerChartVersion:$controllerChartVersion,postgresqlVersion:$postgresqlVersion,spireCrdsVersion:$spireCrdsVersion,spireVersion:$spireVersion,temporalVersion:$temporalVersion,nktpVersion:$nktpVersion,cweDigest:$cweDigest,profilesDigest:$profilesDigest}}' > patch.json
+      kubectl patch configmap "$CONFIGMAP" --type merge --patch-file patch.json >/dev/null || fail "could not record the result in configmap ${CONFIGMAP}"
+      if [ "$VERIFY_MODE" = root ]; then
+        echo "==> OK: root and $(wc -l < record.txt | tr -d ' ') outputs signed and attested by ${IDENTITY_RE}; chart tags match the root"
+      else
+        echo "==> OK (mode off): $(wc -l < record.txt | tr -d ' ') outputs read from the root; chart tags match the root; signatures NOT checked"
+      fi
+      {{- end -}}
+  parameters:
+    - variable: releaseRoot
+      label: NVKR release root
+      description: The release root NVKR published, <registry>/<repository>@sha256:<digest>.
+      type: string
+      required: true
+      validation: ^[a-z0-9.:-]+(/[A-Za-z0-9._-]+)+@sha256:[0-9a-f]{64}$
+    - variable: registryPrefix
+      label: Registry prefix
+      description: The release's publication prefix; every output is at <prefix>/<output>.
+      type: string
+      required: true
+      validation: ^[a-z0-9.:-]+(/[A-Za-z0-9._-]+)+$
+    - variable: verifyMode
+      label: Verification mode
+      type: string
+      options: ["root", "off"]
+      required: true
+    - variable: signerIdentity
+      label: Signer identity (regexp)
+      type: string
+    - variable: oidcIssuer
+      label: OIDC issuer
+      type: string
+    - variable: registryUsername
+      label: Registry username
+      type: string
+    - variable: registryPassword
+      label: Registry password or token
+      type: password
