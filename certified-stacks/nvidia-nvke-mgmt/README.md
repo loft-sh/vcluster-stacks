@@ -1,6 +1,8 @@
 # NVIDIA NVKE Management Plane Certified Stack
 
-This integration installs the management plane of [NVIDIA NVKE](https://github.com/dsx-ai-factory/nvke) into a tenant cluster from a release that you build with [NVKR](https://github.com/dsx-ai-factory/nvkr), NVIDIA's reproducible release tool. The Stack verifies the release first: cosign signatures and SLSA provenance on the release root and on every output. Nothing installs until that check passes, and every chart version and image digest comes from the verified release, not from a parameter.
+This integration installs the management plane of [NVIDIA NVKE](https://github.com/dsx-ai-factory/nvke) into a cluster from a release that you build with [NVKR](https://github.com/dsx-ai-factory/nvkr), NVIDIA's build and release tool for NVKE. 
+
+The Stack verifies the release first: cosign signatures and SLSA provenance on the release root and on every output. Nothing will install until after that check passes. The six chart packages and the two NVKE-built images (the controller and its profiles) are installed at the versions and digests the verified release names, not from parameters. The runtime images those charts pull (PostgreSQL, Temporal, SPIRE, the OpenTelemetry stack) come from their upstream registries and are outside the release; see Known limitations.
 
 The files in this directory are the source manifests for the `nvidia-nvke-mgmt` StackTemplate, its two Apps, and the `nvidia-nvke-mgmt-shared-nodes` and `nvidia-nvke-mgmt-private-nodes` VirtualClusterTemplates.
 
@@ -38,7 +40,7 @@ The two VirtualClusterTemplates create a tenant cluster and install the Stack th
 
 ## Requirements
 
-- vCluster Platform 4.12 or later. The tenant cluster templates also need vCluster 0.37 or later for `deploy.stacks`.
+- vCluster Platform 5.0 or later. The tenant cluster templates also need vCluster 0.37 or later for `deploy.stacks`.
 - A tenant cluster with `linux/amd64` nodes and a default StorageClass or one named in `storageClass`. The management plane requests about 1 CPU and 2.5 GiB of memory in total, most of it for the nktp collectors; PostgreSQL needs a 40Gi volume and SPIRE a 1Gi volume. On shared nodes, set `sharedNodes` to `"true"`.
 - Outbound HTTPS from the tenant cluster to your release registry, to `github.com` for the cosign download, to the public Sigstore services (`rekor.sigstore.dev`, `tuf-repo-cdn.sigstore.dev`) when `verifyMode` is `root`, to `charts.jetstack.io` and `quay.io` for cert-manager, and to the registries the NVKE charts pull their images from (Docker Hub, `ghcr.io`).
 - An NVKR release of NVKE, described in the next section.
@@ -108,7 +110,7 @@ To install into an existing tenant cluster, copy [`example/stackinstance-tenant-
 kubectl apply -n p-default -f example/stackinstance-tenant-cluster.yaml
 ```
 
-The Stack takes 15 to 25 minutes on a fresh cluster. `verify` typically finishes within 2 minutes; SPIRE and Temporal take the longest.
+The Stack takes about 5 minutes on a fresh cluster. `verify` finishes within 2 minutes; SPIRE and Temporal take the longest.
 
 ## Verify
 
@@ -153,10 +155,12 @@ What stays in the tenant cluster after removal:
 
 - `linux/amd64` only. The Definition builds for that platform, and the verify Job downloads the amd64 cosign.
 - On shared nodes, the controller runs without a SPIFFE identity, SPIRE runs without agents and without the OIDC discovery provider, and nktp collects no node-level logs or host metrics. Everything that NVKE issues workload identities for, and node telemetry, needs private nodes.
-- Once per tenant cluster. The CRDs are cluster-scoped and the SPIRE trust domain is `example.org`, as in NVKE's own configuration.
+- Once per cluster. The CRDs are cluster-scoped. The SPIRE trust domain is `example.org`, NVKE's own default; a site-specific trust domain is not yet a parameter.
 - `verifyMode: off` is not a security boundary. It exists for releases that NVKR signed in dry-run mode.
 - The Stack does not install NICo, Cluster API, or anything NVKE uses to provision nodes. It installs the management plane; what you connect to it is up to you.
 - The NVKE Helm values are the ones NVKE v0.22.0 ships. A newer NVKE release whose charts change their values needs a change here.
+- `verify` checks that each chart's install tag resolves to the digest in the release root, but Helm then pulls the chart by tag, not by digest. Between those two steps, a tag could be repointed by anyone with write access to the registry. Keep write access to the release registry limited to the pipeline that publishes releases.
+- The release covers the six chart packages and the controller and profiles images. The runtime images the charts pull (PostgreSQL, Temporal, SPIRE, the OpenTelemetry stack) come from their upstream registries at the references in the charts' values. NVKR's declarative Helm bindings can pin those too; this Stack does not yet use them.
 
 ## Test changes
 
