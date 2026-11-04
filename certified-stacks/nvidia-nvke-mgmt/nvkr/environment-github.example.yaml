@@ -22,6 +22,8 @@ signing:
   mode: cosign
   identity: ^https://github\.com/<org>/<repo>/\.github/workflows/nvkr-run\.yml@refs/heads/main$
   issuer: https://token.actions.githubusercontent.com
+# nvke is a public repository. NVKR's pipeline still requires a source credential; any GitHub
+# token with public repo read works. Mirror points at the same repository.
 sourceAccess:
   https://github.com/dsx-ai-factory/nvke:
     credentialRef: github:NKE_SOURCE_TOKEN
