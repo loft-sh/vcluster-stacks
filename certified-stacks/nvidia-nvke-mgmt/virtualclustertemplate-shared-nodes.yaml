@@ -78,7 +78,7 @@ spec:
     helmRelease:
       chart:
         # renovate: datasource=github-releases depName=loft-sh/vcluster extractVersion=^v(?<version>.+)$
-        version: 0.37.2
+        version: 0.37.6
       values: |
         # Shared nodes: PVCs sync to the control plane cluster and bind to its default StorageClass.
         deploy:
