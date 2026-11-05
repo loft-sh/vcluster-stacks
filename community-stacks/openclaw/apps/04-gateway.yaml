@@ -193,7 +193,7 @@ spec:
       type: string
       required: true
       # renovate: datasource=npm depName=@martian-engineering/lossless-claw
-      defaultValue: "1.1.0"
+      defaultValue: "1.2.0"
     - variable: modelBaseUrl
       label: Model base URL
       description: OpenAI-compatible base URL ending in /v1.

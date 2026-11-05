@@ -516,7 +516,7 @@ spec:
       required: true
       section: Versions
       # renovate: datasource=npm depName=@martian-engineering/lossless-claw
-      defaultValue: "1.1.0"
+      defaultValue: "1.2.0"
 
   tasks:
     # A StackTemplate task cannot be skipped. modelBackend: external selects the -skip App, which
