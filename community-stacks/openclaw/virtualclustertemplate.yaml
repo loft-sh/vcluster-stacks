@@ -100,7 +100,7 @@ spec:
       chart:
         # The Platform requires a pinned vCluster version here; deploy.stacks needs 0.37 or later.
         # renovate: datasource=github-releases depName=loft-sh/vcluster extractVersion=^v(?<version>.+)$
-        version: "0.37.3"
+        version: "0.37.6"
       values: |-
         deploy:
           stacks:
