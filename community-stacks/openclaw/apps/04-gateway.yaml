@@ -186,7 +186,7 @@ spec:
       type: string
       required: true
       # renovate: datasource=docker depName=nginxinc/nginx-unprivileged
-      defaultValue: nginxinc/nginx-unprivileged:1.27-alpine
+      defaultValue: nginxinc/nginx-unprivileged:1.31-alpine
     - variable: losslessClawVersion
       label: lossless-claw version
       description: npm version of @martian-engineering/lossless-claw (needs OpenClaw >= 2026.9.2).

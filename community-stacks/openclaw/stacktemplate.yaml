@@ -509,7 +509,7 @@ spec:
       required: true
       section: Versions
       # renovate: datasource=docker depName=nginxinc/nginx-unprivileged
-      defaultValue: nginxinc/nginx-unprivileged:1.27-alpine
+      defaultValue: nginxinc/nginx-unprivileged:1.31-alpine
     - variable: losslessClawVersion
       label: lossless-claw version
       type: string
