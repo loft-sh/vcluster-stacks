@@ -220,10 +220,10 @@ spec:
       echo "    schema $(jq -r .schemaVersion root-config.json), qualification $(jq -r .qualification root-config.json), $(wc -l < outputs.txt | tr -d ' ') outputs"
       for o in $CHARTS $IMAGES; do grep -q "^${o}|" outputs.txt || fail "output ${o} is not in the release root (see the reference Definition)"; done
 
-      verify_ref() { # prints "<sig> <prov>"
+      verify_ref() { # prints "<sig> <prov>" on stdout; cosign's errors go to stderr so they reach the log
         s=FAIL; p=FAIL
-        ./cosign verify-attestation --type https://sigstore.dev/cosign/sign/v1 --certificate-identity-regexp "$IDENTITY_RE" --certificate-oidc-issuer "$ISSUER" "$1" >/dev/null 2>err.txt && s=ok || sed 's/^/    /' err.txt
-        ./cosign verify-attestation --type slsaprovenance1 --certificate-identity-regexp "$IDENTITY_RE" --certificate-oidc-issuer "$ISSUER" "$1" >/dev/null 2>err.txt && p=ok || sed 's/^/    /' err.txt
+        ./cosign verify-attestation --type https://sigstore.dev/cosign/sign/v1 --certificate-identity-regexp "$IDENTITY_RE" --certificate-oidc-issuer "$ISSUER" "$1" >/dev/null 2>err.txt && s=ok || sed 's/^/    /' err.txt >&2
+        ./cosign verify-attestation --type slsaprovenance1 --certificate-identity-regexp "$IDENTITY_RE" --certificate-oidc-issuer "$ISSUER" "$1" >/dev/null 2>err.txt && p=ok || sed 's/^/    /' err.txt >&2
         echo "$s $p"
       }
 
