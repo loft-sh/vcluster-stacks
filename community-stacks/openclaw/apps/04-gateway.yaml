@@ -59,8 +59,18 @@
 # seed container as uid 1000 and everything works. It also makes ~/.cache writable, which OpenClaw
 # uses as its temp fallback.
 #
-# TMPDIR is a 0700 directory the seed container creates: OpenClaw refuses a world-writable temp
-# root without the sticky bit, and a Kubernetes emptyDir at /tmp is exactly that.
+# TEMP DIRECTORY
+#
+# OpenClaw's secure-temp check needs a private TMPDIR (owned by uid 1000, mode 0700) AND safe
+# ancestors: each one owned by uid 1000 or root, and any writable one with the sticky bit. An
+# emptyDir mounted at /tmp fails the ancestor rule: its root is root-owned mode 2777 (fsGroup adds
+# setgid, never sticky), and uid 1000 cannot chmod a directory it does not own. So the seed
+# container (uid 1000) creates `gateway-tmp` on the emptyDir with mode 1777, plus `gateway-tmp/oc`
+# with mode 0700, and the OpenClaw containers mount `gateway-tmp` at /tmp with subPath. They then
+# see /tmp (uid 1000, 1777) and TMPDIR=/tmp/oc (uid 1000, 0700). This is the layout of the
+# upstream Kubernetes recipe (docs/install/kubernetes.md, "Temporary storage"). OpenClaw 2026.11
+# started to check the ancestors, so a private /tmp/oc directly on the emptyDir root stopped
+# working there.
 #
 # THE PUBLISHED URL
 #
@@ -651,7 +661,7 @@ spec:
                   - { name: TMPDIR,                 value: /tmp/oc }
                 volumeMounts:
                   - { name: state, mountPath: /home/node }
-                  - { name: tmp,   mountPath: /tmp }
+                  - { name: tmp,   mountPath: /tmp, subPath: gateway-tmp }
             containers:
               # `args`, not `command`: keeps the image entrypoint (tini + docker-entrypoint.mjs),
               # which runs `openclaw doctor --fix` against the mounted state on image upgrades.
@@ -700,7 +710,7 @@ spec:
                   failureThreshold: 4
                 volumeMounts:
                   - { name: state, mountPath: /home/node }
-                  - { name: tmp,   mountPath: /tmp }
+                  - { name: tmp,   mountPath: /tmp, subPath: gateway-tmp }
               {{- if ne $mode "port-forward" }}
               # The front door in nodeport mode (IP allowlist, identity header) and in ingress mode
               # (the gateway's trusted proxy behind the Ingress controller).
@@ -845,10 +855,12 @@ spec:
       MANAGED=/etc/openclaw-bootstrap/managed.json
       NS="$POD_NAMESPACE"
 
-      # Owned by this uid (see the header): OpenClaw chmods it, and refuses a temp root that is
-      # world-writable without the sticky bit, so give it a private one on the shared /tmp.
+      # Owned by this uid (see the header): OpenClaw chmods it.
       mkdir -p "$STATE" && chmod 700 "$STATE"
-      mkdir -p /tmp/oc && chmod 700 /tmp/oc
+      # The OpenClaw containers mount gateway-tmp at /tmp (subPath). It must be sticky and owned by
+      # this uid, and TMPDIR (/tmp/oc there) private. See "TEMP DIRECTORY" in the header.
+      mkdir -p /tmp/gateway-tmp && chmod 1777 /tmp/gateway-tmp
+      mkdir -p /tmp/gateway-tmp/oc && chmod 700 /tmp/gateway-tmp/oc
 
       # --- where is this node reachable? --------------------------------------------------
       ip="$HOST_IP"
