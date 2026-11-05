@@ -575,9 +575,14 @@ kubectl delete apps,stacktemplates,virtualclustertemplates -l app.kubernetes.io/
   `openclaw plugins install` changes the mode of the state directory, which fails with `EPERM` on
   a directory that it does not own. One level up, the seed container creates `.openclaw` as uid
   1000.
-- **OpenClaw needs a private temp directory.** A Kubernetes `emptyDir` at `/tmp` is world-writable
-  without the sticky bit. The secure-temp check of OpenClaw rejects it. The seed container creates
-  `/tmp/oc` (mode 0700), and each OpenClaw container uses it as `TMPDIR`.
+- **OpenClaw needs a private temp directory under safe ancestors.** The secure-temp check of
+  OpenClaw rejects a `TMPDIR` that is not private. Since 2026.11 it also rejects a world-writable
+  ancestor without the sticky bit. The root of a Kubernetes `emptyDir` is such a directory: owned
+  by root, mode 2777, and uid 1000 cannot change it. The seed container creates `gateway-tmp`
+  (mode 1777) and `gateway-tmp/oc` (mode 0700) on the volume. Each OpenClaw container mounts
+  `gateway-tmp` at `/tmp` with `subPath` and uses `/tmp/oc` as `TMPDIR`. Without this layout the
+  `install-plugin` init container fails with `temp workspace ancestor "/tmp" has
+  group/world-writable mode 2777 without sticky protection`.
 - **A Service named `vllm` breaks vLLM.** Kubernetes injects `VLLM_PORT=tcp://...` service-link
   env vars into pods in the namespace, and `VLLM_PORT` is a real vLLM setting. All pods set
   `enableServiceLinks: false`.
