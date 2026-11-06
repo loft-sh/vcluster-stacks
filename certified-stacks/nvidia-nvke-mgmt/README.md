@@ -48,7 +48,7 @@ The two VirtualClusterTemplates create a tenant cluster and install the Stack th
 
 ### What the Stack expects from your NVKR release
 
-NVKR is a build tool. It takes a Definition (what to build), an Environment (where to publish and how to sign), and produces a release: every output as an OCI artifact, an SBOM and SLSA provenance per output, and one release root that names them all by digest. You run it; NVIDIA does not publish a release for you. The Stack needs:
+NVKR is a build tool. It takes a Definition (what to build), an Environment (where to publish and how to sign), and produces a release: every output as an OCI artifact, an SBOM and SLSA provenance per output, and one release root that names them all by digest. You run it; NVIDIA does not yet publish a canonical release for you- though it is a roadmap item. The Stack needs:
 
 | What | Where it comes from | Stack parameter |
 | --- | --- | --- |
