@@ -113,7 +113,7 @@ spec:
       type: string
       required: true
       # renovate: datasource=docker depName=vllm/vllm-openai
-      defaultValue: vllm/vllm-openai:v0.30.0
+      defaultValue: vllm/vllm-openai:v0.33.0
     - variable: modelCache
       label: Model cache storage
       description: pvc (network-attached StorageClass recommended), hostPath (node-local directory, follows the pod), or emptyDir (no persistence).
