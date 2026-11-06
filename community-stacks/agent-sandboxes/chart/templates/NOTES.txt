@@ -1,0 +1,29 @@
+vBox is installed as {{ include "vbox.fullname" . }} in its namespace {{ include "vbox.namespace" . }}
+{{- if .Values.namespace.create }} (created by this chart, kept on uninstall){{ end }}.
+The release record is in {{ .Release.Namespace }}: helm upgrade/uninstall {{ .Release.Name }} -n {{ .Release.Namespace }}.
+
+Open it:
+  kubectl -n {{ include "vbox.namespace" . }} port-forward svc/{{ include "vbox.fullname" . }} 8080:{{ .Values.service.port }}
+  then http://localhost:8080
+
+Sign-in: configure the OpenID Connect provider on the Settings page. It is stored
+in the Secret in {{ include "vbox.namespace" . }} annotated {{ .Values.oidc.annotation }}: "true"
+({{ .Values.oidc.secretName }}); editing that Secret directly also works and shows
+up in the UI within seconds.
+
+The audit trail and sign-in sessions are on the PersistentVolumeClaim
+{{ include "vbox.dataClaim" . }}, mounted at /data.
+{{- if not .Values.publicUrl }}
+
+publicUrl is not set: the OIDC redirect URI is derived from each request. Set
+publicUrl to the address browsers use once vBox is exposed beyond port-forward.
+{{- end }}
+{{- if not .Values.persistence.enabled }}
+
+WARNING: persistence.enabled=false. The audit trail and sessions are on an
+emptyDir and are lost whenever the pod is replaced.
+{{- end }}
+{{- if .Values.disableAuth }}
+
+WARNING: disableAuth=true (VBOX_AUTH=off). Sign-in is not enforced.
+{{- end }}

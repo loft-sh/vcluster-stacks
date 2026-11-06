@@ -1,0 +1,32 @@
+{{- if and .Values.rbac.create .Values.collector.enabled }}
+# The Sandbox Router's access log, which the audit collector follows for the
+# steps each client takes. Logs only in the router's namespace: sandbox pods'
+# logs are not read.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "vbox.clusterName" . }}-router-logs
+  namespace: {{ .Values.collector.routerNamespace }}
+  labels:
+    {{- include "vbox.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "vbox.clusterName" . }}-router-logs
+  namespace: {{ .Values.collector.routerNamespace }}
+  labels:
+    {{- include "vbox.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "vbox.clusterName" . }}-router-logs
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Values.serviceAccount.name }}
+    namespace: {{ include "vbox.namespace" . }}
+{{- end }}

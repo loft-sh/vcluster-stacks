@@ -1,0 +1,42 @@
+{{- if .Values.rbac.create }}
+# Read-only, cluster-wide: sandboxes and their claims, pools and templates can be
+# in any namespace, and the UI lists them all. Exactly the calls vBox makes:
+#   get/list   the four Agent Sandbox kinds (lists, detail pages, the collector)
+#   list       pods (sandbox pods across namespaces; Sandbox Router pods)
+#   list       persistentvolumeclaims, networkpolicies (sandbox detail pages)
+# No watch, no writes.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "vbox.clusterName" . }}
+  labels:
+    {{- include "vbox.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["agents.x-k8s.io"]
+    resources: ["sandboxes"]
+    verbs: ["get", "list"]
+  - apiGroups: ["extensions.agents.x-k8s.io"]
+    resources: ["sandboxclaims", "sandboxwarmpools", "sandboxtemplates"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["pods", "persistentvolumeclaims"]
+    verbs: ["list"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "vbox.clusterName" . }}
+  labels:
+    {{- include "vbox.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "vbox.clusterName" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Values.serviceAccount.name }}
+    namespace: {{ include "vbox.namespace" . }}
+{{- end }}
