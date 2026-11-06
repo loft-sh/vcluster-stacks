@@ -21,7 +21,7 @@ spec:
       type: string
       required: true
       # renovate: datasource=helm depName=gpu-operator registryUrl=https://helm.ngc.nvidia.com/nvidia
-      defaultValue: v26.3.3
+      defaultValue: v26.7.2
     - variable: project
       label: Argo CD Project
       type: string
