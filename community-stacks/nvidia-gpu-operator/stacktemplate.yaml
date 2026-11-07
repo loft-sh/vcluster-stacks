@@ -94,7 +94,7 @@ spec:
       required: true
       section: Versions
       # renovate: datasource=github-releases depName=NVIDIA/NVSentinel
-      defaultValue: v1.13.0
+      defaultValue: v1.31.0
   # Values the gate publishes, readable from the StackInstance outputs subresource.
   publishedOutputs:
     - name: gpucount

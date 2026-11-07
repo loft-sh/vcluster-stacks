@@ -124,7 +124,7 @@ spec:
       required: true
       section: Versions
       # renovate: datasource=github-releases depName=NVIDIA/NVSentinel
-      defaultValue: v1.13.0
+      defaultValue: v1.31.0
   template:
     pro:
       enabled: true
