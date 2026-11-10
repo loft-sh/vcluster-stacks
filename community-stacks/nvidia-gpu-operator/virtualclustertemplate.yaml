@@ -98,6 +98,17 @@ spec:
       defaultValue: "1"
       min: 1
       section: GPU Stack
+    - variable: gpuDriverMode
+      label: GPU Driver Mode
+      description: How Kubernetes consumes GPUs. device-plugin requests nvidia.com/gpu; dra (experimental in the
+        GPU Operator) publishes GPUs through the NVIDIA DRA driver and requests them through ResourceClaims.
+        auto keeps an existing GPU Operator's mode and otherwise installs device-plugin. NVSentinel follows.
+      options:
+        - auto
+        - device-plugin
+        - dra
+      defaultValue: auto
+      section: GPU Stack
     - variable: driverPreinstalled
       label: NVIDIA Driver Preinstalled
       description: Enable when the GPU node OS image already contains the NVIDIA driver.
@@ -106,8 +117,9 @@ spec:
       section: GPU Stack
     - variable: waitForClusterPolicy
       label: Gate On ClusterPolicy As Well As GPU Capacity
-      description: Off by default. The gpuready gate verifies allocatable GPU capacity, which is what decides
-        whether a GPU pod can be scheduled. Enable to also wait for every GPU Operator operand to be healthy.
+      description: Off by default. The gpuready gate verifies GPU capacity, which is what decides whether a GPU
+        pod can be scheduled. Enable to also wait for every GPU Operator operand to be healthy (ClusterPolicy, or
+        GPUCluster with dra).
       type: boolean
       defaultValue: "false"
       section: GPU Stack
@@ -200,6 +212,7 @@ spec:
                 argoProject: {{ .Values.argoProject | quote }}
                 cpuNodePool: {{ .Values.cpuNodePool | quote }}
                 minGPUs: {{ .Values.minGPUs | toString | quote }}
+                gpuDriverMode: {{ .Values.gpuDriverMode | quote }}
                 driverPreinstalled: {{ .Values.driverPreinstalled | toString | quote }}
                 waitForClusterPolicy: {{ .Values.waitForClusterPolicy | toString | quote }}
                 gpuOperatorVersion: {{ .Values.gpuOperatorVersion | quote }}
