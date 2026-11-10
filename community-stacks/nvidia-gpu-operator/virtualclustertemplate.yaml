@@ -123,6 +123,49 @@ spec:
       type: boolean
       defaultValue: "false"
       section: GPU Stack
+    - variable: nvsentinelCordon
+      label: NVSentinel Cordons Faulty GPU Nodes
+      description: Cordon a GPU node when NVSentinel detects a fault on it. Never reboots.
+        Needs cert-manager in the cluster. Set false for monitoring only.
+      type: boolean
+      defaultValue: "true"
+      section: NVSentinel
+    - variable: nvsentinelDrain
+      label: NVSentinel Drains Cordoned GPU Nodes
+      description: Also evict pods from a GPU node NVSentinel cordoned. Pods get to finish, and are force deleted
+        after 60 minutes. No effect unless cordoning is on.
+      type: boolean
+      defaultValue: "false"
+      section: NVSentinel
+    - variable: nvsentinelDryRun
+      label: NVSentinel Dry Run
+      description: Log the cordons and drains NVSentinel would make without making them.
+      type: boolean
+      defaultValue: "false"
+      section: NVSentinel
+    - variable: nvsentinelCircuitBreakerPercentage
+      label: NVSentinel Circuit Breaker Percentage
+      description: Share of GPU nodes cordoned within 5 minutes that trips NVSentinel's circuit breaker, which then
+        stops all cordoning and uncordoning until reset by hand. With one GPU node, the first cordon trips it.
+      type: number
+      defaultValue: "50"
+      min: 1
+      section: NVSentinel
+    - variable: nvsentinelCircuitBreakerMaxNodes
+      label: NVSentinel Circuit Breaker Max Nodes
+      description: Cordons within 5 minutes that trip the breaker regardless of fleet size. 0 uses the percentage alone.
+      type: number
+      defaultValue: "0"
+      min: 0
+      section: NVSentinel
+    - variable: nvsentinelMongodbReplicas
+      label: NVSentinel MongoDB Replicas
+      description: Replicas of NVSentinel's MongoDB store, used when cordoning is on. Each requests 1 CPU and 1.5Gi
+        on the CPU services pool.
+      type: number
+      defaultValue: "1"
+      min: 1
+      section: NVSentinel
     - variable: gpuOperatorVersion
       label: GPU Operator Version
       type: string
@@ -213,6 +256,12 @@ spec:
                 cpuNodePool: {{ .Values.cpuNodePool | quote }}
                 minGPUs: {{ .Values.minGPUs | toString | quote }}
                 gpuDriverMode: {{ .Values.gpuDriverMode | quote }}
+                nvsentinelCordon: {{ .Values.nvsentinelCordon | toString | quote }}
+                nvsentinelDrain: {{ .Values.nvsentinelDrain | toString | quote }}
+                nvsentinelDryRun: {{ .Values.nvsentinelDryRun | toString | quote }}
+                nvsentinelMongodbReplicas: {{ .Values.nvsentinelMongodbReplicas | toString | quote }}
+                nvsentinelCircuitBreakerPercentage: {{ .Values.nvsentinelCircuitBreakerPercentage | toString | quote }}
+                nvsentinelCircuitBreakerMaxNodes: {{ .Values.nvsentinelCircuitBreakerMaxNodes | toString | quote }}
                 driverPreinstalled: {{ .Values.driverPreinstalled | toString | quote }}
                 waitForClusterPolicy: {{ .Values.waitForClusterPolicy | toString | quote }}
                 gpuOperatorVersion: {{ .Values.gpuOperatorVersion | quote }}

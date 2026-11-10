@@ -6,6 +6,19 @@
 # which the DRA stack does not create. Kubernetes admits admin-access claims only in a namespace
 # labeled resource.kubernetes.io/admin-access=true, and the chart does not set it, so Argo CD labels
 # the namespace it creates. The label is "false" in device-plugin mode, which grants nothing.
+#
+# Fault handling: by default NVSentinel cordons a GPU node it finds faulty (fault quarantine,
+# dryRun off). drain=true also evicts pods from a cordoned node (node-drainer, with the chart's
+# eviction defaults); it has no effect without cordon, since the drainer acts on quarantined nodes.
+# It never reboots: fault-remediation and janitor stay off. Quarantine keeps its state in NVSentinel's MongoDB store, which gets its TLS
+# certificates from cert-manager, so cordon=true requires cert-manager in the cluster. cordon=false
+# runs monitoring only, with no MongoDB and no cert-manager dependency. dryRun=true keeps
+# quarantine running but only logs what it would cordon.
+#
+# Quarantine's circuit breaker stays on. It trips when the nodes cordoned within 5 minutes reach
+# ceil(GPU nodes x circuitBreakerPercentage / 100), capped by circuitBreakerMaxNodes when that is
+# above 0. A tripped breaker halts all event processing, healthy events included, until it is reset
+# by hand, so with one GPU node the first cordon trips it.
 apiVersion: management.loft.sh/v1
 kind: ArgoCDApplicationTemplate
 metadata:
@@ -45,6 +58,44 @@ spec:
         - device-plugin
         - dra
       defaultValue: device-plugin
+    - variable: cordon
+      label: Cordon Faulty GPU Nodes
+      description: Cordon a node when NVSentinel detects a GPU fault. Never reboots. Needs
+        cert-manager in the cluster, for the MongoDB store that quarantine uses.
+      type: boolean
+      defaultValue: 'true'
+    - variable: drain
+      label: Drain Cordoned GPU Nodes
+      description: Also evict pods from a node NVSentinel cordoned. Pods get to finish, and are force deleted
+        after 60 minutes. No effect unless cordoning is on.
+      type: boolean
+      defaultValue: 'false'
+    - variable: dryRun
+      label: Dry Run
+      description: Log the cordons and drains NVSentinel would make without making them.
+      type: boolean
+      defaultValue: 'false'
+    - variable: circuitBreakerPercentage
+      label: Circuit Breaker Percentage
+      description: Share of GPU nodes cordoned within 5 minutes that trips the circuit breaker, which then stops
+        all cordoning and uncordoning until reset. Used when cordoning is on.
+      type: number
+      defaultValue: '50'
+      min: 1
+    - variable: circuitBreakerMaxNodes
+      label: Circuit Breaker Max Nodes
+      description: Cordons within 5 minutes that trip the breaker regardless of fleet size. 0 uses the percentage
+        alone; when both apply, the lower one wins.
+      type: number
+      defaultValue: '0'
+      min: 0
+    - variable: mongodbReplicas
+      label: MongoDB Replicas
+      description: Replicas of NVSentinel's MongoDB store, used when cordoning is on. 1 fits a small CPU pool; 3
+        survives the loss of one CPU node, with each replica requesting 1 CPU and 1.5Gi.
+      type: number
+      defaultValue: '1'
+      min: 1
     - variable: dcgmHost
       label: DCGM Service Host
       description: Supplied by the gpuready gate's contract when this template runs inside the nvidia-gpu-operator Stack.
@@ -68,8 +119,12 @@ spec:
           releaseName: nvsentinel
           values: |
             {{- $dra := eq (.Values.gpuDriverMode | default "device-plugin") "dra" }}
+            {{- $cordon := ne (.Values.cordon | toString) "false" }}
+            {{- $drain := and $cordon (eq (.Values.drain | toString) "true") }}
+            {{- $replicas := .Values.mongodbReplicas | default "1" | int }}
             global:
-              dryRun: true
+              # Booleans arrive as strings; the default is cordon on, dry run off.
+              dryRun: {{ eq (.Values.dryRun | toString) "true" }}
               # A YAML boolean: the chart fails on a quoted value.
               gpuDraEnabled: {{ $dra }}
               image:
@@ -90,12 +145,14 @@ spec:
                 enabled: false
               healthEventsAnalyzer:
                 enabled: false
+              # Quarantine stores its state in MongoDB and does not start without it.
               mongodbStore:
-                enabled: false
+                enabled: {{ $cordon }}
               faultQuarantine:
-                enabled: false
+                enabled: {{ $cordon }}
+              # Drain is opt-in and needs quarantine. Never reboot.
               nodeDrainer:
-                enabled: false
+                enabled: {{ $drain }}
               faultRemediation:
                 enabled: false
               janitor:
@@ -129,7 +186,7 @@ spec:
               csp:
                 provider: kind
             {{- if $dra }}
-            # Janitor is off in this dry-run setup. Set anyway, so enabling it in DRA mode does not
+            # Janitor is always off here. Set anyway, so enabling it in DRA mode does not
             # fail the render: the janitor chart refuses the default `nvidia` RuntimeClass there.
             janitor:
               config:
@@ -138,8 +195,32 @@ spec:
                     resetJob:
                       runtimeClassName: ""
             {{- end }}
+            {{- if $cordon }}
+            fault-quarantine:
+              # The chart requests a full CPU; on a 4 CPU services node next to MongoDB that leaves
+              # no room for a rolling update. The limit stays at the chart's 1 CPU.
+              resources:
+                requests:
+                  cpu: 250m
+              circuitBreaker:
+                enabled: true
+                percentage: {{ .Values.circuitBreakerPercentage | default "50" | int }}
+                maxNodes: {{ .Values.circuitBreakerMaxNodes | default "0" | int }}
+            {{- end }}
             mongodb-store:
               mongodb:
+                replicaCount: {{ $replicas }}
+                # cert-manager issues one server certificate per replica.
+                tls:
+                  replicaset:
+                    existingSecrets:
+                      {{- range $i := until $replicas }}
+                      - mongo-server-cert-{{ $i }}
+                      {{- end }}
+                # Also places the MongoDB setup Jobs.
+                nodeSelector:
+                  kubernetes.io/os: linux
+                  workload.example.com/pool: {{ .Values.cpuNodePool | quote }}
                 persistence:
                   size: 10Gi
             platformConnector:

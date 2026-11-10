@@ -6,7 +6,9 @@ installs these components in dependency order:
 - The [NVIDIA GPU Operator](https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/latest/),
   through Argo CD, with either the device plugin or Dynamic Resource Allocation (DRA). See
   [GPU driver mode](#gpu-driver-mode).
-- [NVSentinel](https://github.com/NVIDIA/NVSentinel) in dry-run monitoring mode, through Argo CD.
+- [NVSentinel](https://github.com/NVIDIA/NVSentinel), through Argo CD. By default it cordons a GPU
+  node when it detects a fault there. Draining is opt-in, and it never reboots nodes. See
+  [NVSentinel fault handling](#nvsentinel-fault-handling).
 - A task that resolves the GPU driver mode, two readiness gates and a CUDA smoke test, as
   vCluster Platform Apps.
 
@@ -57,7 +59,7 @@ mode from `discover`'s outputs. The diagram leaves those edges out.
 | `gpuready` | `app` | `nvidia-gpu-operator-gate` | `discover`, `gpu-operator` | `28m0s` | Gate. Waits until `minGPUs` GPUs are available, then marks ConfigMap `gpu-stack-contract` ready. |
 | `dcgmready` | `app` | `nvidia-gpu-operator-gate` | `discover`, `gpuready` | `15m0s` | Gate. Waits for the DCGM DaemonSet (`nvidia-dcgm`, or `nvidia-dcgm-dra` with DRA) to finish rolling out on every GPU node. Publishes nothing. |
 | `gpu-smoke-test` | `app` | `nvidia-gpu-operator-gpu-smoke-test` | `discover`, `gpuready` | `12m0s` | Runs NVIDIA's CUDA VectorAdd sample on the GPU pool. |
-| `nvsentinel` | `argoCDApplication` | `nvidia-gpu-operator-nvsentinel` | `discover`, `gpuready`, `dcgmready` | `20m0s` | Installs NVSentinel in dry-run mode, in the resolved mode. Reads its DCGM address from the gate's contract. |
+| `nvsentinel` | `argoCDApplication` | `nvidia-gpu-operator-nvsentinel` | `discover`, `gpuready`, `dcgmready` | `20m0s` | Installs NVSentinel in the resolved mode, cordoning faulty GPU nodes by default. Reads its DCGM address from the gate's contract. |
 
 The Stack mixes two task types. **The workloads are Argo CD Applications**: once the Stack has
 ordered the rollout, Argo CD owns their reconciliation and drift correction. **The gates and the
@@ -239,17 +241,99 @@ readiness at the Stack level.
   | --- | --- |
   | `https://helm.ngc.nvidia.com/nvidia`, `nvcr.io` | GPU Operator chart and images, CUDA sample |
   | `oci://ghcr.io/nvidia/nvsentinel`, `ghcr.io/nvidia` | NVSentinel chart and images |
+  | `docker.io/bitnamilegacy` | NVSentinel's MongoDB store and its helper images, when cordoning is on |
   | The vCluster Platform image, `ghcr.io/loft-sh/vcluster-platform` or your mirror | Gate Jobs, on the CPU pool |
 
-### cert-manager for production NVSentinel
+- cert-manager in the cluster, unless `nvsentinelCordon` is `false`. The Stack does not install
+  it. See [NVSentinel fault handling](#nvsentinel-fault-handling).
+- A default StorageClass in the cluster, unless `nvsentinelCordon` is `false`. NVSentinel's
+  MongoDB store requests a 10Gi volume per replica.
 
-cert-manager is not part of this Stack, and the Stack does not need it. NVSentinel runs here in
-dry-run mode, and that configuration renders no cert-manager resources.
+### NVSentinel fault handling
 
-A production NVSentinel does need it. MongoDB store, which quarantine, draining and remediation
-depend on, needs cert-manager for its certificates. So do Janitor, janitor-provider, preflight
-and PostgreSQL. Install cert-manager in the tenant cluster before you enable any of them, and
-add the dependency to your Stack if you manage cert-manager there.
+By default NVSentinel acts on a GPU fault by cordoning the node, so no new pods land on it. It does
+not drain the node unless you set `nvsentinelDrain`, and it never reboots it: by default running pods
+stay where they are, and recovering the node is left to you. When the fault clears, NVSentinel uncordons the node, unless its circuit breaker
+has tripped (see below).
+
+| Parameter | Default | Effect |
+| --- | --- | --- |
+| `nvsentinelCordon` | `true` | Runs NVSentinel's fault quarantine. `false` runs monitoring only: health events and node conditions, no cordon. |
+| `nvsentinelDrain` | `false` | `true` also evicts pods from a node NVSentinel cordoned. No effect when `nvsentinelCordon` is `false`. |
+| `nvsentinelDryRun` | `false` | `true` keeps quarantine and the drainer running but only logs the cordons and evictions they would make. |
+| `nvsentinelMongodbReplicas` | `1` | Replicas of the MongoDB store that quarantine keeps its state in. |
+| `nvsentinelCircuitBreakerPercentage` | `50` | Share of GPU nodes cordoned within 5 minutes that trips the circuit breaker. |
+| `nvsentinelCircuitBreakerMaxNodes` | `0` | Cordons within 5 minutes that trip the breaker regardless of fleet size. `0` uses the percentage alone. |
+
+Quarantine needs NVSentinel's MongoDB store, and the store gets its TLS certificates from
+cert-manager. So with `nvsentinelCordon: true`, which is the default, **cert-manager must already
+run in the cluster**. Without it the MongoDB certificates are never issued and the `nvsentinel`
+task does not become healthy. The Stack does not install cert-manager.
+
+The MongoDB store and fault quarantine run on the CPU pool. Each MongoDB replica requests 1 CPU
+and 1.5Gi, and fault quarantine 250m. One replica fits the recommended 4 cpu / 8Gi CPU worker.
+Three replicas survive the loss of one CPU worker, but each needs room on the CPU pool.
+
+NVSentinel's circuit breaker is always on, so a fleet-wide problem, such as a bad driver rollout,
+cannot cordon every GPU node. It trips when the nodes cordoned within 5 minutes reach
+`ceil(GPU nodes × percentage / 100)`, or `nvsentinelCircuitBreakerMaxNodes` if that is lower and
+above `0`. **A tripped breaker halts all event processing**, healthy events included: no further
+cordons, and no uncordon of nodes that recover. It stays tripped until you reset it by hand.
+
+On small clusters this happens on the first fault:
+
+| GPU nodes | Default trips at | With `nvsentinelCircuitBreakerPercentage: 100` |
+| --- | --- | --- |
+| 1 | 1st cordon | 1st cordon |
+| 2 | 1st cordon | 2nd cordon |
+| 4 | 2nd cordon | 4th cordon |
+| 10 | 5th cordon | 10th cordon |
+
+With one GPU node no setting avoids it: the cordoned node stays cordoned until you uncordon it
+and reset the breaker.
+
+#### Reset the circuit breaker
+
+With the cluster's kubeconfig:
+
+1. Check the breaker. `TRIPPED` means NVSentinel processes no events; `CLOSED` is normal.
+
+   ```bash
+   kubectl -n nvsentinel get cm circuit-breaker -o jsonpath='{.data.status}{"\n"}'
+   ```
+
+2. Find the cause before you reset. A breaker that tripped on several nodes at once usually points
+   at something fleet-wide, such as a driver rollout, rather than at the GPUs.
+
+3. Uncordon each node whose fault has cleared. A node is ready when none of its `Gpu*` or
+   `SysLog*` conditions is `True`. Resetting the breaker does not uncordon anything.
+
+   ```bash
+   kubectl get node <node> -o jsonpath='{range .status.conditions[?(@.status=="True")]}{.type}{"\n"}{end}'
+   kubectl uncordon <node>
+   ```
+
+4. Reset the breaker and restart fault quarantine, which reads the state only at startup.
+   `cursor: CREATE` discards the events that piled up while the breaker was tripped, so stale
+   events do not trip it again.
+
+   ```bash
+   kubectl -n nvsentinel patch cm circuit-breaker -p '{"data":{"status":"CLOSED","cursor":"CREATE"}}'
+   kubectl -n nvsentinel rollout restart deploy fault-quarantine
+   kubectl -n nvsentinel rollout status deploy fault-quarantine
+   ```
+
+Upstream's
+[circuit breaker runbook](https://github.com/NVIDIA/NVSentinel/blob/v1.31.0/docs/runbooks/circuit-breaker.md)
+has the full procedure, including when to keep the accumulated events instead.
+
+With `nvsentinelDrain: true`, the node drainer uses NVSentinel's defaults: in every namespace it
+lets pods finish (`AllowCompletion`) and force deletes those still running after 60 minutes. To
+evict some namespaces at once, set `node-drainer.userNamespaces` in the NVSentinel
+ArgoCDApplicationTemplate. The node stays cordoned after the drain, until the fault clears.
+
+Fault remediation and Janitor, which reboot or replace nodes, stay off in every configuration of
+this Stack.
 
 ## Files
 
@@ -290,11 +374,17 @@ the Stack parameters through `deploy.stacks`.
 | `driverPreinstalled` | `false` | `true` when the node image has the NVIDIA driver. GPU Operator skips the driver, and NVSentinel labels in preinstalled-driver mode. |
 | `waitForClusterPolicy` | `false` | `true` also waits for every GPU Operator operand (`ClusterPolicy`, or `GPUCluster` with DRA) |
 | `gpuOperatorVersion` | `v26.7.2` | GPU Operator chart version. DRA mode needs v26.7.0 or later. |
+| `nvsentinelCordon` | `true` | Cordon GPU nodes with a detected fault. Needs cert-manager. `false` for monitoring only. |
+| `nvsentinelDrain` | `false` | Also evict pods from cordoned GPU nodes |
+| `nvsentinelDryRun` | `false` | Log cordons and evictions instead of making them |
+| `nvsentinelMongodbReplicas` | `1` | Replicas of NVSentinel's MongoDB store, when cordoning is on |
+| `nvsentinelCircuitBreakerPercentage` | `50` | Share of GPU nodes cordoned within 5 minutes that trips NVSentinel's circuit breaker |
+| `nvsentinelCircuitBreakerMaxNodes` | `0` | Cordons within 5 minutes that trip the breaker regardless of fleet size. `0` uses the percentage alone. |
 | `nvsentinelVersion` | `v1.31.0` | NVSentinel chart and image version |
 
-The StackTemplate declares the Stack parameters: `argoProject`, `cpuNodePool`, `minGPUs`,
-`gpuDriverMode`, `driverPreinstalled`, `waitForClusterPolicy`, `gpuOperatorVersion` and
-`nvsentinelVersion`. The others shape the tenant cluster.
+The StackTemplate declares every parameter above except `kubernetesVersion`, `argoConnector`,
+`gpuNodeProvider`, `gpuNodeType`, `gpuNodeCount`, `cpuNodeProvider` and `cpuNodeType`, which shape
+the tenant cluster.
 
 Notes:
 
@@ -465,6 +555,8 @@ uninstalls their Helm releases. These remain:
 
 - The namespaces `gpu-operator` and `nvsentinel`, which Argo CD creates through
   `CreateNamespace=true`, and `gpu-stack`.
+- NVSentinel's MongoDB volumes. The chart retains them (`whenDeleted: Retain`, and
+  `helm.sh/resource-policy: keep`). Delete the PVCs in `nvsentinel` to free the storage.
 - In DRA mode, possibly the `GPUCluster`. The chart marks it `helm.sh/resource-policy: keep` and
   deletes it from a Helm `pre-delete` hook. Whether Argo CD runs that hook depends on your Argo CD
   version. Check with `kubectl get gpuclusters`.
@@ -488,10 +580,12 @@ kubectl delete apps,argocdapplicationtemplates,stacktemplates,virtualclustertemp
 
 ## Known limitations
 
-- NVSentinel runs in dry-run mode. Quarantine, draining, remediation, Janitor and MongoDB are
-  disabled, so the Stack does not demonstrate automatic fault recovery. Enabling them requires
-  cert-manager; see [cert-manager for production NVSentinel](#cert-manager-for-production-nvsentinel).
-  Prometheus PodMonitor and ServiceMonitor creation is disabled.
+- NVSentinel never remediates or reboots nodes, and drains them only with `nvsentinelDrain`.
+  Recovering a cordoned node is manual. Prometheus PodMonitor and ServiceMonitor creation is disabled.
+- cert-manager is a prerequisite for the default configuration, not part of the Stack.
+- On clusters with one or two GPU nodes, the first cordon trips NVSentinel's circuit breaker, and a
+  recovered node then stays cordoned until you [reset it](#reset-the-circuit-breaker). The breaker
+  cannot be turned off through this Stack's parameters.
 - The `gpuready` gate has a 1380 second budget, because Platform App deploys stop at 30 minutes.
   The slowest measured run, with an in-cluster driver build, passed the gate 9m21s after the GPU
   node joined. A driver build slower than about 23 minutes fails the gate.
@@ -528,6 +622,17 @@ kubectl delete apps,argocdapplicationtemplates,stacktemplates,virtualclustertemp
 - **Gate Job in `ImagePullBackOff`.** The CPU workers cannot pull the Platform image. In an
   air-gapped installation, the Platform's image mirror must be reachable from tenant cluster
   workers as well.
+- **`nvsentinel` stuck Progressing, MongoDB not starting.** Usually cert-manager is missing or
+  has not issued the MongoDB certificates. Check `kubectl -n nvsentinel get certificates`, and
+  that a default StorageClass bound the MongoDB PVC: `kubectl -n nvsentinel get pvc`. With one
+  CPU worker, more than one MongoDB replica may not fit.
+- **A GPU node is cordoned.** NVSentinel found a fault. `kubectl get node <name> -o yaml` shows the
+  NVSentinel condition that is `True`, the `dgxc.nvidia.com/nvsentinel-state: quarantined` label
+  and the `quarantineHealthEvent` annotation. NVSentinel uncordons the node when the fault clears,
+  unless the circuit breaker has tripped.
+- **A recovered node stays cordoned.** NVSentinel's circuit breaker has probably tripped:
+  `kubectl -n nvsentinel get cm circuit-breaker -o jsonpath='{.data.status}'` prints `TRIPPED`.
+  See [Reset the circuit breaker](#reset-the-circuit-breaker).
 - **NVSentinel reports `GpuDcgmConnectivityFailure`.** NVSentinel started before DCGM was
   serving. Confirm that `dcgmready` ran and passed.
 - **NVSentinel `metadata-collector` cannot start in DRA mode.** Kubernetes admits its
@@ -577,7 +682,11 @@ only the parameters the task passes. They assert:
   RuntimeClass and its namespace label.
 - The parameters do what they promise. `driverPreinstalled` reaches GPU Operator and NVSentinel,
   `waitForClusterPolicy` switches the gate's wait, and `minGPUs` sets the capacity it counts.
-- No NVSentinel component that needs cert-manager is enabled.
+- NVSentinel defaults to cordoning without draining (`nvsentinelCordon: true`,
+  `nvsentinelDryRun: false`, `nvsentinelDrain: false`). Fault quarantine and the MongoDB store
+  follow `nvsentinelCordon`, the node drainer runs only with both `nvsentinelCordon` and
+  `nvsentinelDrain`, and fault remediation and Janitor are never enabled. MongoDB runs on the CPU pool with one server certificate per replica.
+  The circuit breaker is on, with the percentage and node cap from the parameters.
 - The tenant cluster template renders one `autoNodes` entry per provider, every pool references
   a NodeProfile defined here, and `gpuNodeCount` sets the GPU pool size.
 
@@ -606,6 +715,14 @@ CPU node and one GPU node with 2x T4. The StackInstance set `gpuDriverMode: dra`
   allocated on both GPUs. The GPU health monitor read from `nvidia-dcgm-dra`, and
   `GpuDcgmConnectivityFailure` stayed `False`.
 - The published outputs included `gpudrivermode: dra`.
+
+The cordon defaults were tested on the same cluster, which already ran cert-manager. Applying them
+to the running Stack started MongoDB, with its certificates issued by cert-manager, and fault
+quarantine with `--dry-run=false`. A double-bit ECC error injected into GPU 0 through `dcgmi test
+--inject` was detected as `GpuMemWatch`, and the node was cordoned 22 seconds after the injection
+started. No pod was evicted. With one GPU node, the cordon tripped the circuit breaker 45 seconds
+later. After the fault cleared, the node stayed cordoned until it was uncordoned and the breaker
+reset by hand, as described in [Reset the circuit breaker](#reset-the-circuit-breaker).
 
 These have not been exercised:
 

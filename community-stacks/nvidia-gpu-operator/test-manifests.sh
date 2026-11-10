@@ -376,6 +376,11 @@ for name in ("gpu-operator", "gpu-smoke-test", "nvsentinel"):
 if "dcgmready" in tasks and "gpuready" not in ancestors("dcgmready"):
     fail("stacktemplate.yaml task dcgmready: must depend on gpuready; before a GPU node joins, nvidia-dcgm has already rolled out")
 
+# The shipped behavior: NVSentinel cordons on a GPU fault, for real, unless told otherwise.
+if (str(defaults(stack_params).get("nvsentinelCordon")), str(defaults(stack_params).get("nvsentinelDryRun")),
+        str(defaults(stack_params).get("nvsentinelDrain"))) != ("true", "false", "false"):
+    fail("stacktemplate.yaml: NVSentinel must default to cordoning without draining (nvsentinelCordon=true, nvsentinelDryRun=false, nvsentinelDrain=false)")
+
 # Defaults that must agree across files: a stack default overrides the template's, so a drifted
 # template default only bites when someone deploys the template on its own.
 for stack_var, app, app_var in [
@@ -383,6 +388,12 @@ for stack_var, app, app_var in [
     ("nvsentinelVersion", f"{PREFIX}-nvsentinel", "version"),
     ("cpuNodePool", f"{PREFIX}-gpu-operator", "cpuNodePool"),
     ("cpuNodePool", f"{PREFIX}-nvsentinel", "cpuNodePool"),
+    ("nvsentinelCordon", f"{PREFIX}-nvsentinel", "cordon"),
+    ("nvsentinelDryRun", f"{PREFIX}-nvsentinel", "dryRun"),
+    ("nvsentinelDrain", f"{PREFIX}-nvsentinel", "drain"),
+    ("nvsentinelMongodbReplicas", f"{PREFIX}-nvsentinel", "mongodbReplicas"),
+    ("nvsentinelCircuitBreakerPercentage", f"{PREFIX}-nvsentinel", "circuitBreakerPercentage"),
+    ("nvsentinelCircuitBreakerMaxNodes", f"{PREFIX}-nvsentinel", "circuitBreakerMaxNodes"),
 ]:
     a = defaults(stack_params).get(stack_var)
     b = defaults(apps.get(app, {}).get("params", {})).get(app_var)
@@ -394,9 +405,12 @@ if (cpu_profile.get("nodeLabels") or {}).get("workload.example.com/pool") != def
 # --- Render the graph for two parameter sets -----------------------------------------------------
 VARIANTS = {
     "defaults": {},
-    "alternate": {"gpuDriverMode": "device-plugin", "driverPreinstalled": "true", "waitForClusterPolicy": "true", "minGPUs": "2"},
+    "alternate": {"gpuDriverMode": "device-plugin", "driverPreinstalled": "true", "waitForClusterPolicy": "true", "minGPUs": "2",
+                  "nvsentinelCordon": "false", "nvsentinelDryRun": "true", "nvsentinelDrain": "true"},
     "dra": {"gpuDriverMode": "dra"},
-    "dra-alternate": {"gpuDriverMode": "dra", "driverPreinstalled": "true", "waitForClusterPolicy": "true", "minGPUs": "2"},
+    "dra-alternate": {"gpuDriverMode": "dra", "driverPreinstalled": "true", "waitForClusterPolicy": "true", "minGPUs": "2",
+                      "nvsentinelDryRun": "true", "nvsentinelMongodbReplicas": "3", "nvsentinelDrain": "true",
+                      "nvsentinelCircuitBreakerPercentage": "100", "nvsentinelCircuitBreakerMaxNodes": "2"},
 }
 for variant, overrides in VARIANTS.items():
     values = {**defaults(stack_params), **overrides}
@@ -564,12 +578,30 @@ for variant, overrides in VARIANTS.items():
         label = rendered["nvsentinel"]["syncPolicy"].get("managedNamespaceMetadata", {}).get("labels", {}).get("resource.kubernetes.io/admin-access")
         if label != ("true" if dra else "false"):
             fail(f"task nvsentinel ({variant}): namespace label resource.kubernetes.io/admin-access={label!r} for mode {mode}; DRA admin-access claims need 'true'")
-        # cert-manager is a production prerequisite, not part of this Stack: every NVSentinel
-        # component that needs it stays off.
+        # Quarantine (with the MongoDB store it needs) follows nvsentinelCordon, the drainer needs
+        # quarantine too, and nothing that remediates or reboots is ever on.
         g = hv["global"]
-        for component in ("mongodbStore", "janitor", "janitorProvider", "preflight"):
-            if (g.get(component) or {}).get("enabled") is True:
-                fail(f"task nvsentinel ({variant}): global.{component} needs cert-manager, which this Stack does not install")
+        cordon = on("nvsentinelCordon")
+        for component, want in (("faultQuarantine", cordon), ("mongodbStore", cordon),
+                                ("nodeDrainer", cordon and on("nvsentinelDrain")),
+                                ("faultRemediation", False), ("janitor", False), ("janitorProvider", False),
+                                ("healthEventsAnalyzer", False), ("preflight", False)):
+            if (g.get(component) or {}).get("enabled", False) is not want:
+                fail(f"task nvsentinel ({variant}): global.{component}.enabled must be {want} with nvsentinelCordon={values['nvsentinelCordon']} nvsentinelDrain={values['nvsentinelDrain']}")
+        if g.get("dryRun") is not on("nvsentinelDryRun"):
+            fail(f"task nvsentinel ({variant}): global.dryRun={g.get('dryRun')!r} with nvsentinelDryRun={values['nvsentinelDryRun']}")
+        mongo = hv["mongodb-store"]["mongodb"]
+        replicas = int(values["nvsentinelMongodbReplicas"])
+        if mongo.get("replicaCount") != replicas or mongo["tls"]["replicaset"]["existingSecrets"] != [f"mongo-server-cert-{i}" for i in range(replicas)]:
+            fail(f"task nvsentinel ({variant}): MongoDB needs {replicas} replicas with one server certificate each")
+        if (mongo.get("nodeSelector") or {}).get("workload.example.com/pool") != values["cpuNodePool"]:
+            fail(f"task nvsentinel ({variant}): MongoDB is not on the CPU services pool")
+        if cordon:
+            cb = (hv.get("fault-quarantine") or {}).get("circuitBreaker") or {}
+            want = {"enabled": True, "percentage": int(values["nvsentinelCircuitBreakerPercentage"]),
+                    "maxNodes": int(values["nvsentinelCircuitBreakerMaxNodes"])}
+            if {k: cb.get(k) for k in want} != want:
+                fail(f"task nvsentinel ({variant}): fault-quarantine.circuitBreaker is {cb}, expected {want}")
 
 # --- VirtualClusterTemplate ----------------------------------------------------------------------
 vct_path = root / "virtualclustertemplate.yaml"
