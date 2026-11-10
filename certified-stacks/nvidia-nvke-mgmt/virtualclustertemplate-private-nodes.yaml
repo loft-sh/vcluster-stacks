@@ -100,7 +100,7 @@ spec:
     helmRelease:
       chart:
         # renovate: datasource=github-releases depName=loft-sh/vcluster extractVersion=^v(?<version>.+)$
-        version: 0.37.2
+        version: 0.37.7
       values: |
         privateNodes:
           enabled: true
