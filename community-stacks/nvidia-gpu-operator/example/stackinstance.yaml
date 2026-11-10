@@ -31,5 +31,8 @@ spec:
     argoProject: default
     cpuNodePool: cpu-services
     minGPUs: "1"
+    # auto keeps an existing GPU Operator's mode and otherwise installs device-plugin.
+    # Set "dra" to run the GPU Operator's DRA stack (Kubernetes 1.34 or later).
+    gpuDriverMode: auto
     # Set to "true" when the GPU node image already contains the NVIDIA driver.
     driverPreinstalled: "false"

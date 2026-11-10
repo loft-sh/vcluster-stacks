@@ -1,6 +1,11 @@
 # Reusable readiness gate. A Job waits for a resource to report ready and for the scheduler to
 # advertise capacity, then marks a contract ConfigMap ready.
 #
+# Capacity comes from one of two places. `allocatable` sums an extended resource such as
+# nvidia.com/gpu over node allocatable, which is where a device plugin advertises it.
+# `resourceslices` counts the devices a DRA driver, such as gpu.nvidia.com, publishes in
+# ResourceSlices for the selected nodes. DRA devices never appear in node allocatable.
+#
 # `wait: true` makes Platform run Helm with `--wait --wait-for-jobs`, so the task stays
 # Progressing until the Job completes and fails when the Job fails. An operator chart reports
 # installed long before its operands are usable; this Job is the stronger signal.
@@ -86,22 +91,53 @@ spec:
 
       observed=0
       if [ -n "$CAPACITY_RESOURCE" ]; then
-        escaped=$(printf '%s' "$CAPACITY_RESOURCE" | sed 's/\./\\./g')
-        count() {
+        nodes() {
           if [ -n "$CAPACITY_NODE_SELECTOR" ]; then
-            kubectl get nodes -l "$CAPACITY_NODE_SELECTOR" -o "jsonpath={.items[*].status.allocatable['${escaped}']}"
+            kubectl get nodes -l "$CAPACITY_NODE_SELECTOR" "$@"
           else
-            kubectl get nodes -o "jsonpath={.items[*].status.allocatable['${escaped}']}"
-          fi | tr ' ' '\n' | awk '{ sum += $1 } END { print sum + 0 }'
+            kubectl get nodes "$@"
+          fi
         }
+        case "$CAPACITY_SOURCE" in
+          allocatable)
+            escaped=$(printf '%s' "$CAPACITY_RESOURCE" | sed 's/\./\\./g')
+            count() {
+              nodes -o "jsonpath={.items[*].status.allocatable['${escaped}']}" \
+                | tr ' ' '\n' | awk '{ sum += $1 } END { print sum + 0 }'
+            }
+            what="allocatable $CAPACITY_RESOURCE"
+            hint="Check the device plugin pods and node allocatable."
+            ;;
+          resourceslices)
+            # Devices of the driver on the selected nodes, optionally only those whose `type`
+            # attribute matches (the NVIDIA DRA driver types whole GPUs as "gpu").
+            count() {
+              names=$(nodes -o 'jsonpath={.items[*].metadata.name}')
+              kubectl get resourceslices -o json | jq --arg driver "$CAPACITY_RESOURCE" \
+                --arg nodes "$names" --arg type "$CAPACITY_DEVICE_TYPE" '
+                  ($nodes | split(" ")) as $n
+                  | [ .items[]
+                      | select(.spec.driver == $driver)
+                      | select(.spec.nodeName as $x | $n | any(. == $x))
+                      | .spec.devices[]?
+                      | select($type == "" or .attributes.type.string == $type) ]
+                  | length'
+            }
+            what="$CAPACITY_RESOURCE devices${CAPACITY_DEVICE_TYPE:+ of type $CAPACITY_DEVICE_TYPE} in ResourceSlices"
+            hint="Check the DRA driver kubelet plugin pods and kubectl get resourceslices."
+            ;;
+          *)
+            fail "capacitySource must be allocatable or resourceslices, got '$CAPACITY_SOURCE'"
+            ;;
+        esac
         while :; do
           observed=$(count)
           [ "$observed" -ge "$CAPACITY_MIN" ] && break
-          [ "$(remaining)" -gt 0 ] || fail "only $observed allocatable $CAPACITY_RESOURCE after ${TIMEOUT_SECONDS}s, wanted $CAPACITY_MIN. Check the device plugin pods and node allocatable."
-          log "allocatable $CAPACITY_RESOURCE: ${observed}/${CAPACITY_MIN}"
+          [ "$(remaining)" -gt 0 ] || fail "only $observed $what after ${TIMEOUT_SECONDS}s, wanted $CAPACITY_MIN. $hint"
+          log "$what: ${observed}/${CAPACITY_MIN}"
           sleep "$POLL_SECONDS"
         done
-        log "$observed allocatable $CAPACITY_RESOURCE"
+        log "$observed $what"
       fi
 
       # The Helm release owns the contract and its static keys. The gate adds only keys that the
@@ -121,9 +157,10 @@ spec:
       {{- $waitResource = .Values.waitResource | default "" -}}
       {{- end -}}
       {{- $capacityMin := .Values.capacityMin | default "0" | toString -}}
+      {{- $capacitySource := .Values.capacitySource | default "allocatable" -}}
       {{- $contractName := .Values.contractName | default "" -}}
       {{- /* A Job spec is immutable. Changing any setting names a new Job, which also re-runs the gate. */ -}}
-      {{- $hash := printf "%s|%s|%s|%s|%s|%s|%s|%s|%s" $waitResource (.Values.waitNamespace | default "") (.Values.waitCondition | default "") (.Values.capacityResource | default "") $capacityMin (.Values.capacityNodeSelector | default "") $contractName (.Values.contractData | default "") (.Values.timeoutSeconds | default "1380" | toString) | sha256sum | trunc 8 -}}
+      {{- $hash := printf "%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s" $waitResource (.Values.waitNamespace | default "") (.Values.waitCondition | default "") $capacitySource (.Values.capacityResource | default "") (.Values.capacityDeviceType | default "") $capacityMin (.Values.capacityNodeSelector | default "") $contractName (.Values.contractData | default "") (.Values.timeoutSeconds | default "1380" | toString) | sha256sum | trunc 8 -}}
 
       {{- if $contractName }}
       apiVersion: v1
@@ -172,7 +209,7 @@ spec:
         labels:
           {{- include "gate.labels" . | nindent 4 }}
       ---
-      # Read-only, cluster-wide: the watched kind and node allocatable.
+      # Read-only, cluster-wide: the watched kind, nodes, and ResourceSlices when counting DRA devices.
       apiVersion: rbac.authorization.k8s.io/v1
       kind: ClusterRole
       metadata:
@@ -188,6 +225,11 @@ spec:
         - apiGroups: [""]
           resources: ["nodes"]
           verbs: ["get", "list"]
+        {{- if eq $capacitySource "resourceslices" }}
+        - apiGroups: ["resource.k8s.io"]
+          resources: ["resourceslices"]
+          verbs: ["get", "list"]
+        {{- end }}
       ---
       apiVersion: rbac.authorization.k8s.io/v1
       kind: ClusterRoleBinding
@@ -259,8 +301,12 @@ spec:
                     value: {{ .Values.waitNamespace | default "" | quote }}
                   - name: WAIT_CONDITION
                     value: {{ .Values.waitCondition | default "" | quote }}
+                  - name: CAPACITY_SOURCE
+                    value: {{ $capacitySource | quote }}
                   - name: CAPACITY_RESOURCE
                     value: {{ .Values.capacityResource | default "" | quote }}
+                  - name: CAPACITY_DEVICE_TYPE
+                    value: {{ .Values.capacityDeviceType | default "" | quote }}
                   - name: CAPACITY_MIN
                     value: {{ $capacityMin | quote }}
                   - name: CAPACITY_NODE_SELECTOR
@@ -326,9 +372,24 @@ spec:
       description: Plural resource name granted read access, for example clusterpolicies or daemonsets.
       type: string
       section: Wait
+    - variable: capacitySource
+      label: Capacity source
+      description: >-
+        allocatable sums capacityResource over node allocatable (device plugin). resourceslices
+        counts the devices the DRA driver named in capacityResource publishes in ResourceSlices.
+      options: ["allocatable", "resourceslices"]
+      defaultValue: allocatable
+      section: Capacity
     - variable: capacityResource
       label: Capacity resource
-      description: Scheduler resource to count, for example nvidia.com/gpu. Empty skips the count.
+      description: >-
+        Extended resource to sum, for example nvidia.com/gpu, or with resourceslices the DRA driver
+        name, for example gpu.nvidia.com. Empty skips the count.
+      type: string
+      section: Capacity
+    - variable: capacityDeviceType
+      label: Capacity device type
+      description: With resourceslices, count only devices whose type attribute equals this, for example gpu. Empty counts every device.
       type: string
       section: Capacity
     - variable: capacityMin

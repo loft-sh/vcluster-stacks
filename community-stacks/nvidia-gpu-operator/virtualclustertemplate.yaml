@@ -98,6 +98,17 @@ spec:
       defaultValue: "1"
       min: 1
       section: GPU Stack
+    - variable: gpuDriverMode
+      label: GPU Driver Mode
+      description: How Kubernetes consumes GPUs. device-plugin requests nvidia.com/gpu; dra (experimental in the
+        GPU Operator) publishes GPUs through the NVIDIA DRA driver and requests them through ResourceClaims.
+        auto keeps an existing GPU Operator's mode and otherwise installs device-plugin. NVSentinel follows.
+      options:
+        - auto
+        - device-plugin
+        - dra
+      defaultValue: auto
+      section: GPU Stack
     - variable: driverPreinstalled
       label: NVIDIA Driver Preinstalled
       description: Enable when the GPU node OS image already contains the NVIDIA driver.
@@ -106,8 +117,9 @@ spec:
       section: GPU Stack
     - variable: waitForClusterPolicy
       label: Gate On ClusterPolicy As Well As GPU Capacity
-      description: Off by default. The gpuready gate verifies allocatable GPU capacity, which is what decides
-        whether a GPU pod can be scheduled. Enable to also wait for every GPU Operator operand to be healthy.
+      description: Off by default. The gpuready gate verifies GPU capacity, which is what decides whether a GPU
+        pod can be scheduled. Enable to also wait for every GPU Operator operand to be healthy (ClusterPolicy, or
+        GPUCluster with dra).
       type: boolean
       defaultValue: "false"
       section: GPU Stack
@@ -117,14 +129,14 @@ spec:
       required: true
       section: Versions
       # renovate: datasource=helm depName=gpu-operator registryUrl=https://helm.ngc.nvidia.com/nvidia
-      defaultValue: v26.3.3
+      defaultValue: v26.7.2
     - variable: nvsentinelVersion
       label: NVSentinel Chart and Image Version
       type: string
       required: true
       section: Versions
       # renovate: datasource=github-releases depName=NVIDIA/NVSentinel
-      defaultValue: v1.13.0
+      defaultValue: v1.31.0
   template:
     pro:
       enabled: true
@@ -134,7 +146,7 @@ spec:
         repo: https://charts.loft.sh
         # deploy.stacks needs 0.37 or later.
         # renovate: datasource=github-releases depName=loft-sh/vcluster extractVersion=^v(?<version>.+)$
-        version: "0.37.2"
+        version: "0.37.6"
       values: |-
         privateNodes:
           enabled: true
@@ -200,6 +212,7 @@ spec:
                 argoProject: {{ .Values.argoProject | quote }}
                 cpuNodePool: {{ .Values.cpuNodePool | quote }}
                 minGPUs: {{ .Values.minGPUs | toString | quote }}
+                gpuDriverMode: {{ .Values.gpuDriverMode | quote }}
                 driverPreinstalled: {{ .Values.driverPreinstalled | toString | quote }}
                 waitForClusterPolicy: {{ .Values.waitForClusterPolicy | toString | quote }}
                 gpuOperatorVersion: {{ .Values.gpuOperatorVersion | quote }}

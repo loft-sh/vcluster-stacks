@@ -46,6 +46,7 @@ PREFIX = "nvidia-gpu-operator"
 PART_OF = "nvidia-gpu-operator-stack"
 STACK = "nvidia-gpu-operator"
 GATE = f"{PREFIX}-gate"
+DISCOVER = f"{PREFIX}-discover"
 # The Platform caps every App deploy (helm --wait) at 30 minutes.
 APP_DEPLOY_CAP = 30 * 60
 # Stands in for the image the Platform injects as .Values.__image__.
@@ -55,6 +56,19 @@ VALUES_REF = re.compile(r"\.Values\.([A-Za-z_][A-Za-z0-9_]*)")
 OUTPUTS_REF = re.compile(r"\.Outputs\.([A-Za-z0-9_]+)\.([A-Za-z0-9_]+)")
 # Keys the gate patches into its contract, whatever contractData declares.
 GATE_KEYS = {"ready", "observedCount", "verifiedAt", "resourceName"}
+# What the discover Job writes for each resolved mode. The Job's script must contain every value,
+# and the rendered graph is checked against these, standing in for the Job's runtime result.
+DISCOVER_FACTS = {
+    "device-plugin": {"mode": "device-plugin", "dcgmHost": "nvidia-dcgm.gpu-operator.svc",
+                      "dcgmDaemonSet": "nvidia-dcgm", "operatorResource": "clusterpolicy/cluster-policy",
+                      "operatorResources": "clusterpolicies", "capacitySource": "allocatable",
+                      "capacityResource": "nvidia.com/gpu"},
+    "dra": {"mode": "dra", "dcgmHost": "nvidia-dcgm-dra.gpu-operator.svc",
+            "dcgmDaemonSet": "nvidia-dcgm-dra", "operatorResource": "gpucluster/gpu-cluster",
+            "operatorResources": "gpuclusters", "capacitySource": "resourceslices",
+            "capacityResource": "gpu.nvidia.com"},
+}
+DISCOVER_KEYS = set(DISCOVER_FACTS["dra"]) | {"source", "discoveredAt"}
 
 
 def fail(message):
@@ -287,6 +301,13 @@ for path in sorted((root / "apps").glob("*.yaml")):
 gate_doc = apps.get(GATE, {})
 if gate_doc.get("kind") != "App" or "__image__" not in gate_doc["doc"]["spec"].get("config", {}).get("manifests", ""):
     fail(f"apps/: {GATE} must be an App whose Job runs .Values.__image__; that keeps this Stack free of its own image")
+discover_manifests = apps.get(DISCOVER, {}).get("doc", {}).get("spec", {}).get("config", {}).get("manifests", "")
+for mode, facts in DISCOVER_FACTS.items():
+    for key, value in facts.items():
+        if key == "dcgmHost":
+            value = value.split(".")[0]
+        if value not in discover_manifests:
+            fail(f"apps/: {DISCOVER} never writes {key}={value!r} for {mode}; the test's DISCOVER_FACTS and the Job disagree")
 
 # --- StackTemplate -------------------------------------------------------------------------------
 st_path = root / "stacktemplate.yaml"
@@ -338,6 +359,18 @@ for po in spec.get("publishedOutputs") or []:
     if ft.get("output") not in declared_outputs.get(ft.get("task"), {}):
         fail(f"stacktemplate.yaml: published output {po.get('name')} reads an undeclared task output {ft}")
 
+# Every task that differs between device-plugin and DRA must take the mode from discover, never
+# from the parameter, or `auto` would leave it on a different mode than the GPU Operator.
+for name, task in tasks.items():
+    if name != "discover" and any("gpuDriverMode" in ref for _, s in strings(task) for ref in VALUES_REF.findall(s)):
+        fail(f"stacktemplate.yaml task {name}: reads .Values.gpuDriverMode; take the resolved mode from .Outputs.discover.mode")
+    passed = (task.get("app") or task.get("argoCDApplication") or {}).get("parameters") or {}
+    if name != "discover" and "gpuDriverMode" in passed and passed["gpuDriverMode"] != "{{ .Outputs.discover.mode }}":
+        fail(f"stacktemplate.yaml task {name}: gpuDriverMode must be '{{{{ .Outputs.discover.mode }}}}'")
+for name in ("gpu-operator", "gpu-smoke-test", "nvsentinel"):
+    if name in tasks and "gpuDriverMode" not in ((tasks[name].get("app") or tasks[name].get("argoCDApplication") or {}).get("parameters") or {}):
+        fail(f"stacktemplate.yaml task {name}: does not pass gpuDriverMode; it would stay on its default mode")
+
 # A rollout wait on a DaemonSet that schedules no pods yet passes at once, so dcgmready must
 # follow gpuready, which proves a GPU node is there.
 if "dcgmready" in tasks and "gpuready" not in ancestors("dcgmready"):
@@ -361,16 +394,22 @@ if (cpu_profile.get("nodeLabels") or {}).get("workload.example.com/pool") != def
 # --- Render the graph for two parameter sets -----------------------------------------------------
 VARIANTS = {
     "defaults": {},
-    "alternate": {"driverPreinstalled": "true", "waitForClusterPolicy": "true", "minGPUs": "2"},
+    "alternate": {"gpuDriverMode": "device-plugin", "driverPreinstalled": "true", "waitForClusterPolicy": "true", "minGPUs": "2"},
+    "dra": {"gpuDriverMode": "dra"},
+    "dra-alternate": {"gpuDriverMode": "dra", "driverPreinstalled": "true", "waitForClusterPolicy": "true", "minGPUs": "2"},
 }
 for variant, overrides in VARIANTS.items():
     values = {**defaults(stack_params), **overrides}
     on = lambda k: str(values[k]) == "true"
+    # auto on a cluster without a GPU Operator resolves to device-plugin.
+    mode = {"auto": "device-plugin"}.get(values["gpuDriverMode"], values["gpuDriverMode"])
+    dra = mode == "dra"
+    facts = DISCOVER_FACTS[mode]
     contract = {}
     outputs = {}
     rendered = {}
-    # gpuready first: its rendered contract stands in for what the gate publishes at runtime.
-    for name in sorted(tasks, key=lambda n: (n != "gpuready", n)):
+    # discover, then gpuready: their rendered ConfigMaps stand in for what the Jobs publish at runtime.
+    for name in sorted(tasks, key=lambda n: ({"discover": 0, "gpuready": 1}.get(n, 2), n)):
         task = tasks[name]
         where = f"task {name} ({variant})"
         t = render(task, values, where, outputs)
@@ -414,11 +453,11 @@ for variant, overrides in VARIANTS.items():
                 fail(f"{where}: the Job must not restart in place or expire")
             rendered[name] = {"ref": ref, "docs": docs, "pod": pod,
                               "env": {e["name"]: e.get("value") for e in pod["containers"][0].get("env", [])}}
-            if ref == GATE:
+            if ref in (GATE, DISCOVER):
                 if pod["containers"][0]["image"] != PLATFORM_IMAGE:
-                    fail(f"{where}: the gate Job does not run the Platform image")
+                    fail(f"{where}: the Job does not run the Platform image")
                 if (pod.get("nodeSelector") or {}).get("workload.example.com/pool") != values["cpuNodePool"]:
-                    fail(f"{where}: the gate Job is not on the CPU services pool")
+                    fail(f"{where}: the Job is not on the CPU services pool")
         else:
             spec_r = render(app["doc"]["spec"]["template"], {**defaults(app["params"]), **passed}, f"{ref} for {where}")
             if not spec_r:
@@ -428,7 +467,23 @@ for variant, overrides in VARIANTS.items():
             except yaml.YAMLError as e:
                 fail(f"{ref} for {where}: rendered Helm values are not YAML: {e}")
                 continue
-            rendered[name] = {"ref": ref, "values": hv}
+            rendered[name] = {"ref": ref, "values": hv, "syncPolicy": spec_r["spec"].get("syncPolicy") or {}}
+
+        if name == "discover" and name in rendered:
+            cms = [d for d in rendered[name]["docs"] if d.get("kind") == "ConfigMap"]
+            for out in declared_outputs[name].values():
+                fr = out["fromResource"]
+                key = fr["jsonPath"][len("{.data."):-1]
+                if fr["namespace"] != app["doc"]["spec"]["defaultNamespace"] or fr["name"] not in [c["metadata"]["name"] for c in cms]:
+                    fail(f"{where}: output {out['name']} reads {fr['namespace']}/{fr['name']}, which discover does not create")
+                if key not in DISCOVER_KEYS:
+                    fail(f"{where}: output {out['name']} reads key {key!r}, which the discover Job never writes")
+                if key in (cms[0].get("data") or {} if cms else {}):
+                    fail(f"{where}: key {key!r} is declared by the release, so a Helm upgrade would reset what the Job wrote")
+            if rendered[name]["env"].get("REQUESTED_MODE") != values["gpuDriverMode"]:
+                fail(f"{where}: the Job does not receive gpuDriverMode={values['gpuDriverMode']}")
+            outputs = {"discover": {o["name"]: facts.get(o["fromResource"]["jsonPath"][len("{.data."):-1], "")
+                                    for o in declared_outputs[name].values()}}
 
         if name == "gpuready" and name in rendered:
             cms = [d for d in rendered[name]["docs"] if d.get("kind") == "ConfigMap"]
@@ -441,26 +496,39 @@ for variant, overrides in VARIANTS.items():
                 if key not in contract and key not in GATE_KEYS:
                     fail(f"{where}: output {out['name']} reads key {key!r}, which the contract never holds")
             contract["observedCount"] = str(values["minGPUs"])
-            outputs = {"gpuready": {o["name"]: str(contract.get(o["fromResource"]["jsonPath"][len("{.data."):-1], ""))
-                                    for o in declared_outputs["gpuready"].values()}}
+            outputs["gpuready"] = {o["name"]: str(contract.get(o["fromResource"]["jsonPath"][len("{.data."):-1], ""))
+                                   for o in declared_outputs["gpuready"].values()}
 
     # Behavior the parameters promise.
     if "gpu-operator" in rendered:
-        driver = rendered["gpu-operator"]["values"]["driver"]["enabled"]
+        hv = rendered["gpu-operator"]["values"]
+        driver = hv["driver"]["enabled"]
         if driver is on("driverPreinstalled"):
             fail(f"task gpu-operator ({variant}): driver.enabled={driver} with driverPreinstalled={values['driverPreinstalled']}")
+        # The chart's own validations: exactly one CR, and a GPUCluster takes its driver from an NVIDIADriver CR.
+        if (hv["clusterPolicy"]["deployCR"], hv["gpuCluster"]["deployCR"]) != (not dra, dra):
+            fail(f"task gpu-operator ({variant}): deploys ClusterPolicy={hv['clusterPolicy']['deployCR']} GPUCluster={hv['gpuCluster']['deployCR']} for mode {mode}")
+        if dra and driver and hv["driver"]["nvidiaDriverCRD"]["enabled"] is not True:
+            fail(f"task gpu-operator ({variant}): a GPUCluster with the driver enabled needs driver.nvidiaDriverCRD.enabled=true")
     if "gpuready" in rendered:
         env = rendered["gpuready"]["env"]
         if bool(env.get("WAIT_RESOURCE")) is not on("waitForClusterPolicy"):
             fail(f"task gpuready ({variant}): WAIT_RESOURCE={env.get('WAIT_RESOURCE')!r} with waitForClusterPolicy={values['waitForClusterPolicy']}")
-        if env.get("CAPACITY_MIN") != str(values["minGPUs"]) or env.get("CAPACITY_RESOURCE") != "nvidia.com/gpu":
-            fail(f"task gpuready ({variant}): the gate does not wait for minGPUs={values['minGPUs']} nvidia.com/gpu")
+        if env.get("WAIT_RESOURCE") and env["WAIT_RESOURCE"] != facts["operatorResource"]:
+            fail(f"task gpuready ({variant}): waits for {env['WAIT_RESOURCE']}, but mode {mode} deploys {facts['operatorResource']}")
+        expected = (str(values["minGPUs"]), facts["capacitySource"], facts["capacityResource"])
+        if (env.get("CAPACITY_MIN"), env.get("CAPACITY_SOURCE"), env.get("CAPACITY_RESOURCE")) != expected:
+            fail(f"task gpuready ({variant}): the gate does not wait for minGPUs={expected[0]} {expected[2]} from {expected[1]}")
+        rules = next(d for d in rendered["gpuready"]["docs"] if d.get("kind") == "ClusterRole")["rules"]
+        if dra and not any("resourceslices" in r.get("resources", []) for r in rules):
+            fail(f"task gpuready ({variant}): counts ResourceSlices without RBAC to list them")
         if env.get("CAPACITY_NODE_SELECTOR") != "workload.example.com/pool=gpu-compute":
             fail(f"task gpuready ({variant}): capacity is not counted on the GPU pool")
     if "dcgmready" in rendered:
         env = rendered["dcgmready"]["env"]
-        if (env.get("WAIT_RESOURCE"), env.get("WAIT_CONDITION")) != ("daemonset/nvidia-dcgm", "rollout"):
-            fail(f"task dcgmready ({variant}): must wait for daemonset/nvidia-dcgm to roll out, which covers any number of GPU workers")
+        expected = f"daemonset/{facts['dcgmDaemonSet']}"
+        if (env.get("WAIT_RESOURCE"), env.get("WAIT_CONDITION")) != (expected, "rollout"):
+            fail(f"task dcgmready ({variant}): must wait for {expected} to roll out, which covers any number of GPU workers")
         if env.get("CONTRACT_NAME"):
             fail(f"task dcgmready ({variant}): publishes a contract; only gpuready does")
     if "gpu-smoke-test" in rendered:
@@ -469,12 +537,33 @@ for variant, overrides in VARIANTS.items():
             fail(f"task gpu-smoke-test ({variant}): does not select the GPU pool from the gate's contract")
         if not any(t.get("key") == "nvidia.com/gpu" for t in pod.get("tolerations") or []):
             fail(f"task gpu-smoke-test ({variant}): does not tolerate the GPU taint")
+        res = pod["containers"][0].get("resources") or {}
+        if dra:
+            rcts = [d for d in rendered["gpu-smoke-test"]["docs"] if d.get("kind") == "ResourceClaimTemplate"]
+            claims = pod.get("resourceClaims") or []
+            if (len(rcts) != 1 or [c.get("resourceClaimTemplateName") for c in claims] != [rcts[0]["metadata"]["name"]]
+                    or [c["name"] for c in res.get("claims") or []] != [c["name"] for c in claims]):
+                fail(f"task gpu-smoke-test ({variant}): must request its GPU through one ResourceClaimTemplate")
+            elif [r["exactly"]["deviceClassName"] for r in rcts[0]["spec"]["spec"]["devices"]["requests"]] != ["gpu.nvidia.com"]:
+                fail(f"task gpu-smoke-test ({variant}): the claim must use DeviceClass gpu.nvidia.com")
+            if "nvidia.com/gpu" in (res.get("limits") or {}):
+                fail(f"task gpu-smoke-test ({variant}): requests nvidia.com/gpu, which the DRA stack never advertises")
+        elif "nvidia.com/gpu" not in (res.get("limits") or {}) or pod.get("resourceClaims"):
+            fail(f"task gpu-smoke-test ({variant}): must request nvidia.com/gpu with the device plugin")
     if "nvsentinel" in rendered:
         hv = rendered["nvsentinel"]["values"]
         if hv["global"]["dcgm"]["service"]["endpoint"] != contract.get("dcgmHost"):
             fail(f"task nvsentinel ({variant}): DCGM endpoint does not come from the gate's contract")
         if str(hv["labeler"]["assumeDriverInstalled"]).lower() != str(values["driverPreinstalled"]):
             fail(f"task nvsentinel ({variant}): labeler.assumeDriverInstalled disagrees with driverPreinstalled")
+        # The chart fails on anything but a YAML boolean here.
+        if hv["global"].get("gpuDraEnabled") is not dra:
+            fail(f"task nvsentinel ({variant}): global.gpuDraEnabled={hv['global'].get('gpuDraEnabled')!r} for mode {mode}")
+        if dra and ((((hv.get("janitor") or {}).get("config") or {}).get("controllers") or {}).get("gpuReset") or {}).get("resetJob", {}).get("runtimeClassName") != "":
+            fail(f"task nvsentinel ({variant}): janitor's reset Job must not use the nvidia RuntimeClass in DRA mode")
+        label = rendered["nvsentinel"]["syncPolicy"].get("managedNamespaceMetadata", {}).get("labels", {}).get("resource.kubernetes.io/admin-access")
+        if label != ("true" if dra else "false"):
+            fail(f"task nvsentinel ({variant}): namespace label resource.kubernetes.io/admin-access={label!r} for mode {mode}; DRA admin-access claims need 'true'")
         # cert-manager is a production prerequisite, not part of this Stack: every NVSentinel
         # component that needs it stays off.
         g = hv["global"]

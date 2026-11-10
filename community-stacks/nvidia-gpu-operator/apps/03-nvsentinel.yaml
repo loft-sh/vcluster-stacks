@@ -1,5 +1,11 @@
 # CPU controllers and GPU node agents use the pool labels from node-profiles.yaml.
 # platformConnector is a node-local socket service, so it stays with GPU health monitors.
+#
+# gpuDriverMode must match the GPU Operator's. With dra, the metadata-collector holds a DRA
+# admin-access ResourceClaim on each node's GPUs instead of running with the `nvidia` RuntimeClass,
+# which the DRA stack does not create. Kubernetes admits admin-access claims only in a namespace
+# labeled resource.kubernetes.io/admin-access=true, and the chart does not set it, so Argo CD labels
+# the namespace it creates. The label is "false" in device-plugin mode, which grants nothing.
 apiVersion: management.loft.sh/v1
 kind: ArgoCDApplicationTemplate
 metadata:
@@ -22,7 +28,7 @@ spec:
       type: string
       required: true
       # renovate: datasource=github-releases depName=NVIDIA/NVSentinel
-      defaultValue: v1.13.0
+      defaultValue: v1.31.0
     - variable: project
       label: Argo CD Project
       type: string
@@ -32,6 +38,13 @@ spec:
       label: NVIDIA Driver Preinstalled
       type: boolean
       defaultValue: 'false'
+    - variable: gpuDriverMode
+      label: GPU Driver Mode
+      description: Must match the GPU Operator. Inside the Stack, the discover task supplies it.
+      options:
+        - device-plugin
+        - dra
+      defaultValue: device-plugin
     - variable: dcgmHost
       label: DCGM Service Host
       description: Supplied by the gpuready gate's contract when this template runs inside the nvidia-gpu-operator Stack.
@@ -54,8 +67,11 @@ spec:
         helm:
           releaseName: nvsentinel
           values: |
+            {{- $dra := eq (.Values.gpuDriverMode | default "device-plugin") "dra" }}
             global:
               dryRun: true
+              # A YAML boolean: the chart fails on a quoted value.
+              gpuDraEnabled: {{ $dra }}
               image:
                 tag: '{{ .Values.version }}'
               dcgm:
@@ -112,6 +128,16 @@ spec:
             janitor-provider:
               csp:
                 provider: kind
+            {{- if $dra }}
+            # Janitor is off in this dry-run setup. Set anyway, so enabling it in DRA mode does not
+            # fail the render: the janitor chart refuses the default `nvidia` RuntimeClass there.
+            janitor:
+              config:
+                controllers:
+                  gpuReset:
+                    resetJob:
+                      runtimeClassName: ""
+            {{- end }}
             mongodb-store:
               mongodb:
                 persistence:
@@ -132,6 +158,9 @@ spec:
                 workload.example.com/pool: {{ .Values.cpuNodePool | quote }}
               tolerations: []
       syncPolicy:
+        managedNamespaceMetadata:
+          labels:
+            resource.kubernetes.io/admin-access: '{{ if eq (.Values.gpuDriverMode | default "device-plugin") "dra" }}true{{ else }}false{{ end }}'
         automated:
           prune: true
           selfHeal: true
