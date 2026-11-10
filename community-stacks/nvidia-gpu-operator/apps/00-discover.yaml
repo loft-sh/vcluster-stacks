@@ -1,0 +1,271 @@
+# Decides how Kubernetes consumes GPUs in this cluster, before anything GPU-related installs, and
+# publishes the names every later task needs for that mode.
+#
+# The GPU Operator runs one of two mutually exclusive stacks, chosen by which CR it deploys:
+#   device-plugin  ClusterPolicy: device plugin, container toolkit, `nvidia` RuntimeClass; pods
+#                  request the nvidia.com/gpu extended resource.
+#   dra            GPUCluster (experimental): the NVIDIA DRA driver publishes each GPU in a
+#                  ResourceSlice; pods request GPUs through ResourceClaims (DeviceClass
+#                  gpu.nvidia.com). No device plugin, no toolkit, no RuntimeClass, and the DCGM
+#                  operands are named *-dra.
+# NVSentinel, the readiness gates and the smoke test must all follow the same mode, so this task
+# decides it once and the rest of the Stack reads the outputs.
+#
+# gpuDriverMode=auto keeps whatever the cluster already runs: an existing GPUCluster means dra, an
+# existing ClusterPolicy means device-plugin, and a cluster without the GPU Operator gets
+# device-plugin. Setting device-plugin or dra explicitly skips detection.
+#
+# Same Job pattern as the readiness gate: `wait: true` holds the task until the Job completes, the
+# release owns the ConfigMap, and the Job adds only keys the release does not declare, so a Helm
+# upgrade with unchanged settings keeps the decision. A changed setting names a new Job, which
+# decides again.
+#
+# Stack-driven AppInstances do not apply App parameter defaults. Every value is guarded with `default`.
+apiVersion: management.loft.sh/v1
+kind: App
+metadata:
+  name: nvidia-gpu-operator-discover
+  labels:
+    app.kubernetes.io/part-of: nvidia-gpu-operator-stack
+spec:
+  displayName: NVIDIA GPU Stack - Discover GPU Driver Mode
+  description: >-
+    Decides whether the GPU stack runs with the device plugin or with DRA, from the gpuDriverMode
+    parameter or the GPU Operator CR already in the cluster, and publishes the mode-specific names
+    the later tasks use.
+  # Stack outputs can be read only from a namespace a task deploys into.
+  defaultNamespace: gpu-stack
+  wait: true
+  timeout: 5m
+  config:
+    manifests: |-
+      {{- define "discover.labels" -}}
+      app.kubernetes.io/name: nvidia-gpu-operator-discover
+      app.kubernetes.io/instance: {{ .Release.Name | quote }}
+      {{- end -}}
+
+      {{- define "discover.script" -}}
+      set -eu
+
+      log() { echo "$(date -u '+%H:%M:%S') [discover] $*"; }
+      fail() { log "ERROR: $*" >&2; exit 1; }
+
+      # Objects of a cluster-scoped kind. A kind whose CRD is not installed counts as 0; any other
+      # error, such as missing RBAC, fails the Job instead of being mistaken for "none".
+      count() {
+        if out=$(kubectl get "$1" -o name 2>&1); then
+          printf '%s\n' "$out" | grep -c . || true
+        else
+          case "$out" in
+            *"doesn't have a resource type"*|*"could not find the requested resource"*) echo 0 ;;
+            *) fail "could not list $1: $out" ;;
+          esac
+        fi
+      }
+
+      cp=$(count clusterpolicies.nvidia.com)
+      gc=$(count gpuclusters.nvidia.com)
+      log "found ${cp} ClusterPolicy and ${gc} GPUCluster"
+
+      case "$REQUESTED_MODE" in
+        auto)
+          if [ "$cp" -gt 0 ] && [ "$gc" -gt 0 ]; then
+            fail "both a ClusterPolicy and a GPUCluster exist, which the GPU Operator rejects. Delete the one you do not use (kubectl delete gpucluster gpu-cluster, or kubectl delete clusterpolicy cluster-policy), or set gpuDriverMode explicitly."
+          elif [ "$gc" -gt 0 ]; then
+            mode=dra; source="existing GPUCluster"
+          elif [ "$cp" -gt 0 ]; then
+            mode=device-plugin; source="existing ClusterPolicy"
+          else
+            mode=device-plugin; source="default, no GPU Operator CR yet"
+          fi
+          ;;
+        device-plugin)
+          mode=device-plugin; source="gpuDriverMode parameter"
+          if [ "$gc" -gt 0 ]; then
+            # The chart marks its GPUCluster helm.sh/resource-policy: keep, so switching back from
+            # dra can leave it behind next to the new ClusterPolicy.
+            log "WARNING: a GPUCluster exists. If it is still there after the gpu-operator task syncs, delete it: kubectl delete gpucluster gpu-cluster"
+          fi
+          ;;
+        dra)
+          mode=dra; source="gpuDriverMode parameter"
+          ;;
+        *)
+          fail "gpuDriverMode must be auto, device-plugin or dra, got '${REQUESTED_MODE}'"
+          ;;
+      esac
+
+      # The GPU Operator always installs into gpu-operator in this Stack. The CR names are the
+      # chart's fixed names.
+      if [ "$mode" = dra ]; then
+        dcgm_daemonset=nvidia-dcgm-dra
+        operator_resource=gpucluster/gpu-cluster
+        operator_resources=gpuclusters
+        capacity_source=resourceslices
+        capacity_resource=gpu.nvidia.com
+      else
+        dcgm_daemonset=nvidia-dcgm
+        operator_resource=clusterpolicy/cluster-policy
+        operator_resources=clusterpolicies
+        capacity_source=allocatable
+        capacity_resource=nvidia.com/gpu
+      fi
+
+      kubectl -n "$CONTRACT_NAMESPACE" patch configmap "$CONTRACT_NAME" --type merge -p "$(printf \
+        '{"data":{"mode":"%s","source":"%s","dcgmHost":"%s.gpu-operator.svc","dcgmDaemonSet":"%s","operatorResource":"%s","operatorResources":"%s","capacitySource":"%s","capacityResource":"%s","discoveredAt":"%s"}}' \
+        "$mode" "$source" "$dcgm_daemonset" "$dcgm_daemonset" "$operator_resource" "$operator_resources" \
+        "$capacity_source" "$capacity_resource" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')")" >/dev/null \
+        || fail "could not record the result in configmap ${CONTRACT_NAMESPACE}/${CONTRACT_NAME}"
+      log "gpuDriverMode=${mode} (${source})"
+      {{- end -}}
+
+      {{- $requested := .Values.gpuDriverMode | default "auto" -}}
+      {{- /* A Job spec is immutable. Changing any setting names a new Job, which also decides again. */ -}}
+      {{- $hash := printf "%s|%s" $requested (.Values.cpuNodeSelector | default "") | sha256sum | trunc 8 -}}
+      # The Job adds the decision to this ConfigMap. `kubectl -n gpu-stack get cm gpu-driver-mode -o yaml`
+      # shows what was decided and why.
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: gpu-driver-mode
+        labels:
+          {{- include "discover.labels" . | nindent 4 }}
+      data:
+        requestedMode: {{ $requested | quote }}
+      ---
+      apiVersion: v1
+      kind: ServiceAccount
+      metadata:
+        name: {{ .Release.Name | trunc 50 | trimSuffix "-" }}-discover
+        labels:
+          {{- include "discover.labels" . | nindent 4 }}
+      ---
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: Role
+      metadata:
+        name: {{ .Release.Name | trunc 50 | trimSuffix "-" }}-discover
+        labels:
+          {{- include "discover.labels" . | nindent 4 }}
+      rules:
+        - apiGroups: [""]
+          resources: ["configmaps"]
+          resourceNames: ["gpu-driver-mode"]
+          verbs: ["get", "patch"]
+      ---
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: RoleBinding
+      metadata:
+        name: {{ .Release.Name | trunc 50 | trimSuffix "-" }}-discover
+        labels:
+          {{- include "discover.labels" . | nindent 4 }}
+      subjects:
+        - kind: ServiceAccount
+          name: {{ .Release.Name | trunc 50 | trimSuffix "-" }}-discover
+          namespace: {{ .Release.Namespace }}
+      roleRef:
+        apiGroup: rbac.authorization.k8s.io
+        kind: Role
+        name: {{ .Release.Name | trunc 50 | trimSuffix "-" }}-discover
+      ---
+      # Read-only: the two GPU Operator CRs, to tell which mode the cluster already runs.
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: ClusterRole
+      metadata:
+        name: {{ .Release.Name | trunc 40 | trimSuffix "-" }}-discover-{{ .Release.Namespace }}
+        labels:
+          {{- include "discover.labels" . | nindent 4 }}
+      rules:
+        - apiGroups: ["nvidia.com"]
+          resources: ["clusterpolicies", "gpuclusters"]
+          verbs: ["get", "list"]
+      ---
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: ClusterRoleBinding
+      metadata:
+        name: {{ .Release.Name | trunc 40 | trimSuffix "-" }}-discover-{{ .Release.Namespace }}
+        labels:
+          {{- include "discover.labels" . | nindent 4 }}
+      subjects:
+        - kind: ServiceAccount
+          name: {{ .Release.Name | trunc 50 | trimSuffix "-" }}-discover
+          namespace: {{ .Release.Namespace }}
+      roleRef:
+        apiGroup: rbac.authorization.k8s.io
+        kind: ClusterRole
+        name: {{ .Release.Name | trunc 40 | trimSuffix "-" }}-discover-{{ .Release.Namespace }}
+      ---
+      # No ttlSecondsAfterFinished: the completed Job and its log stay until the release is removed.
+      apiVersion: batch/v1
+      kind: Job
+      metadata:
+        name: {{ .Release.Name | trunc 40 | trimSuffix "-" }}-discover-{{ $hash }}
+        labels:
+          {{- include "discover.labels" . | nindent 4 }}
+      spec:
+        backoffLimit: 1
+        activeDeadlineSeconds: 240
+        template:
+          metadata:
+            labels:
+              {{- include "discover.labels" . | nindent 8 }}
+          spec:
+            serviceAccountName: {{ .Release.Name | trunc 50 | trimSuffix "-" }}-discover
+            restartPolicy: Never
+            {{- with .Values.cpuNodeSelector }}
+            {{- $kv := splitn "=" 2 . }}
+            nodeSelector:
+              {{ $kv._0 }}: {{ $kv._1 | quote }}
+            {{- end }}
+            securityContext:
+              runAsNonRoot: true
+              seccompProfile:
+                type: RuntimeDefault
+            containers:
+              - name: discover
+                image: {{ .Values.__image__ | quote }}
+                securityContext:
+                  allowPrivilegeEscalation: false
+                  readOnlyRootFilesystem: true
+                  capabilities:
+                    drop: ["ALL"]
+                resources:
+                  requests:
+                    cpu: 50m
+                    memory: 64Mi
+                  limits:
+                    cpu: 500m
+                    memory: 256Mi
+                env:
+                  # kubectl writes a discovery cache under $HOME. The root filesystem is read-only.
+                  - name: HOME
+                    value: /tmp
+                  - name: KUBECACHEDIR
+                    value: /tmp/.kube-cache
+                  - name: REQUESTED_MODE
+                    value: {{ $requested | quote }}
+                  - name: CONTRACT_NAME
+                    value: gpu-driver-mode
+                  - name: CONTRACT_NAMESPACE
+                    value: {{ .Release.Namespace | quote }}
+                command: ["sh", "-c"]
+                args:
+                  - |
+      {{ include "discover.script" . | indent 20 }}
+                volumeMounts:
+                  - name: tmp
+                    mountPath: /tmp
+            volumes:
+              - name: tmp
+                emptyDir: {}
+  parameters:
+    - variable: gpuDriverMode
+      label: GPU driver mode
+      description: >-
+        How Kubernetes consumes GPUs. auto follows the GPU Operator CR already in the cluster and
+        falls back to device-plugin. device-plugin or dra skips detection.
+      options: ["auto", "device-plugin", "dra"]
+      defaultValue: auto
+    - variable: cpuNodeSelector
+      label: CPU node selector
+      description: Optional key=value label selector for the node that runs the Job.
+      type: string
