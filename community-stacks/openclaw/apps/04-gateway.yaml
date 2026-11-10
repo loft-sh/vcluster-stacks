@@ -190,7 +190,7 @@ spec:
       type: string
       required: true
       # renovate: datasource=docker depName=ghcr.io/openclaw/openclaw
-      defaultValue: ghcr.io/openclaw/openclaw:2026.11.1
+      defaultValue: ghcr.io/openclaw/openclaw:2026.11.3
     - variable: proxyImage
       label: Proxy image
       type: string
