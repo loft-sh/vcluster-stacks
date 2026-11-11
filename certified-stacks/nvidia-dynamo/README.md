@@ -39,7 +39,7 @@ Install the Stack at most once per destination. The operator, its CRDs, and its 
 
 | Parameter | Default | Description |
 | --- | --- | --- |
-| `version` | `1.5.0` | Version of the `dynamo-platform` Helm chart. |
+| `version` | `1.6.2` | Version of the `dynamo-platform` Helm chart. |
 | `namespace` | `dynamo-system` | Namespace the runtime is installed into. |
 
 ## Install

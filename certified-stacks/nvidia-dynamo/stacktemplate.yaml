@@ -15,7 +15,7 @@ spec:
       description: Version of the dynamo-platform Helm chart.
       type: string
       required: true
-      defaultValue: "1.5.0"
+      defaultValue: "1.6.2"
       validation: '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'
     - variable: namespace
       label: Namespace

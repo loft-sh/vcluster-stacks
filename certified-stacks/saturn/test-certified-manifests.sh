@@ -116,7 +116,10 @@ MANIFESTS
 echo "ok manifests"
 
 { read -r chart; read -r repo; read -r version; } < "$work/chart"
-if ! helm template saturn "$repo/$chart" --version "$version" --namespace saturn-system --kube-version 1.33.0 > "$work/rendered.yaml"; then
+# The chart refuses to render without domain or customerName. The App always passes both, so give
+# it a placeholder customerName, as a real install would.
+if ! helm template saturn "$repo/$chart" --version "$version" --namespace saturn-system --kube-version 1.33.0 \
+  --set customerName=test > "$work/rendered.yaml"; then
   echo "FAIL $chart $version from $repo does not render" >&2
   exit 1
 fi
