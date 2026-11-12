@@ -1,0 +1,367 @@
+# NVSentinel's Slinky drainer: drains a GPU node that runs Slurm workers through Slurm, not pod eviction.
+#
+# With customDrain on, NVSentinel's node-drainer hands nodes matching slinkyNodeSelector to this
+# controller as a DrainRequest. The controller sets the node's cordon reason, which the Slinky
+# operator uses when it puts the Slurm node in DRAIN after NVSentinel's cordon. It then waits until
+# every Ready Slurm worker pod on the node reports DRAIN with no allocated, mixed or completing
+# jobs, and deletes the pods in slinkyNamespace on that node. Nodes not matching the selector keep
+# the built-in eviction path.
+#
+# Upstream ships the plugin only as kustomize manifests (plugins/slinky-drainer/config/default in
+# NVIDIA/NVSentinel), so they are copied here from the tag in `version`. Re-sync them on a version
+# bump. The image is published by the same release pipeline, so one version pins both.
+#
+# Rendered empty unless `enabled` is "true", so the Stack can always run this task. The Stack
+# passes enabled=true only with cordon, drain and nvsentinelSlinkyDrain all on, and the nvsentinel
+# task depends on this one: node-drainer mounts the drain template ConfigMap and creates
+# DrainRequests, so both must exist before it starts.
+#
+# The CRD is a normal template, not under crds/: it is upgraded with the release and removed, with
+# any open DrainRequests, when the task is disabled or removed.
+#
+# Stack-driven AppInstances do not apply App parameter defaults. Every value is guarded with `default`.
+apiVersion: management.loft.sh/v1
+kind: App
+metadata:
+  name: nvidia-gpu-operator-slinky-drainer
+  labels:
+    app.kubernetes.io/part-of: nvidia-gpu-operator-stack
+spec:
+  displayName: NVIDIA GPU Stack - NVSentinel Slinky Drainer
+  description: Drains Slurm worker nodes through Slurm when NVSentinel cordons them. Renders nothing unless enabled.
+  # node-drainer mounts the drain template from its own namespace.
+  defaultNamespace: nvsentinel
+  wait: true
+  timeout: 10m
+  config:
+    manifests: |-
+      {{- if eq (.Values.enabled | toString) "true" }}
+      {{- $version := .Values.version | default "v1.31.0" }}
+      {{- $labels := printf "app.kubernetes.io/name: slinky-drainer\napp.kubernetes.io/instance: %s\napp.kubernetes.io/part-of: nvidia-gpu-operator-stack" (.Release.Name | quote) }}
+      apiVersion: apiextensions.k8s.io/v1
+      kind: CustomResourceDefinition
+      metadata:
+        annotations:
+          controller-gen.kubebuilder.io/version: v0.23.0
+        labels:
+          {{- $labels | nindent 4 }}
+        name: drainrequests.nvsentinel.nvidia.com
+      spec:
+        group: nvsentinel.nvidia.com
+        names:
+          kind: DrainRequest
+          listKind: DrainRequestList
+          plural: drainrequests
+          singular: drainrequest
+        scope: Namespaced
+        versions:
+        - name: v1alpha1
+          schema:
+            openAPIV3Schema:
+              properties:
+                apiVersion:
+                  description: |-
+                    APIVersion defines the versioned schema of this representation of an object.
+                    Servers should convert recognized schemas to the latest internal value, and
+                    may reject unrecognized values.
+                    More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+                  type: string
+                kind:
+                  description: |-
+                    Kind is a string value representing the REST resource this object represents.
+                    Servers may infer this from the endpoint the client submits requests to.
+                    Cannot be updated.
+                    In CamelCase.
+                    More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+                  type: string
+                metadata:
+                  type: object
+                spec:
+                  properties:
+                    checkName:
+                      type: string
+                    entitiesImpacted:
+                      items:
+                        properties:
+                          type:
+                            type: string
+                          value:
+                            type: string
+                        type: object
+                      type: array
+                    errorCode:
+                      items:
+                        type: string
+                      type: array
+                    healthEventID:
+                      type: string
+                    metadata:
+                      additionalProperties:
+                        type: string
+                      type: object
+                    nodeName:
+                      type: string
+                    podsToDrain:
+                      additionalProperties:
+                        items:
+                          type: string
+                        type: array
+                      type: object
+                    reason:
+                      type: string
+                    recommendedAction:
+                      type: string
+                  required:
+                  - nodeName
+                  type: object
+                status:
+                  properties:
+                    conditions:
+                      items:
+                        description: Condition contains details for one aspect of the current
+                          state of this API Resource.
+                        properties:
+                          lastTransitionTime:
+                            description: |-
+                              lastTransitionTime is the last time the condition transitioned from one status to another.
+                              This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                            format: date-time
+                            type: string
+                          message:
+                            description: |-
+                              message is a human readable message indicating details about the transition.
+                              This may be an empty string.
+                            maxLength: 32768
+                            type: string
+                          observedGeneration:
+                            description: |-
+                              observedGeneration represents the .metadata.generation that the condition was set based upon.
+                              For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                              with respect to the current state of the instance.
+                            format: int64
+                            minimum: 0
+                            type: integer
+                          reason:
+                            description: |-
+                              reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                              Producers of specific condition types may define expected values and meanings for this field,
+                              and whether the values are considered a guaranteed API.
+                              The value should be a CamelCase string.
+                              This field may not be empty.
+                            maxLength: 1024
+                            minLength: 1
+                            pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                            type: string
+                          status:
+                            description: status of the condition, one of True, False, Unknown.
+                            enum:
+                            - "True"
+                            - "False"
+                            - Unknown
+                            type: string
+                          type:
+                            description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                            maxLength: 316
+                            pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                            type: string
+                        required:
+                        - lastTransitionTime
+                        - message
+                        - reason
+                        - status
+                        - type
+                        type: object
+                      type: array
+                  type: object
+              type: object
+          served: true
+          storage: true
+          subresources:
+            status: {}
+      ---
+      apiVersion: v1
+      kind: ServiceAccount
+      metadata:
+        name: slinky-drainer
+        labels:
+          {{- $labels | nindent 4 }}
+      ---
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: ClusterRole
+      metadata:
+        name: slinky-drainer-role
+        labels:
+          {{- $labels | nindent 4 }}
+      rules:
+        - apiGroups: ["nvsentinel.nvidia.com"]
+          resources: ["drainrequests"]
+          verbs: ["get", "list", "watch", "update", "patch"]
+        - apiGroups: ["nvsentinel.nvidia.com"]
+          resources: ["drainrequests/status"]
+          verbs: ["get", "update", "patch"]
+        - apiGroups: ["nvsentinel.nvidia.com"]
+          resources: ["drainrequests/finalizers"]
+          verbs: ["update"]
+        - apiGroups: [""]
+          resources: ["nodes"]
+          verbs: ["get", "list", "watch", "update", "patch"]
+        - apiGroups: [""]
+          resources: ["pods"]
+          verbs: ["get", "list", "delete", "watch"]
+        - apiGroups: [""]
+          resources: ["events"]
+          verbs: ["create", "patch"]
+      ---
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: ClusterRoleBinding
+      metadata:
+        name: slinky-drainer-rolebinding
+        labels:
+          {{- $labels | nindent 4 }}
+      roleRef:
+        apiGroup: rbac.authorization.k8s.io
+        kind: ClusterRole
+        name: slinky-drainer-role
+      subjects:
+        - kind: ServiceAccount
+          name: slinky-drainer
+          namespace: {{ .Release.Namespace }}
+      ---
+      # node-drainer renders this into a DrainRequest. It is a Go template itself, so it sits in a raw
+      # string that this App's own render leaves alone.
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: slinky-drain-template
+        labels:
+          {{- $labels | nindent 4 }}
+      data:
+        drain-template.yaml: |-
+      {{ `apiVersion: nvsentinel.nvidia.com/v1alpha1
+      kind: DrainRequest
+      spec:
+        nodeName: {{ .HealthEvent.NodeName }}
+        checkName: {{ .HealthEvent.CheckName }}
+        recommendedAction: {{ .HealthEvent.RecommendedAction.String }}
+        errorCode:
+        {{- range .HealthEvent.ErrorCode }}
+        - "{{ . }}"
+        {{- end }}
+        healthEventID: {{ .EventID }}
+        entitiesImpacted:
+        {{- range .HealthEvent.EntitiesImpacted }}
+        - type: {{ .EntityType }}
+          value: "{{ .EntityValue }}"
+        {{- end }}
+        reason: "{{ .HealthEvent.Message }}"
+        podsToDrain:
+        {{- range $namespace, $pods := .PodsToDrain }}
+          {{ $namespace }}:
+          {{- range $pods }}
+          - {{ . }}
+          {{- end }}
+        {{- end }}` | indent 4 }}
+      ---
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: slinky-drainer
+        labels:
+          {{- $labels | nindent 4 }}
+      spec:
+        # The controller runs without leader election.
+        replicas: 1
+        selector:
+          matchLabels:
+            app.kubernetes.io/name: slinky-drainer
+            app.kubernetes.io/instance: {{ .Release.Name | quote }}
+        template:
+          metadata:
+            labels:
+              {{- $labels | nindent 8 }}
+            annotations:
+              kubectl.kubernetes.io/default-container: controller
+          spec:
+            serviceAccountName: slinky-drainer
+            nodeSelector:
+              kubernetes.io/os: linux
+              workload.example.com/pool: {{ .Values.cpuNodePool | default "cpu-services" | quote }}
+            securityContext:
+              runAsNonRoot: true
+              seccompProfile:
+                type: RuntimeDefault
+            containers:
+              - name: controller
+                image: ghcr.io/nvidia/nvsentinel/slinky-drainer:{{ $version }}
+                imagePullPolicy: IfNotPresent
+                args:
+                  - --pod-check-interval=5s
+                  # Parsed but not enforced by the controller in v1.31.0; node-drainer's
+                  # customDrain.timeout is what fails a drain that never completes.
+                  - --drain-timeout=30m
+                  - --slinky-namespace={{ .Values.slinkyNamespace | default "slurm" }}
+                  - --metrics-bind-address=:8080
+                  - --health-probe-bind-address=:8081
+                securityContext:
+                  allowPrivilegeEscalation: false
+                  capabilities:
+                    drop:
+                      - ALL
+                  readOnlyRootFilesystem: true
+                ports:
+                  - name: metrics
+                    containerPort: 8080
+                    protocol: TCP
+                  - name: health
+                    containerPort: 8081
+                    protocol: TCP
+                livenessProbe:
+                  httpGet:
+                    path: /healthz
+                    port: health
+                  initialDelaySeconds: 15
+                  periodSeconds: 20
+                  timeoutSeconds: 5
+                  failureThreshold: 3
+                readinessProbe:
+                  httpGet:
+                    path: /readyz
+                    port: health
+                  initialDelaySeconds: 5
+                  periodSeconds: 10
+                  timeoutSeconds: 5
+                  failureThreshold: 3
+                resources:
+                  limits:
+                    cpu: 500m
+                    memory: 256Mi
+                  requests:
+                    cpu: 100m
+                    memory: 128Mi
+            terminationGracePeriodSeconds: 10
+      {{- end }}
+  parameters:
+    - variable: enabled
+      label: Enabled
+      description: Deploy the Slinky drainer. Off renders nothing. Inside the Stack this is on only with
+        cordon, drain and nvsentinelSlinkyDrain all on.
+      type: boolean
+      defaultValue: 'false'
+    - variable: version
+      label: NVSentinel Version
+      description: Tag of the slinky-drainer image and of the upstream manifests copied here. Keep it equal to
+        the NVSentinel chart version.
+      type: string
+      # renovate: datasource=github-releases depName=NVIDIA/NVSentinel
+      defaultValue: v1.31.0
+    - variable: slinkyNamespace
+      label: Slinky Namespace
+      description: Namespace of the Slurm worker pods, slurm in a default Slinky install. On a drained node the
+        controller deletes every pod in it.
+      type: string
+      defaultValue: slurm
+    - variable: cpuNodePool
+      label: CPU Service Pool Label
+      description: Value of workload.example.com/pool on CPU service workers, where the controller runs.
+      type: string
+      defaultValue: cpu-services
