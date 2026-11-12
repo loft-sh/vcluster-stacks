@@ -52,7 +52,7 @@ jobs:
       # renovate: datasource=github-releases depName=loft-sh/vcluster
       VCLUSTER_VERSION: ${{ github.event.inputs.vcluster_version || 'v0.37.1' }}
       # renovate: datasource=github-releases depName=loft-sh/loft extractVersion=^v(?<version>.+)$
-      PLATFORM_VERSION: ${{ github.event.inputs.platform_version || '4.12.0' }}
+      PLATFORM_VERSION: ${{ github.event.inputs.platform_version || '4.12.6' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
