@@ -12,7 +12,7 @@ spec:
     chart:
       name: saturn-helm-operator
       repoURL: oci://ghcr.io/saturncloud/charts
-      version: 2026.06.01-1
+      version: 2026.06.01-69
     values: |-
       createNamespaces: {{ .Values.createNamespaces }}
 

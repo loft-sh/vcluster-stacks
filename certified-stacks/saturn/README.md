@@ -8,7 +8,7 @@ The files in this directory are the source manifests for the `saturn-enterprise`
 
 The `saturn-enterprise` StackTemplate has two App tasks:
 
-- `helm` installs the `saturn-helm-operator` Helm chart, version `2026.06.01-1`, from `oci://ghcr.io/saturncloud/charts` into the `saturn-system` namespace of the destination the StackInstance selects: a tenant cluster or a control plane cluster. Helm waits up to 30 minutes for the release.
+- `helm` installs the `saturn-helm-operator` Helm chart, version `2026.06.01-69`, from `oci://ghcr.io/saturncloud/charts` into the `saturn-system` namespace of the destination the StackInstance selects: a tenant cluster or a control plane cluster. Helm waits up to 30 minutes for the release.
 - `bash` runs after `helm` is healthy. It is a Job in the vCluster Platform image, which Platform provides as `__image__`, with a ClusterRole that can get, patch, and update nodes. It labels each node in `nodeNames` with `node.saturncloud.io/role=<nodeRole>` and, when `taintSystemNodes` is `true`, taints it with `node.saturncloud.io/role=<nodeRole>:NoSchedule`. The Job exits successfully when `nodeNames` and `nodeRole` are both empty, fails when only one of them is set, and waits up to 5 minutes for each node to exist.
 
 The chart release contains:
@@ -66,9 +66,9 @@ Install the Stack at most once per destination. The CRDs are cluster-scoped, and
 | `region` | string | | Required. Region of your cluster, for example `us-east-1`. |
 | `availabilityZone` | string | | Availability zone of your cluster. Can match `region` when the cluster has no distinct zones. |
 | `bootstrapToken` | password | | Bootstrap token from activation. Valid for 4 hours. |
-| `domain` | string | | Domain from registration: `<customerName>.saturnenterprise.io`. |
+| `domain` | string | | Domain from registration: `<customerName>.saturnenterprise.io`. Set `domain` or `customerName`; the chart fails without one. |
 | `adminEmail` | string | | Administrator email from registration, for example `admin@example.com`. |
-| `customerName` | string | | Organization name from registration, for example `my-org`. |
+| `customerName` | string | | Organization name from registration, for example `my-org`. Set `domain` or `customerName`; the chart fails without one. |
 | `baseUrl` | string | | Base URL from registration: `https://app.<customerName>.saturnenterprise.io`. |
 | `sshDomain` | string | | SSH domain from registration: `ssh.<customerName>.saturnenterprise.io`. |
 | `createNamespaces` | boolean | `true` | Create the `saturn`, `ingress`, `cert-manager`, `logging`, and `monitoring` namespaces. |
