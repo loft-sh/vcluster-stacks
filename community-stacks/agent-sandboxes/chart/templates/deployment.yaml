@@ -1,0 +1,140 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "vbox.fullname" . }}
+  namespace: {{ include "vbox.namespace" . }}
+  labels:
+    {{- include "vbox.labels" . | nindent 4 }}
+spec:
+  # One replica, replaced rather than rolled: the audit trail and sessions are
+  # SQLite on a ReadWriteOnce volume, and the hash chain needs a single writer.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "vbox.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "vbox.labels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ .Values.serviceAccount.name }}
+      # vBox calls the Kubernetes API with this ServiceAccount's token.
+      automountServiceAccountToken: true
+      enableServiceLinks: false
+      {{- if or .Values.imagePullSecrets .Values.registryCredentials.create }}
+      imagePullSecrets:
+        {{- with .Values.imagePullSecrets }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        {{- if .Values.registryCredentials.create }}
+        - name: {{ include "vbox.fullname" . }}-registry
+        {{- end }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: vbox
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: 3000
+              protocol: TCP
+          env:
+            - name: VBOX_DATA_DIR
+              value: /data
+            # The settings Secret: the one in this namespace with this annotation.
+            - name: VBOX_OIDC_SECRET_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: VBOX_OIDC_SECRET_ANNOTATION
+              value: {{ .Values.oidc.annotation | quote }}
+            {{- with .Values.publicUrl }}
+            - name: VBOX_PUBLIC_URL
+              value: {{ . | quote }}
+            {{- end }}
+            {{- if .Values.disableAuth }}
+            - name: VBOX_AUTH
+              value: "off"
+            {{- end }}
+            {{- if .Values.collector.enabled }}
+            - name: VBOX_ROUTER_NAMESPACE
+              value: {{ .Values.collector.routerNamespace | quote }}
+            - name: VBOX_ROUTER_SELECTOR
+              value: {{ .Values.collector.routerSelector | quote }}
+            {{- else }}
+            - name: VBOX_COLLECTOR
+              value: "off"
+            {{- end }}
+          startupProbe:
+            httpGet:
+              path: /api/healthz
+              port: http
+            periodSeconds: 2
+            failureThreshold: 30
+          readinessProbe:
+            httpGet:
+              path: /api/healthz
+              port: http
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /api/healthz
+              port: http
+            periodSeconds: 20
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            # Next.js writes its cache here at runtime; the root filesystem is read-only.
+            - name: next-cache
+              mountPath: /app/.next/cache
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: data
+          {{- if .Values.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "vbox.dataClaim" . }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        - name: next-cache
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

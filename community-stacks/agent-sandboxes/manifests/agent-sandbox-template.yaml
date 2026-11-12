@@ -1,0 +1,269 @@
+# Tenant cluster template: creates a NEW tenant cluster with auto-scaling EC2
+# private nodes and the agent sandbox Stack preinstalled.
+#
+# Apply it to the management API, then create tenant clusters from it:
+#   vcluster platform connect management
+#   kubectl apply -f agent-sandbox-template.yaml
+#   vcluster platform create vcluster sandboxes --project <project> --template agent-sandbox-aws
+# (or in the UI: Projects > <project> > Tenant Clusters > Create > "Agent Sandbox on AWS (Auto Nodes)")
+#
+# Updating it later: use `kubectl replace -f`, not `kubectl apply`. The platform
+# merges spec.parameters by list position, so applying a version with entries
+# inserted or reordered leaves each entry with the fields of whatever used to sit
+# at its index (a parameter that inherits another's options turns into a dropdown).
+# A replace sends the whole object.
+#
+# It depends on these objects existing first:
+#   - StackTemplate "agent-sandbox"           (agent-sandbox-stack-template.yaml)
+#   - NodeProvider "aws-ec2"                  (amazon-ec2-nodeprovider.yaml), shared with
+#     the other EC2 templates, which must offer the node types t3.medium and t3.large.
+#     Every property that differs per template (region, CCM, CSI, VPC CIDR) is set
+#     below, so the provider's own fallbacks do not apply to these tenant clusters.
+#
+# Region: picked per tenant cluster from the "AWS region" parameter. The options are
+# the regions where account 865780387329 can run EC2: enabled in the account, not
+# denied by the organization's service control policy (which blocks every ap-*
+# region, ca-central-1 and sa-east-1), and offering t3.medium and t3.large in at
+# least the two availability zones the provider's VPC uses. Re-check with
+# `aws ec2 describe-instance-type-offerings` before adding one. The control plane
+# stays on the EKS cluster in eu-central-1; nodes in other regions join it over its
+# internet-facing NLB. An existing tenant cluster cannot move regions.
+#
+# Compatibility with the "agent-sandbox" StackTemplate:
+#   - Only parameters the StackTemplate declares are passed (podCIDR, vnodeIsolation,
+#     warmPoolType, sandboxEgress, warmPoolReplicas, vboxServiceType); option lists and
+#     ranges match its definitions. vnodeIsolation is fixed to per-pod, not a parameter.
+#   - The Stack always installs both SandboxTemplates (python-template and
+#     chrome-template); warmPoolType only picks which one the warm pool keeps ready.
+#   - networking.podCIDR equals the Stack's podCIDR (Calico IP pool).
+#   - Flannel is disabled because the Stack installs Calico and fails if Flannel runs.
+#   - The node provider deploys the AWS CCM (ccm-enabled), which serves LoadBalancer
+#     Services such as an exposed vBox. vCluster's embedded CCM stays enabled, as
+#     in the provider's own quickstart, which runs the two side by side.
+#   - Sandboxes (Python 250m CPU / 512 MiB requests, Chrome 500m / 1 GiB) fit the t3
+#     sandbox pool.
+apiVersion: management.loft.sh/v1
+kind: VirtualClusterTemplate
+metadata:
+  name: agent-sandbox-aws
+  annotations:
+    vcluster.com/template-icon: https://agent-sandbox.sigs.k8s.io/assets/icons/color_logo.svg
+spec:
+  displayName: Agent Sandbox on AWS (Auto Nodes)
+  description: >-
+    Tenant cluster with auto-scaling EC2 private nodes (t3),
+    Calico, vNode, and the Kubernetes Agent Sandbox with hardened, vNode-isolated
+    Python and Chrome sandbox templates and a warm pool of one of them.
+  parameters:
+    # Sandboxes. Passed through to the Stack; definitions mirror the StackTemplate's.
+    - variable: warmPoolReplicas
+      label: Warm sandboxes
+      description: Sandboxes kept ready; they also keep at least one sandbox node running.
+      type: number
+      min: 0
+      max: 200
+      defaultValue: "2"
+      section: Sandboxes
+    - variable: warmPoolType
+      label: Warm sandbox type
+      description: >-
+        Both sandbox templates are installed; this picks which one the warm pool keeps
+        ready, and claims of the other start cold. python: the Python runtime, reached
+        through the Sandbox Router. chrome: Chromium with the DevTools Protocol, reached
+        with kubectl port-forward (Chromium binds it to localhost only).
+      type: string
+      options:
+        - python
+        - chrome
+      defaultValue: python
+      section: Sandboxes
+    - variable: sandboxEgress
+      label: Sandbox egress
+      description: >-
+        public-internet allows public IPs only (private ranges and metadata blocked;
+        needed for pip install). none blocks all egress.
+      type: string
+      options:
+        - public-internet
+        - none
+      defaultValue: public-internet
+      section: Sandboxes
+    - variable: vboxServiceType
+      label: vBox service type
+      description: >-
+        internal: ClusterIP, reached with kubectl port-forward. exposed: LoadBalancer,
+        an internet-facing AWS Network Load Balancer in the nodes' region, created by
+        the cluster's AWS CCM. Sign-in is off until configured on vBox's Settings page,
+        so an exposed vBox is open to anyone on the internet until then.
+      type: string
+      options:
+        - internal
+        - exposed
+      defaultValue: internal
+      section: Sandboxes
+
+    # Infrastructure
+    - variable: region
+      label: AWS region
+      description: >-
+        Where the tenant cluster's VPC and EC2 nodes are created. Only regions this
+        account may run EC2 in are offered. Cannot be changed after creation.
+      type: string
+      options:
+        - eu-central-1
+        - eu-north-1
+        - eu-west-1
+        - eu-west-2
+        - eu-west-3
+        - us-east-1
+        - us-east-2
+        - us-west-1
+        - us-west-2
+      defaultValue: eu-west-1
+      section: Infrastructure
+    - variable: vpcCIDR
+      label: VPC CIDR
+      description: Must not overlap the pod (10.244.0.0/16) or service (10.96.0.0/16) ranges.
+      type: string
+      defaultValue: 10.0.0.0/16
+      validation: '^([0-9]{1,3}\.){3}[0-9]{1,3}/(1[6-9]|2[0-4])$'
+      invalidation: '^10\.(244|96)\.'
+      section: Infrastructure
+    - variable: maxCPU
+      label: Max sandbox pool vCPUs
+      description: >-
+        Upper bound Karpenter may provision for the t3 sandbox pool. The Stack's
+        sandbox namespace quota (32 CPU limits by default) also caps sandboxes.
+      type: number
+      min: 4
+      max: 1000
+      defaultValue: "64"
+      section: Infrastructure
+    - variable: maxMemory
+      label: Max sandbox pool memory (Gi)
+      type: number
+      min: 8
+      max: 4000
+      defaultValue: "256"
+      section: Infrastructure
+  template:
+    metadata: {}
+    instanceTemplate:
+      metadata: {}
+    pro:
+      enabled: true
+    helmRelease:
+      chart:
+        version: 0.37.2
+      values: |-
+        controlPlane:
+          service:
+            # EC2 nodes in the tenant VPC join through this NLB (AWS Load Balancer
+            # Controller on the EKS control plane cluster).
+            annotations:
+              service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: ip
+              service.beta.kubernetes.io/aws-load-balancer-scheme: internet-facing
+            spec:
+              type: LoadBalancer
+          advanced:
+            # Kept on next to the node provider's AWS CCM (ccm-enabled below), as in
+            # the provider's quickstart.
+            cloudControllerManager:
+              enabled: true
+
+        networking:
+          # Must equal the Stack's podCIDR parameter (Calico IP pool).
+          podCIDR: 10.244.0.0/16
+          serviceCIDR: 10.96.0.0/16
+
+        privateNodes:
+          enabled: true
+          autoNodes:
+            - provider: aws-ec2
+              properties:
+                region: "{{ .Values.region }}"
+                # The AWS cloud-controller-manager, deployed by the node provider into
+                # kube-system: it creates load balancers for LoadBalancer Services (an
+                # exposed vBox) in the tenant VPC's public subnets. Set here rather than
+                # left to the shared provider's fallback. Its permissions go on the node
+                # instance profile, reachable only from host-network pods (IMDS hop
+                # limit 1).
+                vcluster.com/ccm-enabled: "true"
+                # No EBS CSI driver: the provider defaults it on, which would add volume
+                # permissions to every node's instance profile. Sandbox workspaces and
+                # vBox's audit trail use the local-path provisioner below.
+                vcluster.com/csi-enabled: "false"
+                vcluster.com/vpc-cidr: "{{ .Values.vpcCIDR }}"
+              # Always-on node: Calico control components, the Agent Sandbox
+              # controller and routers, and the Stack's install jobs start here
+              # without waiting for Karpenter.
+              static:
+                - name: base
+                  quantity: 1
+                  nodeTypeSelector:
+                    - property: instance-type
+                      operator: In
+                      # 8 GiB: Calico, controller, two routers and the vNode agent
+                      # need more headroom than t3.medium offers.
+                      values: ["t3.large"]
+                  nodeLabels:
+                    pool.agent-sandbox.io/role: base
+              dynamic:
+                - name: sandboxes
+                  nodeTypeSelector:
+                    - property: instance-type
+                      operator: In
+                      # Karpenter picks the cheapest type that fits the pending sandboxes.
+                      # A Python sandbox requests 250m CPU / 512 MiB, so a t3.large holds
+                      # ~6; a Chrome sandbox requests 500m / 1 GiB, so it holds ~3.
+                      values: ["t3.medium", "t3.large"]
+                  nodeLabels:
+                    pool.agent-sandbox.io/role: sandbox
+                  limits:
+                    cpu: "{{ .Values.maxCPU }}"
+                    memory: "{{ .Values.maxMemory }}Gi"
+                  disruption:
+                    # Only remove empty nodes. Consolidating underutilized nodes would
+                    # evict running sandboxes and kill live agent sessions.
+                    consolidationPolicy: WhenEmpty
+                    consolidateAfter: 15m
+                    budgets:
+                      - nodes: "1"
+                  # Replace nodes monthly so they pick up the latest AMI and kernel.
+                  expireAfter: 720h
+                  terminationGracePeriod: 30m
+        deploy:
+          cni:
+            flannel:
+              # The Stack installs Calico (NetworkPolicy enforcement) and fails if
+              # Flannel is still running.
+              enabled: false
+          localPathProvisioner:
+            # Backs each sandbox's workspace volume on the node's gp3 root disk.
+            enabled: true
+          # The agent-sandbox Stack, deployed with every tenant cluster created from
+          # this template. Parameters not listed here take the StackTemplate's
+          # defaults. Because it is declared here, the platform recreates the Stack
+          # if it is deleted from the cluster; delete the tenant cluster instead.
+          stacks:
+            - name: agent-sandbox
+              displayName: Agent Sandbox
+              templateRef:
+                name: agent-sandbox
+              parameters:
+                podCIDR: 10.244.0.0/16
+                # Fixed rather than a parameter: per-namespace would let sandboxes
+                # in the shared sandbox namespace see each other's processes.
+                vnodeIsolation: per-pod
+                warmPoolType: "{{ .Values.warmPoolType }}"
+                sandboxEgress: "{{ .Values.sandboxEgress }}"
+                warmPoolReplicas: "{{ .Values.warmPoolReplicas }}"
+                vboxServiceType: "{{ .Values.vboxServiceType }}"
+              defaults:
+                taskTimeout: 15m
+              # A task removed from the StackTemplate is uninstalled, not left behind.
+              prunePolicy: Prune
+    accessPoint:
+      ingress: {}
+    spaceTemplate:
+      metadata: {}
