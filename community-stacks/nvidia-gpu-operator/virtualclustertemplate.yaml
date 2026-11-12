@@ -137,6 +137,25 @@ spec:
       type: boolean
       defaultValue: "false"
       section: NVSentinel
+    - variable: nvsentinelSlinkyDrain
+      label: NVSentinel Drains Slurm Nodes Through Slinky
+      description: Drain cordoned GPU nodes that match the Slinky node selector through Slurm instead of evicting
+        their pods. Needs the Slinky Slurm operator. No effect unless cordoning and draining are on.
+      type: boolean
+      defaultValue: "false"
+      section: NVSentinel
+    - variable: nvsentinelSlinkyNodeSelector
+      label: NVSentinel Slinky Node Selector
+      description: Label selector for the nodes that drain through Slurm. The default matches every GPU node.
+      type: string
+      defaultValue: nvidia.com/gpu.present=true
+      section: NVSentinel
+    - variable: nvsentinelSlinkyNamespace
+      label: NVSentinel Slinky Namespace
+      description: Namespace of the Slurm worker pods. On a drained node, every pod in it is deleted.
+      type: string
+      defaultValue: slurm
+      section: NVSentinel
     - variable: nvsentinelDryRun
       label: NVSentinel Dry Run
       description: Log the cordons and drains NVSentinel would make without making them.
@@ -259,6 +278,9 @@ spec:
                 nvsentinelCordon: {{ .Values.nvsentinelCordon | toString | quote }}
                 nvsentinelDrain: {{ .Values.nvsentinelDrain | toString | quote }}
                 nvsentinelDryRun: {{ .Values.nvsentinelDryRun | toString | quote }}
+                nvsentinelSlinkyDrain: {{ .Values.nvsentinelSlinkyDrain | toString | quote }}
+                nvsentinelSlinkyNodeSelector: {{ .Values.nvsentinelSlinkyNodeSelector | quote }}
+                nvsentinelSlinkyNamespace: {{ .Values.nvsentinelSlinkyNamespace | quote }}
                 nvsentinelMongodbReplicas: {{ .Values.nvsentinelMongodbReplicas | toString | quote }}
                 nvsentinelCircuitBreakerPercentage: {{ .Values.nvsentinelCircuitBreakerPercentage | toString | quote }}
                 nvsentinelCircuitBreakerMaxNodes: {{ .Values.nvsentinelCircuitBreakerMaxNodes | toString | quote }}

@@ -47,6 +47,7 @@ PART_OF = "nvidia-gpu-operator-stack"
 STACK = "nvidia-gpu-operator"
 GATE = f"{PREFIX}-gate"
 DISCOVER = f"{PREFIX}-discover"
+SLINKY = f"{PREFIX}-slinky-drainer"
 # The Platform caps every App deploy (helm --wait) at 30 minutes.
 APP_DEPLOY_CAP = 30 * 60
 # Stands in for the image the Platform injects as .Values.__image__.
@@ -288,7 +289,7 @@ for path in sorted((root / "apps").glob("*.yaml")):
         if spec.get("config", {}).get("chart"):
             fail(f"{rel(path)}: this Stack's Apps carry their manifests; a chart source brings back an outside dependency")
         if spec.get("wait") is not True:
-            fail(f"{rel(path)}: wait must be true, or the task is Healthy before its Job finishes")
+            fail(f"{rel(path)}: wait must be true, or the task is Healthy before its Job or Deployment is ready")
         seconds = short_duration(spec.get("timeout", ""), rel(path))
         if seconds is not None and seconds >= APP_DEPLOY_CAP:
             fail(f"{rel(path)}: timeout {spec['timeout']} reaches the Platform's 30m per-deploy cap")
@@ -371,6 +372,11 @@ for name in ("gpu-operator", "gpu-smoke-test", "nvsentinel"):
     if name in tasks and "gpuDriverMode" not in ((tasks[name].get("app") or tasks[name].get("argoCDApplication") or {}).get("parameters") or {}):
         fail(f"stacktemplate.yaml task {name}: does not pass gpuDriverMode; it would stay on its default mode")
 
+# node-drainer mounts the Slinky drain template and creates DrainRequests, so with Slinky drain on
+# the ConfigMap and the CRD must exist before NVSentinel starts.
+if "slinky-drainer" in tasks and "slinky-drainer" not in ancestors("nvsentinel"):
+    fail("stacktemplate.yaml task nvsentinel: must depend on slinky-drainer; node-drainer mounts its drain template")
+
 # A rollout wait on a DaemonSet that schedules no pods yet passes at once, so dcgmready must
 # follow gpuready, which proves a GPU node is there.
 if "dcgmready" in tasks and "gpuready" not in ancestors("dcgmready"):
@@ -380,6 +386,8 @@ if "dcgmready" in tasks and "gpuready" not in ancestors("dcgmready"):
 if (str(defaults(stack_params).get("nvsentinelCordon")), str(defaults(stack_params).get("nvsentinelDryRun")),
         str(defaults(stack_params).get("nvsentinelDrain"))) != ("true", "false", "false"):
     fail("stacktemplate.yaml: NVSentinel must default to cordoning without draining (nvsentinelCordon=true, nvsentinelDryRun=false, nvsentinelDrain=false)")
+if str(defaults(stack_params).get("nvsentinelSlinkyDrain")) != "false":
+    fail("stacktemplate.yaml: Slinky drain is opt-in; nvsentinelSlinkyDrain must default to false")
 
 # Defaults that must agree across files: a stack default overrides the template's, so a drifted
 # template default only bites when someone deploys the template on its own.
@@ -394,6 +402,10 @@ for stack_var, app, app_var in [
     ("nvsentinelMongodbReplicas", f"{PREFIX}-nvsentinel", "mongodbReplicas"),
     ("nvsentinelCircuitBreakerPercentage", f"{PREFIX}-nvsentinel", "circuitBreakerPercentage"),
     ("nvsentinelCircuitBreakerMaxNodes", f"{PREFIX}-nvsentinel", "circuitBreakerMaxNodes"),
+    ("nvsentinelSlinkyNodeSelector", f"{PREFIX}-nvsentinel", "slinkyNodeSelector"),
+    ("nvsentinelVersion", SLINKY, "version"),
+    ("nvsentinelSlinkyNamespace", SLINKY, "slinkyNamespace"),
+    ("cpuNodePool", SLINKY, "cpuNodePool"),
 ]:
     a = defaults(stack_params).get(stack_var)
     b = defaults(apps.get(app, {}).get("params", {})).get(app_var)
@@ -406,15 +418,19 @@ if (cpu_profile.get("nodeLabels") or {}).get("workload.example.com/pool") != def
 VARIANTS = {
     "defaults": {},
     "alternate": {"gpuDriverMode": "device-plugin", "driverPreinstalled": "true", "waitForClusterPolicy": "true", "minGPUs": "2",
-                  "nvsentinelCordon": "false", "nvsentinelDryRun": "true", "nvsentinelDrain": "true"},
+                  "nvsentinelCordon": "false", "nvsentinelDryRun": "true", "nvsentinelDrain": "true",
+                  "nvsentinelSlinkyDrain": "true"},
     "dra": {"gpuDriverMode": "dra"},
     "dra-alternate": {"gpuDriverMode": "dra", "driverPreinstalled": "true", "waitForClusterPolicy": "true", "minGPUs": "2",
                       "nvsentinelDryRun": "true", "nvsentinelMongodbReplicas": "3", "nvsentinelDrain": "true",
-                      "nvsentinelCircuitBreakerPercentage": "100", "nvsentinelCircuitBreakerMaxNodes": "2"},
+                      "nvsentinelCircuitBreakerPercentage": "100", "nvsentinelCircuitBreakerMaxNodes": "2",
+                      "nvsentinelSlinkyDrain": "true", "nvsentinelSlinkyNodeSelector": "slurm=worker",
+                      "nvsentinelSlinkyNamespace": "hpc"},
 }
 for variant, overrides in VARIANTS.items():
     values = {**defaults(stack_params), **overrides}
     on = lambda k: str(values[k]) == "true"
+    slinky = on("nvsentinelCordon") and on("nvsentinelDrain") and on("nvsentinelSlinkyDrain")
     # auto on a cluster without a GPU Operator resolves to device-plugin.
     mode = {"auto": "device-plugin"}.get(values["gpuDriverMode"], values["gpuDriverMode"])
     dra = mode == "dra"
@@ -456,6 +472,9 @@ for variant, overrides in VARIANTS.items():
                 fail(f"{where}: task timeout {task['timeout']} must exceed the App deadline it waits on ({limit}s)")
             docs = render_app(app, passed, name, where)
             if docs is None:
+                continue
+            if ref == SLINKY:
+                rendered[name] = {"ref": ref, "docs": docs}
                 continue
             jobs = [d for d in docs if d.get("kind") == "Job"]
             if len(jobs) != 1:
@@ -602,6 +621,50 @@ for variant, overrides in VARIANTS.items():
                     "maxNodes": int(values["nvsentinelCircuitBreakerMaxNodes"])}
             if {k: cb.get(k) for k in want} != want:
                 fail(f"task nvsentinel ({variant}): fault-quarantine.circuitBreaker is {cb}, expected {want}")
+
+    # Slinky drain: the drainer renders only when NVSentinel hands nodes to it, and both sides name
+    # the same ConfigMap, CRD and completion condition.
+    if "slinky-drainer" in rendered:
+        docs = {(d["kind"], d["metadata"]["name"]): d for d in rendered["slinky-drainer"]["docs"]}
+        where = f"task slinky-drainer ({variant})"
+        if not slinky and docs:
+            fail(f"{where}: renders {sorted(docs)} with Slinky drain off; it must render nothing")
+        if slinky:
+            crd = docs.get(("CustomResourceDefinition", "drainrequests.nvsentinel.nvidia.com"))
+            cm = docs.get(("ConfigMap", "slinky-drain-template"))
+            dep = docs.get(("Deployment", "slinky-drainer"))
+            if not (crd and cm and dep):
+                fail(f"{where}: expected the DrainRequest CRD, the slinky-drain-template ConfigMap and the slinky-drainer Deployment")
+            else:
+                if "{{ .HealthEvent.NodeName }}" not in (cm.get("data") or {}).get("drain-template.yaml", ""):
+                    fail(f"{where}: the drain template lost its Go template; node-drainer must render it, not the App")
+                c = dep["spec"]["template"]["spec"]["containers"][0]
+                if c["image"] != f"ghcr.io/nvidia/nvsentinel/slinky-drainer:{values['nvsentinelVersion']}":
+                    fail(f"{where}: image {c['image']} does not follow nvsentinelVersion")
+                if f"--slinky-namespace={values['nvsentinelSlinkyNamespace']}" not in c.get("args", []):
+                    fail(f"{where}: does not watch nvsentinelSlinkyNamespace={values['nvsentinelSlinkyNamespace']}")
+                if (dep["spec"]["template"]["spec"].get("nodeSelector") or {}).get("workload.example.com/pool") != values["cpuNodePool"]:
+                    fail(f"{where}: the controller is not on the CPU services pool")
+    if "nvsentinel" in rendered:
+        cd = (rendered["nvsentinel"]["values"].get("node-drainer") or {}).get("customDrain") or {}
+        where = f"task nvsentinel ({variant})"
+        if bool(cd.get("enabled")) is not slinky:
+            fail(f"{where}: node-drainer.customDrain.enabled={cd.get('enabled')!r} with Slinky drain {'on' if slinky else 'off'}")
+        if slinky:
+            if cd.get("nodeSelector") != values["nvsentinelSlinkyNodeSelector"] or not cd.get("nodeSelector"):
+                fail(f"{where}: customDrain.nodeSelector {cd.get('nodeSelector')!r} must be nvsentinelSlinkyNodeSelector and never empty")
+            docs = {(d["kind"], d["metadata"]["name"]): d for d in rendered.get("slinky-drainer", {}).get("docs", [])}
+            crd = docs.get(("CustomResourceDefinition", "drainrequests.nvsentinel.nvidia.com"), {}).get("spec", {})
+            want = {"templateConfigMapName": "slinky-drain-template", "templateFileName": "drain-template.yaml",
+                    "apiGroup": crd.get("group"), "kind": crd.get("names", {}).get("kind"),
+                    "resource": crd.get("names", {}).get("plural"),
+                    "version": next((v["name"] for v in crd.get("versions", []) if v.get("served")), None),
+                    "statusConditionType": "DrainComplete", "statusConditionStatus": "True"}
+            if not re.fullmatch(r"[1-9][0-9]*", str(cd.get("timeout", ""))):
+                fail(f"{where}: customDrain.timeout {cd.get('timeout')!r} must be whole seconds; node-drainer rejects durations like 30m")
+            got = {k: cd.get(k) for k in want}
+            if got != want:
+                fail(f"{where}: customDrain {got} does not match what the slinky-drainer App deploys {want}")
 
 # --- VirtualClusterTemplate ----------------------------------------------------------------------
 vct_path = root / "virtualclustertemplate.yaml"

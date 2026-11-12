@@ -15,7 +15,7 @@ installs these components in dependency order:
 The gates hold the downstream tasks until the scheduler advertises GPUs and the DCGM host engine
 is serving. The Stack reports healthy only after a CUDA workload has run on a GPU worker.
 
-Everything the Stack deploys is in this directory or comes from a public upstream chart. The gate
+Everything the Stack deploys is in this directory or comes from a public upstream chart or image. The gate
 Jobs run the vCluster Platform image the Platform already uses, so the Stack has no image or chart
 of its own to build or publish.
 
@@ -42,9 +42,11 @@ The files in this directory are the source manifests, an example and the checks 
 ## Architecture
 
 ```text
-discover (00) ---> gpu-operator (01) ---> gpuready (02) --+--> dcgmready (02) ---+
-                                                          |                       +--> nvsentinel (03)
-                                                          +-----------------------+
+discover (00) ---> gpu-operator (01) ---> gpuready (02) --+--> dcgmready (02) -------+
+                                                          |                           |
+                                                          +--> slinky-drainer (03) ---+--> nvsentinel (04)
+                                                          |                           |
+                                                          +---------------------------+
                                                           |
                                                           +--> gpu-smoke-test (03)
 ```
@@ -59,16 +61,17 @@ mode from `discover`'s outputs. The diagram leaves those edges out.
 | `gpuready` | `app` | `nvidia-gpu-operator-gate` | `discover`, `gpu-operator` | `28m0s` | Gate. Waits until `minGPUs` GPUs are available, then marks ConfigMap `gpu-stack-contract` ready. |
 | `dcgmready` | `app` | `nvidia-gpu-operator-gate` | `discover`, `gpuready` | `15m0s` | Gate. Waits for the DCGM DaemonSet (`nvidia-dcgm`, or `nvidia-dcgm-dra` with DRA) to finish rolling out on every GPU node. Publishes nothing. |
 | `gpu-smoke-test` | `app` | `nvidia-gpu-operator-gpu-smoke-test` | `discover`, `gpuready` | `12m0s` | Runs NVIDIA's CUDA VectorAdd sample on the GPU pool. |
-| `nvsentinel` | `argoCDApplication` | `nvidia-gpu-operator-nvsentinel` | `discover`, `gpuready`, `dcgmready` | `20m0s` | Installs NVSentinel in the resolved mode, cordoning faulty GPU nodes by default. Reads its DCGM address from the gate's contract. |
+| `slinky-drainer` | `app` | `nvidia-gpu-operator-slinky-drainer` | `discover`, `gpuready` | `12m0s` | Deploys NVSentinel's Slinky drainer when `nvsentinelSlinkyDrain` is on, and renders nothing otherwise. See [Drain Slurm nodes through Slinky](#drain-slurm-nodes-through-slinky). |
+| `nvsentinel` | `argoCDApplication` | `nvidia-gpu-operator-nvsentinel` | `discover`, `gpuready`, `dcgmready`, `slinky-drainer` | `20m0s` | Installs NVSentinel in the resolved mode, cordoning faulty GPU nodes by default. Reads its DCGM address from the gate's contract. |
 
 The Stack mixes two task types. **The workloads are Argo CD Applications**: once the Stack has
 ordered the rollout, Argo CD owns their reconciliation and drift correction. **The gates and the
-smoke test are Platform Apps**, and so is `discover`: their manifests, a Job with its RBAC, live
-inline in `apps/`.
+smoke test are Platform Apps**, and so are `discover` and `slinky-drainer`: their manifests, a
+Job with its RBAC or, for `slinky-drainer`, a controller, live inline in `apps/`.
 
 An `argoCDApplication` task is ready when its Application reports both `Synced` and `Healthy`. An
 `app` task is ready when the Platform's Helm deploy finishes. The Apps set `wait: true`, so Helm
-waits for the Job to complete. A task that declares outputs is ready only after it has captured
+waits for the Job to complete, or for the Slinky drainer's Deployment to be ready. A task that declares outputs is ready only after it has captured
 them.
 
 The timeouts use the full Go duration form, with seconds. `timeout` is a `metav1.Duration`, so
@@ -260,6 +263,9 @@ has tripped (see below).
 | --- | --- | --- |
 | `nvsentinelCordon` | `true` | Runs NVSentinel's fault quarantine. `false` runs monitoring only: health events and node conditions, no cordon. |
 | `nvsentinelDrain` | `false` | `true` also evicts pods from a node NVSentinel cordoned. No effect when `nvsentinelCordon` is `false`. |
+| `nvsentinelSlinkyDrain` | `false` | `true` drains the nodes matching `nvsentinelSlinkyNodeSelector` through Slurm instead of evicting their pods. No effect unless `nvsentinelCordon` and `nvsentinelDrain` are on. See [Drain Slurm nodes through Slinky](#drain-slurm-nodes-through-slinky). |
+| `nvsentinelSlinkyNodeSelector` | `nvidia.com/gpu.present=true` | Nodes that drain through Slurm. |
+| `nvsentinelSlinkyNamespace` | `slurm` | Namespace of the Slurm worker pods. |
 | `nvsentinelDryRun` | `false` | `true` keeps quarantine and the drainer running but only logs the cordons and evictions they would make. |
 | `nvsentinelMongodbReplicas` | `1` | Replicas of the MongoDB store that quarantine keeps its state in. |
 | `nvsentinelCircuitBreakerPercentage` | `50` | Share of GPU nodes cordoned within 5 minutes that trips the circuit breaker. |
@@ -332,6 +338,57 @@ lets pods finish (`AllowCompletion`) and force deletes those still running after
 evict some namespaces at once, set `node-drainer.userNamespaces` in the NVSentinel
 ArgoCDApplicationTemplate. The node stays cordoned after the drain, until the fault clears.
 
+#### Drain Slurm nodes through Slinky
+
+Evicting the pods of a [Slinky](https://github.com/SlinkyProject/slurm-operator) Slurm worker
+kills the jobs running in it, without Slurm knowing why. With `nvsentinelSlinkyDrain: true`, on
+top of `nvsentinelCordon` and `nvsentinelDrain`, the nodes matching
+`nvsentinelSlinkyNodeSelector` drain through Slurm instead, with NVSentinel's
+[Slinky drainer](https://github.com/NVIDIA/NVSentinel/tree/v1.31.0/plugins/slinky-drainer):
+
+1. Fault quarantine cordons the node, as before.
+2. The node drainer creates a `DrainRequest` for it, instead of evicting pods.
+3. The Slinky drainer writes the fault into the node's `nodeset.slinky.slurm.net/node-cordon-reason`
+   annotation. The Slinky operator puts the Slurm node in `DRAIN` because the node is cordoned,
+   with that annotation as the reason, so Slurm schedules no new jobs there.
+4. When every Ready Slurm worker pod on the node reports `DRAIN` with no allocated, mixed or
+   completing jobs, the drainer deletes the pods in `nvsentinelSlinkyNamespace` on that node
+   and marks the `DrainRequest` complete.
+
+When the fault clears and NVSentinel uncordons the node, the drainer removes its cordon reason
+and deletes the `DrainRequest`. The NodeSet's replacement worker pod then starts on the node, but
+the Slurm node stays `DOWN` with the reason `slurm-operator: Pod is terminating`: deleting the
+old pod ran slurmd's default preStop hook, and Slurm does not return a node set down that way to
+service on its own. Resume it once the node is healthy:
+
+```bash
+kubectl -n slurm exec slurm-controller-0 -c slurmctld -- scontrol update nodename=<slurm-node> state=resume
+```
+
+Requirements and behavior to know:
+
+- **The Slinky Slurm operator must already run in the cluster.** The Stack does not install it.
+  Slinky runs its operator in `slinky` and, by default, the Slurm cluster in `slurm`. The Slurm
+  worker pods are what the drainer watches, so the default `nvsentinelSlinkyNamespace` is `slurm`.
+- **Matching nodes get no pod eviction.** The drainer deletes only pods in
+  `nvsentinelSlinkyNamespace`; any other pod stays on the node. The default selector,
+  `nvidia.com/gpu.present=true`, matches every GPU node, because a default Slinky install runs its
+  workers wherever they fit and labels no nodes. If some GPU nodes run other workloads, label the
+  Slurm nodes and set the selector to that label. Nodes not matching it keep the eviction
+  defaults above.
+- **Every pod in `nvsentinelSlinkyNamespace` on the node is deleted**, not just Slurm workers,
+  with a 30 second grace period and without the Eviction API, so PodDisruptionBudgets do not
+  apply. Do not run other workloads in that namespace.
+- **The drain waits for running jobs.** The node drainer gives up after 30 minutes and marks the
+  drain failed. The node stays cordoned and the Slurm node stays drained.
+- The drainer runs on the CPU pool, as one replica without leader election. Its CRD,
+  `drainrequests.nvsentinel.nvidia.com`, is deleted with any open `DrainRequest` when you turn
+  `nvsentinelSlinkyDrain` off.
+
+Upstream ships the drainer as kustomize manifests only, so
+[apps/03-slinky-drainer.yaml](apps/03-slinky-drainer.yaml) carries a copy of them from the
+NVSentinel release in `nvsentinelVersion`. The image comes from the same release.
+
 Fault remediation and Janitor, which reboot or replace nodes, stay off in every configuration of
 this Stack.
 
@@ -339,12 +396,13 @@ this Stack.
 
 | File | Purpose |
 | --- | --- |
-| [stacktemplate.yaml](stacktemplate.yaml) | StackTemplate `nvidia-gpu-operator`: six tasks, parameters and published outputs |
+| [stacktemplate.yaml](stacktemplate.yaml) | StackTemplate `nvidia-gpu-operator`: seven tasks, parameters and published outputs |
 | [apps/00-discover.yaml](apps/00-discover.yaml) | App `nvidia-gpu-operator-discover`, which resolves the GPU driver mode |
 | [apps/01-gpu-operator.yaml](apps/01-gpu-operator.yaml) | ArgoCDApplicationTemplate `nvidia-gpu-operator-gpu-operator` |
 | [apps/02-gate.yaml](apps/02-gate.yaml) | App `nvidia-gpu-operator-gate`, the reusable readiness gate |
 | [apps/03-gpu-smoke-test.yaml](apps/03-gpu-smoke-test.yaml) | App `nvidia-gpu-operator-gpu-smoke-test` |
-| [apps/03-nvsentinel.yaml](apps/03-nvsentinel.yaml) | ArgoCDApplicationTemplate `nvidia-gpu-operator-nvsentinel` |
+| [apps/03-slinky-drainer.yaml](apps/03-slinky-drainer.yaml) | App `nvidia-gpu-operator-slinky-drainer`, NVSentinel's Slinky drainer, empty unless enabled |
+| [apps/04-nvsentinel.yaml](apps/04-nvsentinel.yaml) | ArgoCDApplicationTemplate `nvidia-gpu-operator-nvsentinel` |
 | [nodeprofiles.yaml](nodeprofiles.yaml) | NodeProfiles for the CPU services pool and the GPU pool |
 | [virtualclustertemplate.yaml](virtualclustertemplate.yaml) | VirtualClusterTemplate `nvidia-gpu-operator-private-nodes`: both pools, the Argo CD integration and the Stack through `deploy.stacks` |
 | [example/stackinstance.yaml](example/stackinstance.yaml) | StackInstance for an existing tenant cluster |
@@ -376,6 +434,9 @@ the Stack parameters through `deploy.stacks`.
 | `gpuOperatorVersion` | `v26.7.2` | GPU Operator chart version. DRA mode needs v26.7.0 or later. |
 | `nvsentinelCordon` | `true` | Cordon GPU nodes with a detected fault. Needs cert-manager. `false` for monitoring only. |
 | `nvsentinelDrain` | `false` | Also evict pods from cordoned GPU nodes |
+| `nvsentinelSlinkyDrain` | `false` | Drain matching nodes through Slurm instead of evicting their pods. Needs the Slinky Slurm operator. |
+| `nvsentinelSlinkyNodeSelector` | `nvidia.com/gpu.present=true` | Nodes that drain through Slurm |
+| `nvsentinelSlinkyNamespace` | `slurm` | Namespace of the Slurm worker pods |
 | `nvsentinelDryRun` | `false` | Log cordons and evictions instead of making them |
 | `nvsentinelMongodbReplicas` | `1` | Replicas of NVSentinel's MongoDB store, when cordoning is on |
 | `nvsentinelCircuitBreakerPercentage` | `50` | Share of GPU nodes cordoned within 5 minutes that trips NVSentinel's circuit breaker |
@@ -550,8 +611,8 @@ kubectl -n <project-namespace> delete stackinstance <name>
 ```
 
 The Platform deletes each child Argo CD Application with cascade, so Argo CD prunes the GPU
-Operator and NVSentinel resources. It deletes the gate and smoke test AppInstances, which
-uninstalls their Helm releases. These remain:
+Operator and NVSentinel resources. It deletes the gate, smoke test and Slinky drainer
+AppInstances, which uninstalls their Helm releases. That also deletes the `DrainRequest` CRD. These remain:
 
 - The namespaces `gpu-operator` and `nvsentinel`, which Argo CD creates through
   `CreateNamespace=true`, and `gpu-stack`.
@@ -582,7 +643,12 @@ kubectl delete apps,argocdapplicationtemplates,stacktemplates,virtualclustertemp
 
 - NVSentinel never remediates or reboots nodes, and drains them only with `nvsentinelDrain`.
   Recovering a cordoned node is manual. Prometheus PodMonitor and ServiceMonitor creation is disabled.
-- cert-manager is a prerequisite for the default configuration, not part of the Stack.
+- cert-manager is a prerequisite for the default configuration, not part of the Stack. So is the
+  Slinky Slurm operator for `nvsentinelSlinkyDrain`.
+- The Slinky drainer's manifests are a copy of upstream's. A `nvsentinelVersion` bump needs them
+  re-synced from that release's `plugins/slinky-drainer/config`.
+- The Slinky drainer's `--drain-timeout` is not enforced upstream in v1.31.0. A Slurm worker that
+  never reports `DRAIN` holds the drain until the node drainer's 30 minute timeout.
 - On clusters with one or two GPU nodes, the first cordon trips NVSentinel's circuit breaker, and a
   recovered node then stays cordoned until you [reset it](#reset-the-circuit-breaker). The breaker
   cannot be turned off through this Stack's parameters.
@@ -675,7 +741,7 @@ only the parameters the task passes. They assert:
   `.Outputs.discover.mode`. `discover`'s outputs read keys its Job writes and its release does not
   declare, and the Job script contains the value the test expects for each mode.
 - `discover` and the gate run the Platform image on the CPU pool, and each App renders exactly one
-  Job.
+  Job, except the Slinky drainer.
 - The mode reaches every component: one GPU Operator CR, with the NVIDIADriver CRD on for a
   `GPUCluster`; the gate's capacity source, resource and RBAC; the DCGM DaemonSet; the smoke
   test's GPU request; and NVSentinel's `gpuDraEnabled` (a YAML boolean), its janitor
@@ -687,6 +753,12 @@ only the parameters the task passes. They assert:
   follow `nvsentinelCordon`, the node drainer runs only with both `nvsentinelCordon` and
   `nvsentinelDrain`, and fault remediation and Janitor are never enabled. MongoDB runs on the CPU pool with one server certificate per replica.
   The circuit breaker is on, with the percentage and node cap from the parameters.
+- Slinky drain is off by default. The Slinky drainer App renders nothing unless cordon, drain and
+  `nvsentinelSlinkyDrain` are all on, and `customDrain` follows the same switch. When on, the
+  drainer runs the `nvsentinelVersion` image on the CPU pool and watches
+  `nvsentinelSlinkyNamespace`, its drain template is left for the node drainer to render, and
+  `customDrain` names the ConfigMap, CRD and completion condition the App deploys, with a
+  non-empty node selector. `nvsentinel` depends on `slinky-drainer`.
 - The tenant cluster template renders one `autoNodes` entry per provider, every pool references
   a NodeProfile defined here, and `gpuNodeCount` sets the GPU pool size.
 

@@ -10,6 +10,10 @@
 # Fault handling: by default NVSentinel cordons a GPU node it finds faulty (fault quarantine,
 # dryRun off). drain=true also evicts pods from a cordoned node (node-drainer, with the chart's
 # eviction defaults); it has no effect without cordon, since the drainer acts on quarantined nodes.
+# slinkyDrain=true hands nodes matching slinkyNodeSelector to NVSentinel's Slinky drainer instead
+# (customDrain): node-drainer creates a DrainRequest and the drainer drains the node through Slurm.
+# The drainer, its CRD and the drain template ConfigMap come from the slinky-drainer App, which must
+# be deployed first. Nodes not matching the selector keep the eviction defaults.
 # It never reboots: fault-remediation and janitor stay off. Quarantine keeps its state in NVSentinel's MongoDB store, which gets its TLS
 # certificates from cert-manager, so cordon=true requires cert-manager in the cluster. cordon=false
 # runs monitoring only, with no MongoDB and no cert-manager dependency. dryRun=true keeps
@@ -70,6 +74,19 @@ spec:
         after 60 minutes. No effect unless cordoning is on.
       type: boolean
       defaultValue: 'false'
+    - variable: slinkyDrain
+      label: Drain Slurm Nodes Through Slinky
+      description: Hand cordoned nodes matching the Slinky node selector to NVSentinel's Slinky drainer, which
+        waits for Slurm to drain them before deleting the Slurm worker pods. Needs drain on and the
+        slinky-drainer App deployed.
+      type: boolean
+      defaultValue: 'false'
+    - variable: slinkyNodeSelector
+      label: Slinky Node Selector
+      description: Label selector for the nodes that drain through Slurm. Matching nodes get no pod eviction, so
+        pods outside the Slinky namespace stay on them.
+      type: string
+      defaultValue: nvidia.com/gpu.present=true
     - variable: dryRun
       label: Dry Run
       description: Log the cordons and drains NVSentinel would make without making them.
@@ -121,6 +138,7 @@ spec:
             {{- $dra := eq (.Values.gpuDriverMode | default "device-plugin") "dra" }}
             {{- $cordon := ne (.Values.cordon | toString) "false" }}
             {{- $drain := and $cordon (eq (.Values.drain | toString) "true") }}
+            {{- $slinky := and $drain (eq (.Values.slinkyDrain | toString) "true") }}
             {{- $replicas := .Values.mongodbReplicas | default "1" | int }}
             global:
               # Booleans arrive as strings; the default is cordon on, dry run off.
@@ -206,6 +224,27 @@ spec:
                 enabled: true
                 percentage: {{ .Values.circuitBreakerPercentage | default "50" | int }}
                 maxNodes: {{ .Values.circuitBreakerMaxNodes | default "0" | int }}
+            {{- end }}
+            {{- if $slinky }}
+            node-drainer:
+              customDrain:
+                enabled: true
+                # Never empty: an empty selector sends every node through the Slinky drainer.
+                nodeSelector: {{ .Values.slinkyNodeSelector | default "nvidia.com/gpu.present=true" | quote }}
+                # Created by the slinky-drainer App.
+                templateConfigMapName: slinky-drain-template
+                templateMountPath: /etc/drain-template
+                templateFileName: drain-template.yaml
+                namespace: nvsentinel
+                apiGroup: nvsentinel.nvidia.com
+                version: v1alpha1
+                kind: DrainRequest
+                resource: drainrequests
+                statusConditionType: DrainComplete
+                statusConditionStatus: "True"
+                # Whole seconds as a string. node-drainer v1.31.0 fails to start on the chart's
+                # own default, "30m".
+                timeout: "1800"
             {{- end }}
             mongodb-store:
               mongodb:
