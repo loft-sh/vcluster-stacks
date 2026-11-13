@@ -1,6 +1,10 @@
 # Runs NVIDIA's CUDA VectorAdd sample on a GPU worker. `wait: true` holds the task until the Job
 # completes, so the task is Healthy only after a CUDA kernel ran and exited 0.
 #
+# With gpuDriverMode=dra the GPU comes from a ResourceClaim on DeviceClass gpu.nvidia.com instead of
+# the nvidia.com/gpu extended resource, which the DRA stack does not advertise. That also proves the
+# DRA driver can allocate a GPU and inject it into a container.
+#
 # Stack-driven AppInstances do not apply App parameter defaults. Every value is guarded with `default`.
 apiVersion: management.loft.sh/v1
 kind: App
@@ -18,12 +22,34 @@ spec:
     manifests: |-
       {{- $image := .Values.image | default "nvcr.io/nvidia/k8s/cuda-sample:vectoradd-cuda12.5.0-ubuntu22.04" -}}
       {{- $gpuCount := .Values.gpuCount | default "1" | toString -}}
-      {{- $hash := printf "%s|%s|%s" $image $gpuCount (.Values.gpuNodeSelector | default "") | sha256sum | trunc 8 -}}
+      {{- $dra := eq (.Values.gpuDriverMode | default "device-plugin") "dra" -}}
+      {{- $hash := printf "%s|%s|%s|%t" $image $gpuCount (.Values.gpuNodeSelector | default "") $dra | sha256sum | trunc 8 -}}
+      {{- $name := printf "%s-%s" (.Release.Name | trunc 45 | trimSuffix "-") $hash -}}
+      {{- if $dra }}
+      # The claim template is immutable too, so it carries the same suffix as the Job.
+      apiVersion: resource.k8s.io/v1
+      kind: ResourceClaimTemplate
+      metadata:
+        name: {{ $name }}
+        labels:
+          app.kubernetes.io/name: nvidia-gpu-operator-gpu-smoke-test
+          app.kubernetes.io/instance: {{ .Release.Name | quote }}
+      spec:
+        spec:
+          devices:
+            requests:
+              - name: gpu
+                exactly:
+                  deviceClassName: gpu.nvidia.com
+                  allocationMode: ExactCount
+                  count: {{ $gpuCount }}
+      ---
+      {{- end }}
       # A Job spec is immutable. Changing a setting names a new Job instead of failing the upgrade.
       apiVersion: batch/v1
       kind: Job
       metadata:
-        name: {{ .Release.Name | trunc 45 | trimSuffix "-" }}-{{ $hash }}
+        name: {{ $name }}
         labels:
           app.kubernetes.io/name: nvidia-gpu-operator-gpu-smoke-test
           app.kubernetes.io/instance: {{ .Release.Name | quote }}
@@ -38,25 +64,44 @@ spec:
           spec:
             restartPolicy: Never
             {{- with .Values.gpuNodeSelector }}
-            {{- $kv := splitn "=" 2 . }}
             nodeSelector:
-              {{ $kv._0 }}: {{ $kv._1 | quote }}
+              {{- range splitList "," . }}
+              {{- if trim . }}
+              {{- $kv := splitn "=" 2 (trim .) }}
+              {{ $kv._0 }}: {{ $kv._1 | default "" | quote }}
+              {{- end }}
+              {{- end }}
             {{- end }}
             tolerations:
               - key: nvidia.com/gpu
                 operator: Exists
                 effect: NoSchedule
+            {{- if $dra }}
+            resourceClaims:
+              - name: gpu
+                resourceClaimTemplateName: {{ $name }}
+            {{- end }}
             containers:
               - name: cuda-vectoradd
                 image: {{ $image | quote }}
                 resources:
+                  {{- if $dra }}
+                  claims:
+                    - name: gpu
+                  {{- else }}
                   limits:
                     nvidia.com/gpu: {{ $gpuCount }}
+                  {{- end }}
   parameters:
     - variable: gpuNodeSelector
       label: GPU node selector
-      description: Optional key=value label selector for GPU workers. The GPU request alone already restricts placement.
+      description: Optional comma-separated key=value labels that select GPU workers. The GPU request alone already restricts placement.
       type: string
+    - variable: gpuDriverMode
+      label: GPU driver mode
+      description: device-plugin requests nvidia.com/gpu; dra requests GPUs through a ResourceClaim on gpu.nvidia.com.
+      options: ["device-plugin", "dra"]
+      defaultValue: device-plugin
     - variable: gpuCount
       label: GPUs requested
       description: Whole GPUs the sample requests for the few seconds it runs.

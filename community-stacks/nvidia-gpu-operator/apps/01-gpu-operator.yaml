@@ -1,4 +1,11 @@
 # CPU controllers and GPU node agents use the pool labels from node-profiles.yaml.
+#
+# gpuDriverMode picks the GPU Operator's stack. device-plugin deploys the ClusterPolicy (device
+# plugin, container toolkit, `nvidia` RuntimeClass). dra deploys the experimental GPUCluster instead:
+# the NVIDIA DRA driver publishes GPUs as ResourceSlices, and the driver comes from an NVIDIADriver
+# CR, which the chart requires with a GPUCluster. The chart refuses to render with both CRs, and
+# refuses a GPUCluster on a cluster that serves no resource.k8s.io DeviceClass API (Kubernetes 1.34
+# serves resource.k8s.io/v1).
 apiVersion: management.loft.sh/v1
 kind: ArgoCDApplicationTemplate
 metadata:
@@ -16,12 +23,22 @@ spec:
       type: string
       required: true
       defaultValue: cpu-services
+    - variable: cpuNodeSelector
+      label: CPU Node Selector
+      description: Comma-separated key=value labels that select the CPU service workers. Empty selects
+        workload.example.com/pool=<cpuNodePool>.
+      type: string
+    - variable: gpuNodeSelector
+      label: GPU Node Selector
+      description: Comma-separated key=value labels that select the GPU workers. Empty selects
+        workload.example.com/pool=gpu-compute.
+      type: string
     - variable: version
       label: Chart Version
       type: string
       required: true
       # renovate: datasource=helm depName=gpu-operator registryUrl=https://helm.ngc.nvidia.com/nvidia
-      defaultValue: v26.3.3
+      defaultValue: v26.7.2
     - variable: project
       label: Argo CD Project
       type: string
@@ -31,6 +48,14 @@ spec:
       label: NVIDIA Driver Preinstalled
       type: boolean
       defaultValue: 'false'
+    - variable: gpuDriverMode
+      label: GPU Driver Mode
+      description: device-plugin deploys the ClusterPolicy stack; dra deploys the GPUCluster (DRA) stack.
+        Inside the Stack, the discover task resolves auto to one of these.
+      options:
+        - device-plugin
+        - dra
+      defaultValue: device-plugin
   template:
     spec:
       destination:
@@ -43,16 +68,39 @@ spec:
         helm:
           releaseName: gpu-operator
           values: |
+            {{- /* cpuNodeSelector (comma-separated key=value), or workload.example.com/pool=<cpuNodePool> when empty. */}}
+            {{- $cpuNodeSelector := dict "kubernetes.io/os" "linux" }}
+            {{- range splitList "," (.Values.cpuNodeSelector | default (printf "workload.example.com/pool=%s" (.Values.cpuNodePool | default "cpu-services"))) }}
+            {{- if trim . }}
+            {{- $kv := splitn "=" 2 (trim .) }}
+            {{- $_ := set $cpuNodeSelector $kv._0 ($kv._1 | default "") }}
+            {{- end }}
+            {{- end }}
+            {{- /* gpuNodeSelector (comma-separated key=value), or workload.example.com/pool=gpu-compute when empty. */}}
+            {{- $gpuNodeSelector := dict "kubernetes.io/os" "linux" }}
+            {{- range splitList "," (.Values.gpuNodeSelector | default "workload.example.com/pool=gpu-compute") }}
+            {{- if trim . }}
+            {{- $kv := splitn "=" 2 (trim .) }}
+            {{- $_ := set $gpuNodeSelector $kv._0 ($kv._1 | default "") }}
+            {{- end }}
+            {{- end }}
+            {{- $dra := eq (.Values.gpuDriverMode | default "device-plugin") "dra" }}
+            clusterPolicy:
+              deployCR: {{ not $dra }}
+            gpuCluster:
+              deployCR: {{ $dra }}
             operator:
               defaultRuntime: containerd
               nodeSelector:
-                kubernetes.io/os: linux
-                workload.example.com/pool: {{ .Values.cpuNodePool | quote }}
+                {{- range $k, $v := $cpuNodeSelector }}
+                {{ $k }}: {{ $v | quote }}
+                {{- end }}
               tolerations: []
             driver:
               enabled: {{ if eq (.Values.driverPreinstalled | toString) "true" }}false{{ else }}true{{ end }}
               nvidiaDriverCRD:
-                enabled: false
+                # GPUCluster takes its driver from an NVIDIADriver CR only.
+                enabled: {{ $dra }}
                 deployDefaultCR: true
                 driverType: gpu
               repository: nvcr.io/nvidia
@@ -73,7 +121,7 @@ spec:
               enabled: true
               repository: nvcr.io/nvidia/k8s
               image: dcgm-exporter
-              version: 4.5.3-4.8.2-distroless
+              version: 4.6.1-4.8.4-distroless
               enablePodLabels: false
               enablePodUID: false
               config:
@@ -125,16 +173,19 @@ spec:
               postDeleteCleanup: false
               master:
                 nodeSelector:
-                  kubernetes.io/os: linux
-                  workload.example.com/pool: {{ .Values.cpuNodePool | quote }}
+                  {{- range $k, $v := $cpuNodeSelector }}
+                  {{ $k }}: {{ $v | quote }}
+                  {{- end }}
               gc:
                 nodeSelector:
-                  kubernetes.io/os: linux
-                  workload.example.com/pool: {{ .Values.cpuNodePool | quote }}
+                  {{- range $k, $v := $cpuNodeSelector }}
+                  {{ $k }}: {{ $v | quote }}
+                  {{- end }}
               worker:
                 nodeSelector:
-                  kubernetes.io/os: linux
-                  workload.example.com/pool: gpu-compute
+                  {{- range $k, $v := $gpuNodeSelector }}
+                  {{ $k }}: {{ $v | quote }}
+                  {{- end }}
                 tolerations:
                 - key: nvidia.com/gpu
                   operator: Exists
