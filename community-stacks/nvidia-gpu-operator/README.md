@@ -214,8 +214,12 @@ Pods reach a pool through a `nodeSelector` on `workload.example.com/pool`. Pods 
 | NVSentinel labeler | CPU pool |
 | NVSentinel health monitors, metadata collector, `platformConnector` | GPU pool, with the GPU taint toleration |
 
-The CPU pool label value is the `cpuNodePool` parameter. The GPU pool value `gpu-compute` is
-fixed in the templates.
+CPU workloads select `workload.example.com/pool=<cpuNodePool>`. To select CPU workers by other
+labels, for example on a cluster whose nodes do not come from these NodeProfiles, set
+`cpuNodeSelector` to comma-separated `key=value` pairs, such as
+`foo.acme.corp/cpu-node=true,tier=services`. It replaces the pool label everywhere a CPU workload
+is placed. See [Change the CPU node selector](#change-the-cpu-node-selector) before you change it
+on a running Stack. The GPU pool value `gpu-compute` is fixed in the templates.
 
 The profiles do not use `startupTaints`. Those are removed when the node becomes Ready, which
 does not prove that NVIDIA initialization has completed. The `gpuready` gate handles GPU
@@ -427,6 +431,7 @@ the Stack parameters through `deploy.stacks`.
 | `cpuNodeProvider` | required | Node provider for the CPU services worker. Can equal `gpuNodeProvider`. |
 | `cpuNodeType` | `large` | The provider's `vcluster.com/profile` node type for the CPU worker |
 | `cpuNodePool` | `cpu-services` | Value of `workload.example.com/pool` on CPU workers |
+| `cpuNodeSelector` | empty | Comma-separated `key=value` labels that select CPU workers instead of the pool label. Leave empty with the NodeProfiles. |
 | `minGPUs` | `1` | GPUs that must be available before `gpuready` passes |
 | `gpuDriverMode` | `auto` | `device-plugin`, `dra`, or `auto` to keep an existing GPU Operator's mode. See [GPU driver mode](#gpu-driver-mode). |
 | `driverPreinstalled` | `false` | `true` when the node image has the NVIDIA driver. GPU Operator skips the driver, and NVSentinel labels in preinstalled-driver mode. |
@@ -591,8 +596,14 @@ containers:
   parameter values rendered at creation. A new or changed template parameter reaches existing
   tenant clusters only after **Sync Template** on the instance, or `spec.templateRef.syncOnce:
   true`. Until then, a new parameter renders as an empty string, with no error.
-- **Re-running a gate.** The gate Job name carries a hash of its settings. A Job spec is
-  immutable, so a changed setting creates a new Job, which runs the gate again.
+- **Re-running a gate.** The gate Job name carries a hash of its settings and its check script.
+  A Job spec is immutable, so a changed setting creates a new Job, which runs the gate again. The
+  `discover` Job works the same way. Upgrading to the version that added `cpuNodeSelector` renames
+  both gate Jobs and `discover` once, so they run again.
+- **CPU node selector.** An empty `cpuNodeSelector`, its default, keeps
+  `workload.example.com/pool=<cpuNodePool>`. A tenant cluster that has not synced its template yet
+  also passes it empty. Either way an upgrade renders the same node selectors and moves nothing.
+  To change it, see [Change the CPU node selector](#change-the-cpu-node-selector).
 - **Switching the GPU driver mode.** Change `gpuDriverMode` to `device-plugin` or `dra`.
   `discover` decides again, and every task follows. Plan for downtime: the GPU Operator replaces
   its whole node stack, including the driver DaemonSet, so GPU workloads on the nodes are
@@ -603,6 +614,47 @@ containers:
     `discover` log warns about this. Once the `gpu-operator` task has synced, run
     `kubectl get gpuclusters`, and if `gpu-cluster` is still there, run `kubectl delete gpucluster
     gpu-cluster`.
+
+### Change the CPU node selector
+
+Changing `cpuNodePool` or `cpuNodeSelector` on a running Stack moves every CPU workload: the GPU
+Operator controller, NFD master and garbage collector, the NVSentinel controllers, MongoDB and,
+with `nvsentinelSlinkyDrain`, the Slinky drainer.
+
+Deployments roll without downtime when a node matches the new selector. MongoDB does not: its
+volume can be pinned to a node (local storage) or a zone (zonal disks), and a StatefulSet deletes
+its pod before it schedules the new one. If no node matching the new selector can reach the volume,
+NVSentinel's store stays down, and quarantine with it.
+
+`discover` checks every bound volume in `nvsentinel` against the selector, and fails with `no
+node matching the CPU node selector ... can reach PersistentVolume ...` if none can reach one. It
+also fails on a selector that is not `key=value` pairs. **This reports the problem; it does not
+prevent it.** When a parameter changes, the Stack re-syncs every affected task at once and does not
+wait for `discover`, so MongoDB may already be moving when `discover` fails. Check the volume first,
+as in step 2.
+
+To move the CPU workloads to other nodes:
+
+1. Label the target CPU workers with the new labels.
+2. Keep a node MongoDB's volume is pinned to in the new selector, or plan to recreate the store:
+   `kubectl -n nvsentinel get pvc` and `kubectl get pv <volume> -o jsonpath='{.spec.nodeAffinity}'`
+   show where it is pinned.
+3. Delete NVSentinel's completed MongoDB setup Job, if it is still there. Its name does not change
+   with the selector and a Job spec is immutable, so Argo CD's server-side diff fails on it
+   (`ComparisonError ... Job.batch "create-mongodb-database-..." is invalid: spec.template`) and
+   NVSentinel keeps the old selector. The chart re-runs the Job on every sync and expires it 24
+   hours after it finishes. [NVIDIA/NVSentinel#2381](https://github.com/NVIDIA/NVSentinel/pull/2381)
+   proposes hashing the pod spec into the name, which makes this step unnecessary.
+
+   ```bash
+   kubectl -n nvsentinel delete job -l app.kubernetes.io/name=create-mongodb-database
+   ```
+
+4. Change the parameter, and wait for every task to be healthy again. Task health is not enough:
+   Argo CD can report the NVSentinel Application as synced from an earlier comparison. Check that
+   the workloads carry the new selector, for example
+   `kubectl -n nvsentinel get deploy,sts -o custom-columns=NAME:.metadata.name,SELECTOR:.spec.template.spec.nodeSelector`.
+5. Remove the old labels.
 
 ## Remove
 
@@ -671,8 +723,12 @@ kubectl delete apps,argocdapplicationtemplates,stacktemplates,virtualclustertemp
 
 ## Troubleshooting
 
-- **GPU Operator controller, `discover` or a gate Job Pending.** No CPU worker has the
-  `cpuNodePool` label. These pods cannot use the GPU pool.
+- **GPU Operator controller, `discover` or a gate Job Pending.** No CPU worker matches the CPU
+  node selector: the `cpuNodePool` label, or `cpuNodeSelector` when set. These pods cannot use the
+  GPU pool.
+- **`discover` failed with "no node matching the CPU node selector".** The new selector would
+  leave a volume in `nvsentinel`, MongoDB's, with no node to run on. See
+  [Change the CPU node selector](#change-the-cpu-node-selector).
 - **`discover` failed with "both a ClusterPolicy and a GPUCluster exist".** The cluster is in a
   state the GPU Operator rejects, usually after a switch from DRA. Delete the CR for the mode you
   do not use, or set `gpuDriverMode` explicitly. The Job log names both commands.
@@ -742,6 +798,11 @@ only the parameters the task passes. They assert:
   declare, and the Job script contains the value the test expects for each mode.
 - `discover` and the gate run the Platform image on the CPU pool, and each App renders exactly one
   Job, except the Slinky drainer.
+- Every CPU workload carries the same CPU node selector: `workload.example.com/pool=<cpuNodePool>`
+  by default, and exactly the `cpuNodeSelector` labels when set (the alternate variants set it).
+  `cpuNodeSelector` defaults to empty. The gate and `discover` Job names change with the selector.
+  `discover`'s volume check runs against a fake `kubectl`: it passes for a volume a matching node
+  can reach and with no volumes, and fails for a stranded volume and a malformed selector.
 - The mode reaches every component: one GPU Operator CR, with the NVIDIADriver CRD on for a
   `GPUCluster`; the gate's capacity source, resource and RBAC; the DCGM DaemonSet; the smoke
   test's GPU request; and NVSentinel's `gpuDraEnabled` (a YAML boolean), its janitor

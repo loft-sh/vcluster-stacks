@@ -23,6 +23,11 @@ spec:
       type: string
       required: true
       defaultValue: cpu-services
+    - variable: cpuNodeSelector
+      label: CPU Node Selector
+      description: Comma-separated key=value labels that select the CPU service workers. Empty selects
+        workload.example.com/pool=<cpuNodePool>.
+      type: string
     - variable: version
       label: Chart Version
       type: string
@@ -58,6 +63,14 @@ spec:
         helm:
           releaseName: gpu-operator
           values: |
+            {{- /* cpuNodeSelector (comma-separated key=value), or workload.example.com/pool=<cpuNodePool> when empty. */}}
+            {{- $cpuNodeSelector := dict "kubernetes.io/os" "linux" }}
+            {{- range splitList "," (.Values.cpuNodeSelector | default (printf "workload.example.com/pool=%s" (.Values.cpuNodePool | default "cpu-services"))) }}
+            {{- if trim . }}
+            {{- $kv := splitn "=" 2 (trim .) }}
+            {{- $_ := set $cpuNodeSelector $kv._0 ($kv._1 | default "") }}
+            {{- end }}
+            {{- end }}
             {{- $dra := eq (.Values.gpuDriverMode | default "device-plugin") "dra" }}
             clusterPolicy:
               deployCR: {{ not $dra }}
@@ -66,8 +79,9 @@ spec:
             operator:
               defaultRuntime: containerd
               nodeSelector:
-                kubernetes.io/os: linux
-                workload.example.com/pool: {{ .Values.cpuNodePool | quote }}
+                {{- range $k, $v := $cpuNodeSelector }}
+                {{ $k }}: {{ $v | quote }}
+                {{- end }}
               tolerations: []
             driver:
               enabled: {{ if eq (.Values.driverPreinstalled | toString) "true" }}false{{ else }}true{{ end }}
@@ -146,12 +160,14 @@ spec:
               postDeleteCleanup: false
               master:
                 nodeSelector:
-                  kubernetes.io/os: linux
-                  workload.example.com/pool: {{ .Values.cpuNodePool | quote }}
+                  {{- range $k, $v := $cpuNodeSelector }}
+                  {{ $k }}: {{ $v | quote }}
+                  {{- end }}
               gc:
                 nodeSelector:
-                  kubernetes.io/os: linux
-                  workload.example.com/pool: {{ .Values.cpuNodePool | quote }}
+                  {{- range $k, $v := $cpuNodeSelector }}
+                  {{ $k }}: {{ $v | quote }}
+                  {{- end }}
               worker:
                 nodeSelector:
                   kubernetes.io/os: linux

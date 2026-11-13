@@ -234,6 +234,12 @@ def defaults(params):
     return {v: p["defaultValue"] for v, p in params.items() if "defaultValue" in p}
 
 
+def cpu_selector(values):
+    """The CPU node selector every CPU workload must carry: cpuNodeSelector, or the pool label."""
+    raw = str(values.get("cpuNodeSelector") or "") or f"workload.example.com/pool={values['cpuNodePool']}"
+    return dict(p.strip().split("=", 1) for p in raw.split(",") if p.strip())
+
+
 def check_refs(where, node, declared, extra_ok=()):
     for path, s in strings(node):
         for ref in VALUES_REF.findall(s):
@@ -386,6 +392,8 @@ if "dcgmready" in tasks and "gpuready" not in ancestors("dcgmready"):
 if (str(defaults(stack_params).get("nvsentinelCordon")), str(defaults(stack_params).get("nvsentinelDryRun")),
         str(defaults(stack_params).get("nvsentinelDrain"))) != ("true", "false", "false"):
     fail("stacktemplate.yaml: NVSentinel must default to cordoning without draining (nvsentinelCordon=true, nvsentinelDryRun=false, nvsentinelDrain=false)")
+if defaults(stack_params).get("cpuNodeSelector"):
+    fail("stacktemplate.yaml: cpuNodeSelector must default to empty, so an upgrade keeps workload.example.com/pool=<cpuNodePool>")
 if str(defaults(stack_params).get("nvsentinelSlinkyDrain")) != "false":
     fail("stacktemplate.yaml: Slinky drain is opt-in; nvsentinelSlinkyDrain must default to false")
 
@@ -419,18 +427,22 @@ VARIANTS = {
     "defaults": {},
     "alternate": {"gpuDriverMode": "device-plugin", "driverPreinstalled": "true", "waitForClusterPolicy": "true", "minGPUs": "2",
                   "nvsentinelCordon": "false", "nvsentinelDryRun": "true", "nvsentinelDrain": "true",
-                  "nvsentinelSlinkyDrain": "true"},
+                  "nvsentinelSlinkyDrain": "true",
+                  "cpuNodeSelector": "foo.acme.corp/cpu-node=true, tier=services"},
     "dra": {"gpuDriverMode": "dra"},
     "dra-alternate": {"gpuDriverMode": "dra", "driverPreinstalled": "true", "waitForClusterPolicy": "true", "minGPUs": "2",
                       "nvsentinelDryRun": "true", "nvsentinelMongodbReplicas": "3", "nvsentinelDrain": "true",
                       "nvsentinelCircuitBreakerPercentage": "100", "nvsentinelCircuitBreakerMaxNodes": "2",
                       "nvsentinelSlinkyDrain": "true", "nvsentinelSlinkyNodeSelector": "slurm=worker",
-                      "nvsentinelSlinkyNamespace": "hpc"},
+                      "nvsentinelSlinkyNamespace": "hpc",
+                      "cpuNodeSelector": "foo.acme.corp/cpu-node=true"},
 }
 for variant, overrides in VARIANTS.items():
     values = {**defaults(stack_params), **overrides}
     on = lambda k: str(values[k]) == "true"
     slinky = on("nvsentinelCordon") and on("nvsentinelDrain") and on("nvsentinelSlinkyDrain")
+    cpu_sel = cpu_selector(values)
+    cpu_pod_sel = {"kubernetes.io/os": "linux", **cpu_sel}
     # auto on a cluster without a GPU Operator resolves to device-plugin.
     mode = {"auto": "device-plugin"}.get(values["gpuDriverMode"], values["gpuDriverMode"])
     dra = mode == "dra"
@@ -489,8 +501,8 @@ for variant, overrides in VARIANTS.items():
             if ref in (GATE, DISCOVER):
                 if pod["containers"][0]["image"] != PLATFORM_IMAGE:
                     fail(f"{where}: the Job does not run the Platform image")
-                if (pod.get("nodeSelector") or {}).get("workload.example.com/pool") != values["cpuNodePool"]:
-                    fail(f"{where}: the Job is not on the CPU services pool")
+                if pod.get("nodeSelector") != cpu_sel:
+                    fail(f"{where}: Job nodeSelector {pod.get('nodeSelector')} is not the CPU node selector {cpu_sel}")
         else:
             spec_r = render(app["doc"]["spec"]["template"], {**defaults(app["params"]), **passed}, f"{ref} for {where}")
             if not spec_r:
@@ -513,6 +525,10 @@ for variant, overrides in VARIANTS.items():
                     fail(f"{where}: output {out['name']} reads key {key!r}, which the discover Job never writes")
                 if key in (cms[0].get("data") or {} if cms else {}):
                     fail(f"{where}: key {key!r} is declared by the release, so a Helm upgrade would reset what the Job wrote")
+            env = rendered[name]["env"]
+            if dict(p.strip().split("=", 1) for p in env.get("CPU_NODE_SELECTOR", "").split(",") if p.strip()) != cpu_sel \
+                    or env.get("PINNED_VOLUME_NAMESPACE") != "nvsentinel":
+                fail(f"{where}: the guard gets CPU_NODE_SELECTOR={env.get('CPU_NODE_SELECTOR')!r} PINNED_VOLUME_NAMESPACE={env.get('PINNED_VOLUME_NAMESPACE')!r}; expected the CPU node selector and nvsentinel")
             if rendered[name]["env"].get("REQUESTED_MODE") != values["gpuDriverMode"]:
                 fail(f"{where}: the Job does not receive gpuDriverMode={values['gpuDriverMode']}")
             outputs = {"discover": {o["name"]: facts.get(o["fromResource"]["jsonPath"][len("{.data."):-1], "")
@@ -535,6 +551,13 @@ for variant, overrides in VARIANTS.items():
     # Behavior the parameters promise.
     if "gpu-operator" in rendered:
         hv = rendered["gpu-operator"]["values"]
+        for path in (("operator", "nodeSelector"), ("node-feature-discovery", "master", "nodeSelector"),
+                     ("node-feature-discovery", "gc", "nodeSelector")):
+            got = hv
+            for k in path:
+                got = (got or {}).get(k)
+            if got != cpu_pod_sel:
+                fail(f"task gpu-operator ({variant}): {'.'.join(path)} is {got}, expected the CPU node selector {cpu_pod_sel}")
         driver = hv["driver"]["enabled"]
         if driver is on("driverPreinstalled"):
             fail(f"task gpu-operator ({variant}): driver.enabled={driver} with driverPreinstalled={values['driverPreinstalled']}")
@@ -613,8 +636,13 @@ for variant, overrides in VARIANTS.items():
         replicas = int(values["nvsentinelMongodbReplicas"])
         if mongo.get("replicaCount") != replicas or mongo["tls"]["replicaset"]["existingSecrets"] != [f"mongo-server-cert-{i}" for i in range(replicas)]:
             fail(f"task nvsentinel ({variant}): MongoDB needs {replicas} replicas with one server certificate each")
-        if (mongo.get("nodeSelector") or {}).get("workload.example.com/pool") != values["cpuNodePool"]:
-            fail(f"task nvsentinel ({variant}): MongoDB is not on the CPU services pool")
+        for path in (("global", "systemNodeSelector"), ("mongodb-store", "mongodb", "nodeSelector"),
+                     ("nodeConditionCleanup", "nodeSelector")):
+            got = hv
+            for k in path:
+                got = (got or {}).get(k)
+            if got != cpu_pod_sel:
+                fail(f"task nvsentinel ({variant}): {'.'.join(path)} is {got}, expected the CPU node selector {cpu_pod_sel}")
         if cordon:
             cb = (hv.get("fault-quarantine") or {}).get("circuitBreaker") or {}
             want = {"enabled": True, "percentage": int(values["nvsentinelCircuitBreakerPercentage"]),
@@ -643,7 +671,7 @@ for variant, overrides in VARIANTS.items():
                     fail(f"{where}: image {c['image']} does not follow nvsentinelVersion")
                 if f"--slinky-namespace={values['nvsentinelSlinkyNamespace']}" not in c.get("args", []):
                     fail(f"{where}: does not watch nvsentinelSlinkyNamespace={values['nvsentinelSlinkyNamespace']}")
-                if (dep["spec"]["template"]["spec"].get("nodeSelector") or {}).get("workload.example.com/pool") != values["cpuNodePool"]:
+                if dep["spec"]["template"]["spec"].get("nodeSelector") != cpu_pod_sel:
                     fail(f"{where}: the controller is not on the CPU services pool")
     if "nvsentinel" in rendered:
         cd = (rendered["nvsentinel"]["values"].get("node-drainer") or {}).get("customDrain") or {}
@@ -665,6 +693,53 @@ for variant, overrides in VARIANTS.items():
             got = {k: cd.get(k) for k in want}
             if got != want:
                 fail(f"{where}: customDrain {got} does not match what the slinky-drainer App deploys {want}")
+
+# --- CPU node selector: Job names and the discover guard -----------------------------------------
+# A Job spec is immutable, so a changed selector must name a new Job, or the upgrade fails.
+for ref in (GATE, DISCOVER):
+    names = []
+    for sel in ("workload.example.com/pool=cpu-services", "foo.acme.corp/cpu-node=true"):
+        docs = render_app(apps[ref], {"cpuNodeSelector": sel, "pinnedVolumeNamespace": "nvsentinel"}, "hash", f"{ref} hash")
+        names.append([d["metadata"]["name"] for d in docs or [] if d.get("kind") == "Job"])
+    if names[0] == names[1]:
+        fail(f"apps/: {ref} keeps Job name {names[0]} when cpuNodeSelector changes; Helm cannot patch a Job's pod template")
+
+# Run the discover script against a fake kubectl. The fake lists one PVC in nvsentinel, gives its
+# PV the node affinity FAKE_TERMS, and reports a node only for the exact selector FAKE_MATCH.
+fake = work / "fakebin"
+fake.mkdir()
+(fake / "kubectl").write_text("""#!/bin/sh
+case "$*" in
+  *clusterpolicies*|*gpuclusters*|*"patch configmap"*) exit 0 ;;
+  *"get pvc"*) [ -n "$FAKE_PV" ] && echo "$FAKE_PV"; exit 0 ;;
+  *"get pv "*) echo "$FAKE_TERMS"; exit 0 ;;
+  *"get nodes"*)
+    while [ $# -gt 0 ]; do [ "$1" = -l ] && sel=$2; shift; done
+    [ "$sel" = "$FAKE_MATCH" ] && echo node/node-a
+    exit 0 ;;
+esac
+echo "fake kubectl: unexpected $*" >&2; exit 1
+""")
+(fake / "kubectl").chmod(0o755)
+docs = render_app(apps[DISCOVER], {"cpuNodeSelector": "x=y", "pinnedVolumeNamespace": "nvsentinel"}, "guard", "discover guard")
+script = next(d for d in docs if d.get("kind") == "Job")["spec"]["template"]["spec"]["containers"][0]["args"][0]
+HOST = "kubernetes.io/hostname In node-a|"
+POOL = "workload.example.com/pool=cpu-services"
+for case, sel, pv, terms, match, ok, says in [
+    ("pinned volume still reachable", POOL, "pv-1", HOST, f"kubernetes.io/hostname in (node-a),{POOL}", True, "reaches every pinned volume"),
+    ("selector strands the volume", "foo.acme.corp/cpu-node=true", "pv-1", HOST, f"kubernetes.io/hostname in (node-a),{POOL}", False, "can reach PersistentVolume pv-1"),
+    ("zonal volume, node in zone", "foo.acme.corp/cpu-node=true", "pv-1", "topology.kubernetes.io/zone In europe-west4-b|",
+     "topology.kubernetes.io/zone in (europe-west4-b),foo.acme.corp/cpu-node=true", True, "reaches every pinned volume"),
+    ("no volumes yet", "foo.acme.corp/cpu-node=true", "", "", "", True, "reaches every pinned volume"),
+    ("malformed selector", "foo", "", "", "", False, "is not a key=value label"),
+]:
+    env = {"PATH": f"{fake}:/usr/bin:/bin", "HOME": str(work), "REQUESTED_MODE": "device-plugin",
+           "CONTRACT_NAME": "gpu-driver-mode", "CONTRACT_NAMESPACE": "gpu-stack", "CPU_NODE_SELECTOR": sel,
+           "PINNED_VOLUME_NAMESPACE": "nvsentinel", "FAKE_PV": pv, "FAKE_TERMS": terms, "FAKE_MATCH": match}
+    r = subprocess.run(["sh", "-c", script], env=env, capture_output=True, text=True)
+    out = r.stdout + r.stderr
+    if (r.returncode == 0) != ok or says not in out:
+        fail(f"apps/{DISCOVER} guard, {case}: exit {r.returncode}, expected {'success' if ok else 'failure'} saying {says!r}: {out.strip()[-300:]}")
 
 # --- VirtualClusterTemplate ----------------------------------------------------------------------
 vct_path = root / "virtualclustertemplate.yaml"

@@ -40,6 +40,11 @@ spec:
       type: string
       required: true
       defaultValue: cpu-services
+    - variable: cpuNodeSelector
+      label: CPU Node Selector
+      description: Comma-separated key=value labels that select the CPU service workers. Empty selects
+        workload.example.com/pool=<cpuNodePool>.
+      type: string
     - variable: version
       label: Chart Version and Image Tag
       type: string
@@ -135,6 +140,14 @@ spec:
         helm:
           releaseName: nvsentinel
           values: |
+            {{- /* cpuNodeSelector (comma-separated key=value), or workload.example.com/pool=<cpuNodePool> when empty. */}}
+            {{- $cpuNodeSelector := dict "kubernetes.io/os" "linux" }}
+            {{- range splitList "," (.Values.cpuNodeSelector | default (printf "workload.example.com/pool=%s" (.Values.cpuNodePool | default "cpu-services"))) }}
+            {{- if trim . }}
+            {{- $kv := splitn "=" 2 (trim .) }}
+            {{- $_ := set $cpuNodeSelector $kv._0 ($kv._1 | default "") }}
+            {{- end }}
+            {{- end }}
             {{- $dra := eq (.Values.gpuDriverMode | default "device-plugin") "dra" }}
             {{- $cordon := ne (.Values.cordon | toString) "false" }}
             {{- $drain := and $cordon (eq (.Values.drain | toString) "true") }}
@@ -190,8 +203,9 @@ spec:
                 operator: Exists
                 effect: NoSchedule
               systemNodeSelector:
-                kubernetes.io/os: linux
-                workload.example.com/pool: {{ .Values.cpuNodePool | quote }}
+                {{- range $k, $v := $cpuNodeSelector }}
+                {{ $k }}: {{ $v | quote }}
+                {{- end }}
               systemNodeTolerations: []
             networkPolicy:
               enabled: true
@@ -258,8 +272,9 @@ spec:
                       {{- end }}
                 # Also places the MongoDB setup Jobs.
                 nodeSelector:
-                  kubernetes.io/os: linux
-                  workload.example.com/pool: {{ .Values.cpuNodePool | quote }}
+                  {{- range $k, $v := $cpuNodeSelector }}
+                  {{ $k }}: {{ $v | quote }}
+                  {{- end }}
                 persistence:
                   size: 10Gi
             platformConnector:
@@ -274,8 +289,9 @@ spec:
                         - gpu-compute
             nodeConditionCleanup:
               nodeSelector:
-                kubernetes.io/os: linux
-                workload.example.com/pool: {{ .Values.cpuNodePool | quote }}
+                {{- range $k, $v := $cpuNodeSelector }}
+                {{ $k }}: {{ $v | quote }}
+                {{- end }}
               tolerations: []
       syncPolicy:
         managedNamespaceMetadata:
