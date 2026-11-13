@@ -75,6 +75,15 @@ spec:
         would strand NVSentinel's MongoDB volume, but cannot stop the change. Check before changing it.
       type: string
       section: Node Pools
+    - variable: gpuNodeSelector
+      label: GPU Node Selector
+      description: Comma-separated key=value labels that select the GPU workers, replacing
+        workload.example.com/pool=gpu-compute. Leave empty to keep that selector, which also keeps an
+        upgrade from moving anything. The gpuready gate counts GPUs only on these nodes, and the NFD
+        workers, NVSentinel's GPU agents and the smoke test run there, tolerating the nvidia.com/gpu
+        NoSchedule taint. Changing it moves those pods.
+      type: string
+      section: Node Pools
     - variable: minGPUs
       label: Minimum Allocatable GPUs
       description: How many GPUs the scheduler must advertise before the gpuready gate passes and NVSentinel starts.
@@ -209,6 +218,10 @@ spec:
       fromTask:
         task: gpuready
         output: gpupool
+    - name: gpunodeselector
+      fromTask:
+        task: gpuready
+        output: gpunodeselector
     - name: dcgmhost
       fromTask:
         task: gpuready
@@ -291,6 +304,7 @@ spec:
         parameters:
           cpuNodePool: '{{ .Values.cpuNodePool }}'
           cpuNodeSelector: '{{ .Values.cpuNodeSelector }}'
+          gpuNodeSelector: '{{ .Values.gpuNodeSelector }}'
           version: '{{ .Values.gpuOperatorVersion }}'
           project: '{{ .Values.argoProject }}'
           driverPreinstalled: '{{ .Values.driverPreinstalled | toString }}'
@@ -327,12 +341,14 @@ spec:
           # Whole GPUs only. Ignored with allocatable.
           capacityDeviceType: gpu
           capacityMin: '{{ .Values.minGPUs }}'
-          capacityNodeSelector: workload.example.com/pool=gpu-compute
+          capacityNodeSelector: '{{ .Values.gpuNodeSelector | default "workload.example.com/pool=gpu-compute" }}'
           contractName: gpu-stack-contract
           # The gate App is workload-agnostic. The GPU keys belong here, with the Stack that
-          # publishes them.
+          # publishes them. gpuPool is the pool label's value, empty once gpuNodeSelector
+          # replaces it; gpuNodeSelector is the selector in effect either way.
           contractData: |
-            gpuPool: gpu-compute
+            gpuPool: {{ if .Values.gpuNodeSelector }}""{{ else }}gpu-compute{{ end }}
+            gpuNodeSelector: {{ .Values.gpuNodeSelector | default "workload.example.com/pool=gpu-compute" | quote }}
             dcgmHost: {{ .Outputs.discover.dcgmhost }}
             dcgmPort: "5555"
           timeoutSeconds: "1380"
@@ -351,6 +367,13 @@ spec:
             namespace: gpu-stack
             name: gpu-stack-contract
             jsonPath: '{.data.gpuPool}'
+        - name: gpunodeselector
+          fromResource:
+            apiVersion: v1
+            kind: ConfigMap
+            namespace: gpu-stack
+            name: gpu-stack-contract
+            jsonPath: '{.data.gpuNodeSelector}'
         - name: dcgmhost
           fromResource:
             apiVersion: v1
@@ -399,7 +422,7 @@ spec:
         templateRef:
           name: nvidia-gpu-operator-gpu-smoke-test
         parameters:
-          gpuNodeSelector: 'workload.example.com/pool={{ .Outputs.gpuready.gpupool }}'
+          gpuNodeSelector: '{{ .Outputs.gpuready.gpunodeselector }}'
           gpuCount: "1"
           gpuDriverMode: '{{ .Outputs.discover.mode }}'
     # Always runs, and renders nothing unless Slinky drain is effectively on. The same expression
@@ -432,6 +455,7 @@ spec:
         parameters:
           cpuNodePool: '{{ .Values.cpuNodePool }}'
           cpuNodeSelector: '{{ .Values.cpuNodeSelector }}'
+          gpuNodeSelector: '{{ .Values.gpuNodeSelector }}'
           version: '{{ .Values.nvsentinelVersion }}'
           project: '{{ .Values.argoProject }}'
           driverPreinstalled: '{{ .Values.driverPreinstalled | toString }}'

@@ -240,6 +240,12 @@ def cpu_selector(values):
     return dict(p.strip().split("=", 1) for p in raw.split(",") if p.strip())
 
 
+def gpu_selector(values):
+    """The GPU node selector every GPU workload must carry: gpuNodeSelector, or the GPU pool label."""
+    raw = str(values.get("gpuNodeSelector") or "") or "workload.example.com/pool=gpu-compute"
+    return dict(p.strip().split("=", 1) for p in raw.split(",") if p.strip())
+
+
 def check_refs(where, node, declared, extra_ok=()):
     for path, s in strings(node):
         for ref in VALUES_REF.findall(s):
@@ -270,7 +276,7 @@ if not cpu_profile or not gpu_profile:
 if cpu_profile.get("taints"):
     fail("nodeprofiles.yaml: the CPU services profile must stay untainted; controllers and gates carry no toleration")
 if (gpu_profile.get("nodeLabels") or {}).get("workload.example.com/pool") != "gpu-compute":
-    fail("nodeprofiles.yaml: the GPU profile must label workload.example.com/pool=gpu-compute; the templates hard-code it")
+    fail("nodeprofiles.yaml: the GPU profile must label workload.example.com/pool=gpu-compute, the selector an empty gpuNodeSelector falls back to")
 if not any(t.get("key") == "nvidia.com/gpu" and t.get("effect") == "NoSchedule" for t in gpu_profile.get("taints") or []):
     fail("nodeprofiles.yaml: the GPU profile must taint nvidia.com/gpu:NoSchedule; every GPU toleration matches it")
 
@@ -303,6 +309,13 @@ for path in sorted((root / "apps").glob("*.yaml")):
             fail(f"{rel(path)}: no defaultNamespace; Stack outputs can be read only from a namespace a task deploys into")
     else:
         check_refs(rel(path), doc["spec"]["template"], params)
+        # The Platform renders these itself, with fewer functions than Helm's tpl that this test
+        # uses. Functions it was seen to lack ("function ... not defined"):
+        for func in ("merge",):
+            for _, text in strings(doc["spec"]["template"]):
+                if re.search(r"\{\{[^}]*\b" + func + r"\b", re.sub(r"/\*.*?\*/", "", text, flags=re.S)):
+                    fail(f"{rel(path)}: uses {func}, which the Platform's template renderer does not define")
+                    break
     apps[name] = {"path": path, "doc": doc, "params": params, "kind": kind}
 
 gate_doc = apps.get(GATE, {})
@@ -394,6 +407,8 @@ if (str(defaults(stack_params).get("nvsentinelCordon")), str(defaults(stack_para
     fail("stacktemplate.yaml: NVSentinel must default to cordoning without draining (nvsentinelCordon=true, nvsentinelDryRun=false, nvsentinelDrain=false)")
 if defaults(stack_params).get("cpuNodeSelector"):
     fail("stacktemplate.yaml: cpuNodeSelector must default to empty, so an upgrade keeps workload.example.com/pool=<cpuNodePool>")
+if defaults(stack_params).get("gpuNodeSelector"):
+    fail("stacktemplate.yaml: gpuNodeSelector must default to empty, so an upgrade keeps workload.example.com/pool=gpu-compute")
 if str(defaults(stack_params).get("nvsentinelSlinkyDrain")) != "false":
     fail("stacktemplate.yaml: Slinky drain is opt-in; nvsentinelSlinkyDrain must default to false")
 
@@ -428,14 +443,16 @@ VARIANTS = {
     "alternate": {"gpuDriverMode": "device-plugin", "driverPreinstalled": "true", "waitForClusterPolicy": "true", "minGPUs": "2",
                   "nvsentinelCordon": "false", "nvsentinelDryRun": "true", "nvsentinelDrain": "true",
                   "nvsentinelSlinkyDrain": "true",
-                  "cpuNodeSelector": "foo.acme.corp/cpu-node=true, tier=services"},
+                  "cpuNodeSelector": "foo.acme.corp/cpu-node=true, tier=services",
+                  "gpuNodeSelector": "foo.acme.corp/gpu-node=true, tier=gpu"},
     "dra": {"gpuDriverMode": "dra"},
     "dra-alternate": {"gpuDriverMode": "dra", "driverPreinstalled": "true", "waitForClusterPolicy": "true", "minGPUs": "2",
                       "nvsentinelDryRun": "true", "nvsentinelMongodbReplicas": "3", "nvsentinelDrain": "true",
                       "nvsentinelCircuitBreakerPercentage": "100", "nvsentinelCircuitBreakerMaxNodes": "2",
                       "nvsentinelSlinkyDrain": "true", "nvsentinelSlinkyNodeSelector": "slurm=worker",
                       "nvsentinelSlinkyNamespace": "hpc",
-                      "cpuNodeSelector": "foo.acme.corp/cpu-node=true"},
+                      "cpuNodeSelector": "foo.acme.corp/cpu-node=true",
+                      "gpuNodeSelector": "foo.acme.corp/gpu-node=true"},
 }
 for variant, overrides in VARIANTS.items():
     values = {**defaults(stack_params), **overrides}
@@ -443,6 +460,9 @@ for variant, overrides in VARIANTS.items():
     slinky = on("nvsentinelCordon") and on("nvsentinelDrain") and on("nvsentinelSlinkyDrain")
     cpu_sel = cpu_selector(values)
     cpu_pod_sel = {"kubernetes.io/os": "linux", **cpu_sel}
+    gpu_sel = gpu_selector(values)
+    gpu_pod_sel = {"kubernetes.io/os": "linux", **gpu_sel}
+    parse_sel = lambda raw: dict(p.strip().split("=", 1) for p in (raw or "").split(",") if p.strip())
     # auto on a cluster without a GPU Operator resolves to device-plugin.
     mode = {"auto": "device-plugin"}.get(values["gpuDriverMode"], values["gpuDriverMode"])
     dra = mode == "dra"
@@ -558,6 +578,9 @@ for variant, overrides in VARIANTS.items():
                 got = (got or {}).get(k)
             if got != cpu_pod_sel:
                 fail(f"task gpu-operator ({variant}): {'.'.join(path)} is {got}, expected the CPU node selector {cpu_pod_sel}")
+        got = hv["node-feature-discovery"]["worker"].get("nodeSelector")
+        if got != gpu_pod_sel:
+            fail(f"task gpu-operator ({variant}): node-feature-discovery.worker.nodeSelector is {got}, expected the GPU node selector {gpu_pod_sel}")
         driver = hv["driver"]["enabled"]
         if driver is on("driverPreinstalled"):
             fail(f"task gpu-operator ({variant}): driver.enabled={driver} with driverPreinstalled={values['driverPreinstalled']}")
@@ -578,8 +601,13 @@ for variant, overrides in VARIANTS.items():
         rules = next(d for d in rendered["gpuready"]["docs"] if d.get("kind") == "ClusterRole")["rules"]
         if dra and not any("resourceslices" in r.get("resources", []) for r in rules):
             fail(f"task gpuready ({variant}): counts ResourceSlices without RBAC to list them")
-        if env.get("CAPACITY_NODE_SELECTOR") != "workload.example.com/pool=gpu-compute":
-            fail(f"task gpuready ({variant}): capacity is not counted on the GPU pool")
+        if parse_sel(env.get("CAPACITY_NODE_SELECTOR")) != gpu_sel:
+            fail(f"task gpuready ({variant}): capacity is counted on {env.get('CAPACITY_NODE_SELECTOR')!r}, not the GPU node selector {gpu_sel}")
+        if parse_sel(contract.get("gpuNodeSelector")) != gpu_sel:
+            fail(f"task gpuready ({variant}): contract gpuNodeSelector {contract.get('gpuNodeSelector')!r} is not the GPU node selector {gpu_sel}")
+        want_pool = "" if values.get("gpuNodeSelector") else "gpu-compute"
+        if contract.get("gpuPool") != want_pool:
+            fail(f"task gpuready ({variant}): contract gpuPool {contract.get('gpuPool')!r}, expected {want_pool!r}")
     if "dcgmready" in rendered:
         env = rendered["dcgmready"]["env"]
         expected = f"daemonset/{facts['dcgmDaemonSet']}"
@@ -589,8 +617,8 @@ for variant, overrides in VARIANTS.items():
             fail(f"task dcgmready ({variant}): publishes a contract; only gpuready does")
     if "gpu-smoke-test" in rendered:
         pod = rendered["gpu-smoke-test"]["pod"]
-        if (pod.get("nodeSelector") or {}).get("workload.example.com/pool") != contract.get("gpuPool"):
-            fail(f"task gpu-smoke-test ({variant}): does not select the GPU pool from the gate's contract")
+        if pod.get("nodeSelector") != gpu_sel:
+            fail(f"task gpu-smoke-test ({variant}): nodeSelector {pod.get('nodeSelector')} is not the GPU node selector {gpu_sel} from the gate's contract")
         if not any(t.get("key") == "nvidia.com/gpu" for t in pod.get("tolerations") or []):
             fail(f"task gpu-smoke-test ({variant}): does not tolerate the GPU taint")
         res = pod["containers"][0].get("resources") or {}
@@ -643,6 +671,12 @@ for variant, overrides in VARIANTS.items():
                 got = (got or {}).get(k)
             if got != cpu_pod_sel:
                 fail(f"task nvsentinel ({variant}): {'.'.join(path)} is {got}, expected the CPU node selector {cpu_pod_sel}")
+        if hv["global"].get("nodeSelector") != gpu_pod_sel:
+            fail(f"task nvsentinel ({variant}): global.nodeSelector is {hv['global'].get('nodeSelector')}, expected the GPU node selector {gpu_pod_sel}")
+        terms = hv["platformConnector"]["affinity"]["nodeAffinity"]["requiredDuringSchedulingIgnoredDuringExecution"]["nodeSelectorTerms"]
+        exprs = {e["key"]: (e["operator"], e["values"]) for t in terms for e in t.get("matchExpressions") or []}
+        if len(terms) != 1 or exprs != {k: ("In", [v]) for k, v in gpu_sel.items()}:
+            fail(f"task nvsentinel ({variant}): platformConnector affinity {terms} does not require exactly the GPU node selector {gpu_sel}")
         if cordon:
             cb = (hv.get("fault-quarantine") or {}).get("circuitBreaker") or {}
             want = {"enabled": True, "percentage": int(values["nvsentinelCircuitBreakerPercentage"]),
@@ -703,6 +737,13 @@ for ref in (GATE, DISCOVER):
         names.append([d["metadata"]["name"] for d in docs or [] if d.get("kind") == "Job"])
     if names[0] == names[1]:
         fail(f"apps/: {ref} keeps Job name {names[0]} when cpuNodeSelector changes; Helm cannot patch a Job's pod template")
+for ref, param in ((GATE, "capacityNodeSelector"), (f"{PREFIX}-gpu-smoke-test", "gpuNodeSelector")):
+    names = []
+    for sel in ("workload.example.com/pool=gpu-compute", "foo.acme.corp/gpu-node=true"):
+        docs = render_app(apps[ref], {param: sel}, "hash", f"{ref} hash")
+        names.append([d["metadata"]["name"] for d in docs or [] if d.get("kind") == "Job"])
+    if names[0] == names[1]:
+        fail(f"apps/: {ref} keeps Job name {names[0]} when {param} changes; Helm cannot patch a Job's pod template")
 
 # Run the discover script against a fake kubectl. The fake lists one PVC in nvsentinel, gives its
 # PV the node affinity FAKE_TERMS, and reports a node only for the exact selector FAKE_MATCH.

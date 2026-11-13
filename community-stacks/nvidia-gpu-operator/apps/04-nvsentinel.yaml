@@ -45,6 +45,11 @@ spec:
       description: Comma-separated key=value labels that select the CPU service workers. Empty selects
         workload.example.com/pool=<cpuNodePool>.
       type: string
+    - variable: gpuNodeSelector
+      label: GPU Node Selector
+      description: Comma-separated key=value labels that select the GPU workers. Empty selects
+        workload.example.com/pool=gpu-compute.
+      type: string
     - variable: version
       label: Chart Version and Image Tag
       type: string
@@ -148,6 +153,20 @@ spec:
             {{- $_ := set $cpuNodeSelector $kv._0 ($kv._1 | default "") }}
             {{- end }}
             {{- end }}
+            {{- /* gpuNodeSelector (comma-separated key=value), or workload.example.com/pool=gpu-compute when empty. */}}
+            {{- /* $gpuLabels holds only those pairs, for platformConnector's affinity. */}}
+            {{- $gpuLabels := dict }}
+            {{- range splitList "," (.Values.gpuNodeSelector | default "workload.example.com/pool=gpu-compute") }}
+            {{- if trim . }}
+            {{- $kv := splitn "=" 2 (trim .) }}
+            {{- $_ := set $gpuLabels $kv._0 ($kv._1 | default "") }}
+            {{- end }}
+            {{- end }}
+            {{- /* No merge: the Platform's template functions do not include it. */}}
+            {{- $gpuNodeSelector := dict "kubernetes.io/os" "linux" }}
+            {{- range $k, $v := $gpuLabels }}
+            {{- $_ := set $gpuNodeSelector $k $v }}
+            {{- end }}
             {{- $dra := eq (.Values.gpuDriverMode | default "device-plugin") "dra" }}
             {{- $cordon := ne (.Values.cordon | toString) "false" }}
             {{- $drain := and $cordon (eq (.Values.drain | toString) "true") }}
@@ -196,8 +215,9 @@ spec:
               auditLogging:
                 enabled: false
               nodeSelector:
-                kubernetes.io/os: linux
-                workload.example.com/pool: gpu-compute
+                {{- range $k, $v := $gpuNodeSelector }}
+                {{ $k }}: {{ $v | quote }}
+                {{- end }}
               tolerations:
               - key: nvidia.com/gpu
                 operator: Exists
@@ -283,10 +303,12 @@ spec:
                   requiredDuringSchedulingIgnoredDuringExecution:
                     nodeSelectorTerms:
                     - matchExpressions:
-                      - key: workload.example.com/pool
+                      {{- range $k, $v := $gpuLabels }}
+                      - key: {{ $k }}
                         operator: In
                         values:
-                        - gpu-compute
+                        - {{ $v | quote }}
+                      {{- end }}
             nodeConditionCleanup:
               nodeSelector:
                 {{- range $k, $v := $cpuNodeSelector }}
