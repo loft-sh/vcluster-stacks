@@ -63,6 +63,59 @@ spec:
         fi
       }
 
+      # The CPU node selector places controllers, Jobs and NVSentinel's MongoDB. MongoDB's volume can
+      # be pinned to a node or zone, and a StatefulSet replaces its pod before the new one can
+      # schedule, so a selector that drops every node the volume can reach takes the store down.
+      # Fail on such a selector, so the Stack reports it. The Stack does not hold the other tasks while
+      # discover re-runs, so this flags the change rather than preventing it.
+      if [ -n "${CPU_NODE_SELECTOR}" ]; then
+        for pair in $(printf '%s' "$CPU_NODE_SELECTOR" | tr ',' ' '); do
+          printf '%s\n' "$pair" | grep -Eq '^([a-z0-9]([-a-z0-9.]*[a-z0-9])?/)?[A-Za-z0-9]([-A-Za-z0-9_.]*[A-Za-z0-9])?=([A-Za-z0-9]([-A-Za-z0-9_.]*[A-Za-z0-9])?)?$' \
+            || fail "CPU node selector '${CPU_NODE_SELECTOR}': '${pair}' is not a key=value label"
+        done
+        if [ -n "${PINNED_VOLUME_NAMESPACE}" ]; then
+          pvs=$(kubectl -n "$PINNED_VOLUME_NAMESPACE" get pvc -o jsonpath='{range .items[*]}{.spec.volumeName}{"\n"}{end}') \
+            || fail "could not list PersistentVolumeClaims in ${PINNED_VOLUME_NAMESPACE}"
+          for pv in $pvs; do
+            # One line per nodeSelectorTerm (terms are ORed), expressions separated by |.
+            terms=$(kubectl get pv "$pv" -o jsonpath='{range .spec.nodeAffinity.required.nodeSelectorTerms[*]}{range .matchExpressions[*]}{.key} {.operator} {.values[*]}|{end}{"\n"}{end}') \
+              || fail "could not read PersistentVolume ${pv}"
+            [ -n "$terms" ] || continue
+            reachable=
+            unknown=
+            while IFS= read -r term; do
+              [ -n "$term" ] || continue
+              sel=
+              rest=$term
+              while [ -n "$rest" ]; do
+                expr=${rest%%|*}; rest=${rest#*|}
+                set -- $expr
+                key=$1; op=$2; shift 2
+                vals=$(printf '%s' "$*" | tr ' ' ',')
+                case "$op" in
+                  In) part="${key} in (${vals})" ;;
+                  NotIn) part="${key} notin (${vals})" ;;
+                  Exists) part="${key}" ;;
+                  DoesNotExist) part="!${key}" ;;
+                  *) unknown=1; part= ;;
+                esac
+                if [ -n "$part" ]; then sel="${sel:+${sel},}${part}"; fi
+              done
+              [ -n "$sel" ] || continue
+              matched=$(kubectl get nodes -l "${sel},${CPU_NODE_SELECTOR}" -o name) \
+                || fail "could not list nodes for PersistentVolume ${pv}"
+              if [ -n "$matched" ]; then reachable=1; fi
+            done <<EOF
+      $terms
+      EOF
+            if [ -z "$reachable" ] && [ -z "$unknown" ]; then
+              fail "no node matching the CPU node selector '${CPU_NODE_SELECTOR}' can reach PersistentVolume ${pv} (${PINNED_VOLUME_NAMESPACE}). Its pod could not schedule after the change. Keep a node it is pinned to in the selector, or move or delete its claim first."
+            fi
+          done
+          log "CPU node selector ${CPU_NODE_SELECTOR} reaches every pinned volume in ${PINNED_VOLUME_NAMESPACE}"
+        fi
+      fi
+
       cp=$(count clusterpolicies.nvidia.com)
       gc=$(count gpuclusters.nvidia.com)
       log "found ${cp} ClusterPolicy and ${gc} GPUCluster"
@@ -120,8 +173,8 @@ spec:
       {{- end -}}
 
       {{- $requested := .Values.gpuDriverMode | default "auto" -}}
-      {{- /* A Job spec is immutable. Changing any setting names a new Job, which also decides again. */ -}}
-      {{- $hash := printf "%s|%s" $requested (.Values.cpuNodeSelector | default "") | sha256sum | trunc 8 -}}
+      {{- /* A Job spec is immutable. Changing any setting, or the script, names a new Job, which also decides again. */ -}}
+      {{- $hash := printf "%s|%s|%s|%s" $requested (.Values.cpuNodeSelector | default "") (.Values.pinnedVolumeNamespace | default "") (include "discover.script" . | sha256sum) | sha256sum | trunc 8 -}}
       # The Job adds the decision to this ConfigMap. `kubectl -n gpu-stack get cm gpu-driver-mode -o yaml`
       # shows what was decided and why.
       apiVersion: v1
@@ -167,7 +220,8 @@ spec:
         kind: Role
         name: {{ .Release.Name | trunc 50 | trimSuffix "-" }}-discover
       ---
-      # Read-only: the two GPU Operator CRs, to tell which mode the cluster already runs.
+      # Read-only: the two GPU Operator CRs, to tell which mode the cluster already runs, and the
+      # nodes and volumes the CPU node selector check reads.
       apiVersion: rbac.authorization.k8s.io/v1
       kind: ClusterRole
       metadata:
@@ -177,6 +231,10 @@ spec:
       rules:
         - apiGroups: ["nvidia.com"]
           resources: ["clusterpolicies", "gpuclusters"]
+          verbs: ["get", "list"]
+        # The CPU node selector check: nodes it matches, and the volumes it must still reach.
+        - apiGroups: [""]
+          resources: ["nodes", "persistentvolumes", "persistentvolumeclaims"]
           verbs: ["get", "list"]
       ---
       apiVersion: rbac.authorization.k8s.io/v1
@@ -212,9 +270,13 @@ spec:
             serviceAccountName: {{ .Release.Name | trunc 50 | trimSuffix "-" }}-discover
             restartPolicy: Never
             {{- with .Values.cpuNodeSelector }}
-            {{- $kv := splitn "=" 2 . }}
             nodeSelector:
-              {{ $kv._0 }}: {{ $kv._1 | quote }}
+              {{- range splitList "," . }}
+              {{- if trim . }}
+              {{- $kv := splitn "=" 2 (trim .) }}
+              {{ $kv._0 }}: {{ $kv._1 | default "" | quote }}
+              {{- end }}
+              {{- end }}
             {{- end }}
             securityContext:
               runAsNonRoot: true
@@ -243,6 +305,10 @@ spec:
                     value: /tmp/.kube-cache
                   - name: REQUESTED_MODE
                     value: {{ $requested | quote }}
+                  - name: CPU_NODE_SELECTOR
+                    value: {{ .Values.cpuNodeSelector | default "" | quote }}
+                  - name: PINNED_VOLUME_NAMESPACE
+                    value: {{ .Values.pinnedVolumeNamespace | default "" | quote }}
                   - name: CONTRACT_NAME
                     value: gpu-driver-mode
                   - name: CONTRACT_NAMESPACE
@@ -267,5 +333,10 @@ spec:
       defaultValue: auto
     - variable: cpuNodeSelector
       label: CPU node selector
-      description: Optional key=value label selector for the node that runs the Job.
+      description: Optional comma-separated key=value labels for the node that runs the Job.
+      type: string
+    - variable: pinnedVolumeNamespace
+      label: Pinned volume namespace
+      description: Optional namespace whose bound volumes must stay reachable from a node matching cpuNodeSelector.
+        The Job fails, and the Stack reports it, if a selector would strand one.
       type: string

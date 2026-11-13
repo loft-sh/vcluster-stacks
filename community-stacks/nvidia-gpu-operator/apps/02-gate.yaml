@@ -159,8 +159,8 @@ spec:
       {{- $capacityMin := .Values.capacityMin | default "0" | toString -}}
       {{- $capacitySource := .Values.capacitySource | default "allocatable" -}}
       {{- $contractName := .Values.contractName | default "" -}}
-      {{- /* A Job spec is immutable. Changing any setting names a new Job, which also re-runs the gate. */ -}}
-      {{- $hash := printf "%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s" $waitResource (.Values.waitNamespace | default "") (.Values.waitCondition | default "") $capacitySource (.Values.capacityResource | default "") (.Values.capacityDeviceType | default "") $capacityMin (.Values.capacityNodeSelector | default "") $contractName (.Values.contractData | default "") (.Values.timeoutSeconds | default "1380" | toString) | sha256sum | trunc 8 -}}
+      {{- /* A Job spec is immutable. Changing any setting, or the check script, names a new Job, which also re-runs the gate. */ -}}
+      {{- $hash := printf "%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s" $waitResource (.Values.waitNamespace | default "") (.Values.waitCondition | default "") $capacitySource (.Values.capacityResource | default "") (.Values.capacityDeviceType | default "") $capacityMin (.Values.capacityNodeSelector | default "") $contractName (.Values.contractData | default "") (.Values.timeoutSeconds | default "1380" | toString) (.Values.cpuNodeSelector | default "") (include "gate.check" . | sha256sum) | sha256sum | trunc 8 -}}
 
       {{- if $contractName }}
       apiVersion: v1
@@ -264,9 +264,13 @@ spec:
             serviceAccountName: {{ include "gate.fullname" . }}
             restartPolicy: Never
             {{- with .Values.cpuNodeSelector }}
-            {{- $kv := splitn "=" 2 . }}
             nodeSelector:
-              {{ $kv._0 }}: {{ $kv._1 | quote }}
+              {{- range splitList "," . }}
+              {{- if trim . }}
+              {{- $kv := splitn "=" 2 (trim .) }}
+              {{ $kv._0 }}: {{ $kv._1 | default "" | quote }}
+              {{- end }}
+              {{- end }}
             {{- end }}
             securityContext:
               runAsNonRoot: true
@@ -337,7 +341,7 @@ spec:
       defaultValue: gate
     - variable: cpuNodeSelector
       label: CPU node selector
-      description: Optional key=value label selector for the node that runs the gate Job.
+      description: Optional comma-separated key=value labels for the node that runs the gate Job.
       type: string
     - variable: waitEnabled
       label: Wait for the resource

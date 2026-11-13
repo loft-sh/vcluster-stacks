@@ -37,6 +37,14 @@ spec:
     manifests: |-
       {{- if eq (.Values.enabled | toString) "true" }}
       {{- $version := .Values.version | default "v1.31.0" }}
+      {{- /* cpuNodeSelector (comma-separated key=value), or workload.example.com/pool=<cpuNodePool> when empty. */}}
+      {{- $cpuNodeSelector := dict "kubernetes.io/os" "linux" }}
+      {{- range splitList "," (.Values.cpuNodeSelector | default (printf "workload.example.com/pool=%s" (.Values.cpuNodePool | default "cpu-services"))) }}
+      {{- if trim . }}
+      {{- $kv := splitn "=" 2 (trim .) }}
+      {{- $_ := set $cpuNodeSelector $kv._0 ($kv._1 | default "") }}
+      {{- end }}
+      {{- end }}
       {{- $labels := printf "app.kubernetes.io/name: slinky-drainer\napp.kubernetes.io/instance: %s\napp.kubernetes.io/part-of: nvidia-gpu-operator-stack" (.Release.Name | quote) }}
       apiVersion: apiextensions.k8s.io/v1
       kind: CustomResourceDefinition
@@ -284,8 +292,9 @@ spec:
           spec:
             serviceAccountName: slinky-drainer
             nodeSelector:
-              kubernetes.io/os: linux
-              workload.example.com/pool: {{ .Values.cpuNodePool | default "cpu-services" | quote }}
+              {{- range $k, $v := $cpuNodeSelector }}
+              {{ $k }}: {{ $v | quote }}
+              {{- end }}
             securityContext:
               runAsNonRoot: true
               seccompProfile:
@@ -365,3 +374,8 @@ spec:
       description: Value of workload.example.com/pool on CPU service workers, where the controller runs.
       type: string
       defaultValue: cpu-services
+    - variable: cpuNodeSelector
+      label: CPU Node Selector
+      description: Comma-separated key=value labels that select the CPU service workers. Empty selects
+        workload.example.com/pool=<cpuNodePool>.
+      type: string
