@@ -96,6 +96,12 @@ spec:
         Stack selects by default.
       type: string
       section: Node Pools
+    - variable: gpuNodeSelector
+      label: GPU Node Selector
+      description: Leave empty. The NodeProfiles label the GPU pool with workload.example.com/pool=gpu-compute,
+        which the Stack selects by default.
+      type: string
+      section: Node Pools
     - variable: minGPUs
       label: Minimum Allocatable GPUs
       description: How many GPUs the scheduler must advertise before the gpuready gate passes.
@@ -280,6 +286,7 @@ spec:
                 argoProject: {{ .Values.argoProject | quote }}
                 cpuNodePool: {{ .Values.cpuNodePool | quote }}
                 cpuNodeSelector: {{ .Values.cpuNodeSelector | default "" | quote }}
+                gpuNodeSelector: {{ .Values.gpuNodeSelector | default "" | quote }}
                 minGPUs: {{ .Values.minGPUs | toString | quote }}
                 gpuDriverMode: {{ .Values.gpuDriverMode | quote }}
                 nvsentinelCordon: {{ .Values.nvsentinelCordon | toString | quote }}

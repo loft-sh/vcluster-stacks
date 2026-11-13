@@ -28,6 +28,11 @@ spec:
       description: Comma-separated key=value labels that select the CPU service workers. Empty selects
         workload.example.com/pool=<cpuNodePool>.
       type: string
+    - variable: gpuNodeSelector
+      label: GPU Node Selector
+      description: Comma-separated key=value labels that select the GPU workers. Empty selects
+        workload.example.com/pool=gpu-compute.
+      type: string
     - variable: version
       label: Chart Version
       type: string
@@ -69,6 +74,14 @@ spec:
             {{- if trim . }}
             {{- $kv := splitn "=" 2 (trim .) }}
             {{- $_ := set $cpuNodeSelector $kv._0 ($kv._1 | default "") }}
+            {{- end }}
+            {{- end }}
+            {{- /* gpuNodeSelector (comma-separated key=value), or workload.example.com/pool=gpu-compute when empty. */}}
+            {{- $gpuNodeSelector := dict "kubernetes.io/os" "linux" }}
+            {{- range splitList "," (.Values.gpuNodeSelector | default "workload.example.com/pool=gpu-compute") }}
+            {{- if trim . }}
+            {{- $kv := splitn "=" 2 (trim .) }}
+            {{- $_ := set $gpuNodeSelector $kv._0 ($kv._1 | default "") }}
             {{- end }}
             {{- end }}
             {{- $dra := eq (.Values.gpuDriverMode | default "device-plugin") "dra" }}
@@ -170,8 +183,9 @@ spec:
                   {{- end }}
               worker:
                 nodeSelector:
-                  kubernetes.io/os: linux
-                  workload.example.com/pool: gpu-compute
+                  {{- range $k, $v := $gpuNodeSelector }}
+                  {{ $k }}: {{ $v | quote }}
+                  {{- end }}
                 tolerations:
                 - key: nvidia.com/gpu
                   operator: Exists

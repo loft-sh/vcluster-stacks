@@ -64,9 +64,13 @@ spec:
           spec:
             restartPolicy: Never
             {{- with .Values.gpuNodeSelector }}
-            {{- $kv := splitn "=" 2 . }}
             nodeSelector:
-              {{ $kv._0 }}: {{ $kv._1 | quote }}
+              {{- range splitList "," . }}
+              {{- if trim . }}
+              {{- $kv := splitn "=" 2 (trim .) }}
+              {{ $kv._0 }}: {{ $kv._1 | default "" | quote }}
+              {{- end }}
+              {{- end }}
             {{- end }}
             tolerations:
               - key: nvidia.com/gpu
@@ -91,7 +95,7 @@ spec:
   parameters:
     - variable: gpuNodeSelector
       label: GPU node selector
-      description: Optional key=value label selector for GPU workers. The GPU request alone already restricts placement.
+      description: Optional comma-separated key=value labels that select GPU workers. The GPU request alone already restricts placement.
       type: string
     - variable: gpuDriverMode
       label: GPU driver mode
