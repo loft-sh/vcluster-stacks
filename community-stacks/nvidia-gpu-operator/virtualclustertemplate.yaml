@@ -174,17 +174,32 @@ spec:
       type: boolean
       defaultValue: "false"
       section: NVSentinel
+    - variable: nvsentinelCircuitBreakerEnabled
+      label: NVSentinel Circuit Breaker Enabled
+      description: Stop cordoning when too many GPU nodes are cordoned within the window. Off removes that
+        limit, but one or two GPU nodes then recover without a manual reset.
+      type: boolean
+      defaultValue: "true"
+      section: NVSentinel
+    - variable: nvsentinelCircuitBreakerDuration
+      label: NVSentinel Circuit Breaker Window
+      description: Window the circuit breaker counts cordons in, as a Go duration such as 5m or 1h.
+      type: string
+      defaultValue: 5m
+      section: NVSentinel
     - variable: nvsentinelCircuitBreakerPercentage
       label: NVSentinel Circuit Breaker Percentage
-      description: Share of GPU nodes cordoned within 5 minutes that trips NVSentinel's circuit breaker, which then
-        stops all cordoning and uncordoning until reset by hand. With one GPU node, the first cordon trips it.
+      description: Share of GPU nodes cordoned within the window that trips NVSentinel's circuit breaker,
+        which then stops all cordoning and uncordoning until reset by hand. With one GPU node, the first
+        cordon trips it.
       type: number
       defaultValue: "50"
       min: 1
       section: NVSentinel
     - variable: nvsentinelCircuitBreakerMaxNodes
       label: NVSentinel Circuit Breaker Max Nodes
-      description: Cordons within 5 minutes that trip the breaker regardless of fleet size. 0 uses the percentage alone.
+      description: Cordons within the window that trip the breaker regardless of fleet size. 0 uses the
+        percentage alone.
       type: number
       defaultValue: "0"
       min: 0
@@ -296,6 +311,8 @@ spec:
                 nvsentinelSlinkyNodeSelector: {{ .Values.nvsentinelSlinkyNodeSelector | quote }}
                 nvsentinelSlinkyNamespace: {{ .Values.nvsentinelSlinkyNamespace | quote }}
                 nvsentinelMongodbReplicas: {{ .Values.nvsentinelMongodbReplicas | toString | quote }}
+                nvsentinelCircuitBreakerEnabled: {{ .Values.nvsentinelCircuitBreakerEnabled | toString | quote }}
+                nvsentinelCircuitBreakerDuration: {{ .Values.nvsentinelCircuitBreakerDuration | quote }}
                 nvsentinelCircuitBreakerPercentage: {{ .Values.nvsentinelCircuitBreakerPercentage | toString | quote }}
                 nvsentinelCircuitBreakerMaxNodes: {{ .Values.nvsentinelCircuitBreakerMaxNodes | toString | quote }}
                 driverPreinstalled: {{ .Values.driverPreinstalled | toString | quote }}

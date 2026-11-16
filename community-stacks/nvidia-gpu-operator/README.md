@@ -268,8 +268,8 @@ readiness at the Stack level.
 
 By default NVSentinel acts on a GPU fault by cordoning the node, so no new pods land on it. It does
 not drain the node unless you set `nvsentinelDrain`, and it never reboots it: by default running pods
-stay where they are, and recovering the node is left to you. When the fault clears, NVSentinel uncordons the node, unless its circuit breaker
-has tripped (see below).
+stay where they are, and recovering the node is left to you. When the fault clears, NVSentinel
+uncordons the node, unless its [circuit breaker](#circuit-breaker) has tripped.
 
 | Parameter | Default | Effect |
 | --- | --- | --- |
@@ -280,8 +280,10 @@ has tripped (see below).
 | `nvsentinelSlinkyNamespace` | `slurm` | Namespace of the Slurm worker pods. |
 | `nvsentinelDryRun` | `false` | `true` keeps quarantine and the drainer running but only logs the cordons and evictions they would make. |
 | `nvsentinelMongodbReplicas` | `1` | Replicas of the MongoDB store that quarantine keeps its state in. |
-| `nvsentinelCircuitBreakerPercentage` | `50` | Share of GPU nodes cordoned within 5 minutes that trips the circuit breaker. |
-| `nvsentinelCircuitBreakerMaxNodes` | `0` | Cordons within 5 minutes that trip the breaker regardless of fleet size. `0` uses the percentage alone. |
+| `nvsentinelCircuitBreakerEnabled` | `true` | `false` turns the [circuit breaker](#circuit-breaker) off. |
+| `nvsentinelCircuitBreakerDuration` | `5m` | Window the breaker counts cordons in, as a Go duration. |
+| `nvsentinelCircuitBreakerPercentage` | `50` | Share of GPU nodes cordoned within the window that trips the breaker. |
+| `nvsentinelCircuitBreakerMaxNodes` | `0` | Cordons within the window that trip the breaker. `0` uses the percentage alone. |
 
 Quarantine needs NVSentinel's MongoDB store, and the store gets its TLS certificates from
 cert-manager. So with `nvsentinelCordon: true`, which is the default, **cert-manager must already
@@ -292,13 +294,17 @@ The MongoDB store and fault quarantine run on the CPU pool. Each MongoDB replica
 and 1.5Gi, and fault quarantine 250m. One replica fits the recommended 4 cpu / 8Gi CPU worker.
 Three replicas survive the loss of one CPU worker, but each needs room on the CPU pool.
 
-NVSentinel's circuit breaker is always on, so a fleet-wide problem, such as a bad driver rollout,
-cannot cordon every GPU node. It trips when the nodes cordoned within 5 minutes reach
-`ceil(GPU nodes × percentage / 100)`, or `nvsentinelCircuitBreakerMaxNodes` if that is lower and
-above `0`. **A tripped breaker halts all event processing**, healthy events included: no further
-cordons, and no uncordon of nodes that recover. It stays tripped until you reset it by hand.
+#### Circuit breaker
 
-On small clusters this happens on the first fault:
+The circuit breaker keeps a fleet-wide problem, such as a bad driver rollout, from cordoning every
+GPU node. It trips when the nodes cordoned within `nvsentinelCircuitBreakerDuration` (default
+`5m`) reach `ceil(GPU nodes × nvsentinelCircuitBreakerPercentage / 100)`, or
+`nvsentinelCircuitBreakerMaxNodes` if that is lower and above `0`. **A tripped breaker halts all
+event processing**, healthy events included: no further cordons, and no uncordon of nodes that
+recover. It stays tripped until you [reset it](#reset-the-circuit-breaker). In dry run the breaker
+never applies.
+
+When it trips depends on the number of GPU nodes. On the smallest clusters, the first cordon trips it:
 
 | GPU nodes | Default trips at | With `nvsentinelCircuitBreakerPercentage: 100` |
 | --- | --- | --- |
@@ -307,8 +313,14 @@ On small clusters this happens on the first fault:
 | 4 | 2nd cordon | 4th cordon |
 | 10 | 5th cordon | 10th cordon |
 
-With one GPU node no setting avoids it: the cordoned node stays cordoned until you uncordon it
-and reset the breaker.
+With one GPU node no threshold avoids it. `nvsentinelCircuitBreakerEnabled: false` turns the
+breaker off: NVSentinel then uncordons a recovered node on its own, but nothing limits how many
+nodes it cordons, so keep it on for larger fleets. Turning it off does not reset it. Fault
+quarantine reads the saved state when it starts, so a breaker turned back on is still tripped
+until you reset it.
+
+`nvsentinelCircuitBreakerDuration` is a Go duration, such as `5m` or `1h`. Fault quarantine fails
+to start on any other format while the breaker is on.
 
 #### Reset the circuit breaker
 
@@ -453,8 +465,10 @@ the Stack parameters through `deploy.stacks`.
 | `nvsentinelSlinkyNamespace` | `slurm` | Namespace of the Slurm worker pods |
 | `nvsentinelDryRun` | `false` | Log cordons and evictions instead of making them |
 | `nvsentinelMongodbReplicas` | `1` | Replicas of NVSentinel's MongoDB store, when cordoning is on |
-| `nvsentinelCircuitBreakerPercentage` | `50` | Share of GPU nodes cordoned within 5 minutes that trips NVSentinel's circuit breaker |
-| `nvsentinelCircuitBreakerMaxNodes` | `0` | Cordons within 5 minutes that trip the breaker regardless of fleet size. `0` uses the percentage alone. |
+| `nvsentinelCircuitBreakerEnabled` | `true` | NVSentinel's [circuit breaker](#circuit-breaker) |
+| `nvsentinelCircuitBreakerDuration` | `5m` | Window the breaker counts cordons in |
+| `nvsentinelCircuitBreakerPercentage` | `50` | Share of GPU nodes cordoned within the window that trips the breaker |
+| `nvsentinelCircuitBreakerMaxNodes` | `0` | Cordons within the window that trip the breaker. `0` uses the percentage alone. |
 | `nvsentinelVersion` | `v1.31.0` | NVSentinel chart and image version |
 
 The StackTemplate declares every parameter above except `kubernetesVersion`, `argoConnector`,
@@ -717,9 +731,8 @@ kubectl delete apps,argocdapplicationtemplates,stacktemplates,virtualclustertemp
   re-synced from that release's `plugins/slinky-drainer/config`.
 - The Slinky drainer's `--drain-timeout` is not enforced upstream in v1.31.0. A Slurm worker that
   never reports `DRAIN` holds the drain until the node drainer's 30 minute timeout.
-- On clusters with one or two GPU nodes, the first cordon trips NVSentinel's circuit breaker, and a
-  recovered node then stays cordoned until you [reset it](#reset-the-circuit-breaker). The breaker
-  cannot be turned off through this Stack's parameters.
+- On clusters with one or two GPU nodes, the first cordon trips NVSentinel's
+  [circuit breaker](#circuit-breaker).
 - The `gpuready` gate has a 1380 second budget, because Platform App deploys stop at 30 minutes.
   The slowest measured run, with an in-cluster driver build, passed the gate 9m21s after the GPU
   node joined. A driver build slower than about 23 minutes fails the gate.
@@ -773,7 +786,10 @@ kubectl delete apps,argocdapplicationtemplates,stacktemplates,virtualclustertemp
   unless the circuit breaker has tripped.
 - **A recovered node stays cordoned.** NVSentinel's circuit breaker has probably tripped:
   `kubectl -n nvsentinel get cm circuit-breaker -o jsonpath='{.data.status}'` prints `TRIPPED`.
-  See [Reset the circuit breaker](#reset-the-circuit-breaker).
+  See [Reset the circuit breaker](#reset-the-circuit-breaker). It stays tripped after
+  `nvsentinelCircuitBreakerEnabled` is turned off and back on.
+- **`fault-quarantine` crash-loops with "invalid circuit breaker duration".**
+  `nvsentinelCircuitBreakerDuration` is not a Go duration. Use a value such as `5m` or `1h`.
 - **NVSentinel reports `GpuDcgmConnectivityFailure`.** NVSentinel started before DCGM was
   serving. Confirm that `dcgmready` ran and passed.
 - **NVSentinel `metadata-collector` cannot start in DRA mode.** Kubernetes admits its
@@ -837,7 +853,8 @@ only the parameters the task passes. They assert:
   `nvsentinelDryRun: false`, `nvsentinelDrain: false`). Fault quarantine and the MongoDB store
   follow `nvsentinelCordon`, the node drainer runs only with both `nvsentinelCordon` and
   `nvsentinelDrain`, and fault remediation and Janitor are never enabled. MongoDB runs on the CPU pool with one server certificate per replica.
-  The circuit breaker is on, with the percentage and node cap from the parameters.
+  The circuit breaker follows `nvsentinelCircuitBreakerEnabled`, with the window, percentage and
+  node cap from the parameters. The window default is a valid Go duration.
 - Slinky drain is off by default. The Slinky drainer App renders nothing unless cordon, drain and
   `nvsentinelSlinkyDrain` are all on, and `customDrain` follows the same switch. When on, the
   drainer runs the `nvsentinelVersion` image on the CPU pool and watches

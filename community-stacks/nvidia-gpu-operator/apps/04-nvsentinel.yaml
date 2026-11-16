@@ -19,10 +19,7 @@
 # runs monitoring only, with no MongoDB and no cert-manager dependency. dryRun=true keeps
 # quarantine running but only logs what it would cordon.
 #
-# Quarantine's circuit breaker stays on. It trips when the nodes cordoned within 5 minutes reach
-# ceil(GPU nodes x circuitBreakerPercentage / 100), capped by circuitBreakerMaxNodes when that is
-# above 0. A tripped breaker halts all event processing, healthy events included, until it is reset
-# by hand, so with one GPU node the first cordon trips it.
+# The circuit breaker parameters and their trade-offs are described in the Stack's README.
 apiVersion: management.loft.sh/v1
 kind: ArgoCDApplicationTemplate
 metadata:
@@ -102,17 +99,28 @@ spec:
       description: Log the cordons and drains NVSentinel would make without making them.
       type: boolean
       defaultValue: 'false'
+    - variable: circuitBreakerEnabled
+      label: Circuit Breaker Enabled
+      description: Stop cordoning when too many GPU nodes are cordoned within the window. Off removes that limit,
+        but one or two GPU nodes then recover without a manual reset.
+      type: boolean
+      defaultValue: 'true'
+    - variable: circuitBreakerDuration
+      label: Circuit Breaker Window
+      description: Window the circuit breaker counts cordons in, as a Go duration such as 5m or 1h.
+      type: string
+      defaultValue: 5m
     - variable: circuitBreakerPercentage
       label: Circuit Breaker Percentage
-      description: Share of GPU nodes cordoned within 5 minutes that trips the circuit breaker, which then stops
-        all cordoning and uncordoning until reset. Used when cordoning is on.
+      description: Share of GPU nodes cordoned within the window that trips the circuit breaker, which then
+        stops all cordoning and uncordoning until reset.
       type: number
       defaultValue: '50'
       min: 1
     - variable: circuitBreakerMaxNodes
       label: Circuit Breaker Max Nodes
-      description: Cordons within 5 minutes that trip the breaker regardless of fleet size. 0 uses the percentage
-        alone; when both apply, the lower one wins.
+      description: Cordons within the window that trip the breaker regardless of fleet size. 0 uses the
+        percentage alone; when both apply, the lower one wins.
       type: number
       defaultValue: '0'
       min: 0
@@ -255,7 +263,9 @@ spec:
                 requests:
                   cpu: 250m
               circuitBreaker:
-                enabled: true
+                enabled: {{ ne (.Values.circuitBreakerEnabled | toString) "false" }}
+                # A Go duration; fault-quarantine fails to start on anything else.
+                duration: {{ .Values.circuitBreakerDuration | default "5m" | quote }}
                 percentage: {{ .Values.circuitBreakerPercentage | default "50" | int }}
                 maxNodes: {{ .Values.circuitBreakerMaxNodes | default "0" | int }}
             {{- end }}

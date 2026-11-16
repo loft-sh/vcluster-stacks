@@ -172,19 +172,34 @@ spec:
       type: boolean
       defaultValue: 'false'
       section: NVSentinel
+    - variable: nvsentinelCircuitBreakerEnabled
+      label: NVSentinel Circuit Breaker Enabled
+      description: Stop cordoning when too many GPU nodes are cordoned within the window, so a fleet-wide fault
+        cannot cordon every GPU node. Off removes that limit, but one or two GPU nodes then recover without a
+        manual reset. Turning it back on keeps an earlier trip until it is reset.
+      type: boolean
+      defaultValue: 'true'
+      section: NVSentinel
+    - variable: nvsentinelCircuitBreakerDuration
+      label: NVSentinel Circuit Breaker Window
+      description: Window the circuit breaker counts cordons in, as a Go duration such as 5m or 1h. Fault
+        quarantine fails to start on any other format.
+      type: string
+      defaultValue: 5m
+      section: NVSentinel
     - variable: nvsentinelCircuitBreakerPercentage
       label: NVSentinel Circuit Breaker Percentage
-      description: Share of GPU nodes cordoned within 5 minutes that trips NVSentinel's circuit breaker. A tripped
-        breaker stops all cordoning and uncordoning until it is reset by hand. With one GPU node, the first cordon
-        always trips it.
+      description: Share of GPU nodes cordoned within the window that trips NVSentinel's circuit breaker. A
+        tripped breaker stops all cordoning and uncordoning until it is reset by hand. With one GPU node, the
+        first cordon always trips it.
       type: number
       defaultValue: '50'
       min: 1
       section: NVSentinel
     - variable: nvsentinelCircuitBreakerMaxNodes
       label: NVSentinel Circuit Breaker Max Nodes
-      description: Cordons within 5 minutes that trip the breaker regardless of fleet size. 0 uses the percentage
-        alone; when both apply, the lower one wins.
+      description: Cordons within the window that trip the breaker regardless of fleet size. 0 uses the
+        percentage alone; when both apply, the lower one wins.
       type: number
       defaultValue: '0'
       min: 0
@@ -466,6 +481,8 @@ spec:
           slinkyNodeSelector: '{{ .Values.nvsentinelSlinkyNodeSelector }}'
           dryRun: '{{ .Values.nvsentinelDryRun | toString }}'
           mongodbReplicas: '{{ .Values.nvsentinelMongodbReplicas }}'
+          circuitBreakerEnabled: '{{ .Values.nvsentinelCircuitBreakerEnabled | toString }}'
+          circuitBreakerDuration: '{{ .Values.nvsentinelCircuitBreakerDuration }}'
           circuitBreakerPercentage: '{{ .Values.nvsentinelCircuitBreakerPercentage }}'
           circuitBreakerMaxNodes: '{{ .Values.nvsentinelCircuitBreakerMaxNodes }}'
           # Read from the contract the gate published rather than hard-coded here.

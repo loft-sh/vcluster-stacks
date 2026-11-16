@@ -409,6 +409,11 @@ if defaults(stack_params).get("cpuNodeSelector"):
     fail("stacktemplate.yaml: cpuNodeSelector must default to empty, so an upgrade keeps workload.example.com/pool=<cpuNodePool>")
 if defaults(stack_params).get("gpuNodeSelector"):
     fail("stacktemplate.yaml: gpuNodeSelector must default to empty, so an upgrade keeps workload.example.com/pool=gpu-compute")
+if str(defaults(stack_params).get("nvsentinelCircuitBreakerEnabled")) != "true":
+    fail("stacktemplate.yaml: NVSentinel's circuit breaker must default to on")
+if not re.fullmatch(r"(?:\d+(?:\.\d+)?(?:h|m|s|ms|us|ns))+", str(defaults(stack_params).get("nvsentinelCircuitBreakerDuration", ""))) \
+        or not re.search(r"[1-9]", str(defaults(stack_params).get("nvsentinelCircuitBreakerDuration", ""))):
+    fail("stacktemplate.yaml: nvsentinelCircuitBreakerDuration must default to a positive Go duration; fault-quarantine refuses to start otherwise")
 if str(defaults(stack_params).get("nvsentinelSlinkyDrain")) != "false":
     fail("stacktemplate.yaml: Slinky drain is opt-in; nvsentinelSlinkyDrain must default to false")
 
@@ -423,6 +428,8 @@ for stack_var, app, app_var in [
     ("nvsentinelDryRun", f"{PREFIX}-nvsentinel", "dryRun"),
     ("nvsentinelDrain", f"{PREFIX}-nvsentinel", "drain"),
     ("nvsentinelMongodbReplicas", f"{PREFIX}-nvsentinel", "mongodbReplicas"),
+    ("nvsentinelCircuitBreakerEnabled", f"{PREFIX}-nvsentinel", "circuitBreakerEnabled"),
+    ("nvsentinelCircuitBreakerDuration", f"{PREFIX}-nvsentinel", "circuitBreakerDuration"),
     ("nvsentinelCircuitBreakerPercentage", f"{PREFIX}-nvsentinel", "circuitBreakerPercentage"),
     ("nvsentinelCircuitBreakerMaxNodes", f"{PREFIX}-nvsentinel", "circuitBreakerMaxNodes"),
     ("nvsentinelSlinkyNodeSelector", f"{PREFIX}-nvsentinel", "slinkyNodeSelector"),
@@ -449,6 +456,7 @@ VARIANTS = {
     "dra-alternate": {"gpuDriverMode": "dra", "driverPreinstalled": "true", "waitForClusterPolicy": "true", "minGPUs": "2",
                       "nvsentinelDryRun": "true", "nvsentinelMongodbReplicas": "3", "nvsentinelDrain": "true",
                       "nvsentinelCircuitBreakerPercentage": "100", "nvsentinelCircuitBreakerMaxNodes": "2",
+                      "nvsentinelCircuitBreakerEnabled": "false", "nvsentinelCircuitBreakerDuration": "1h30m",
                       "nvsentinelSlinkyDrain": "true", "nvsentinelSlinkyNodeSelector": "slurm=worker",
                       "nvsentinelSlinkyNamespace": "hpc",
                       "cpuNodeSelector": "foo.acme.corp/cpu-node=true",
@@ -679,7 +687,8 @@ for variant, overrides in VARIANTS.items():
             fail(f"task nvsentinel ({variant}): platformConnector affinity {terms} does not require exactly the GPU node selector {gpu_sel}")
         if cordon:
             cb = (hv.get("fault-quarantine") or {}).get("circuitBreaker") or {}
-            want = {"enabled": True, "percentage": int(values["nvsentinelCircuitBreakerPercentage"]),
+            want = {"enabled": on("nvsentinelCircuitBreakerEnabled"), "duration": values["nvsentinelCircuitBreakerDuration"],
+                    "percentage": int(values["nvsentinelCircuitBreakerPercentage"]),
                     "maxNodes": int(values["nvsentinelCircuitBreakerMaxNodes"])}
             if {k: cb.get(k) for k in want} != want:
                 fail(f"task nvsentinel ({variant}): fault-quarantine.circuitBreaker is {cb}, expected {want}")
