@@ -212,6 +212,13 @@ spec:
       defaultValue: '1'
       min: 1
       section: NVSentinel
+    - variable: nvsentinelMongodbStorageClass
+      label: NVSentinel MongoDB Storage Class
+      description: StorageClass for NVSentinel's MongoDB volumes, used when cordoning is on. Empty uses the
+        cluster's default StorageClass, without which the volumes stay Pending. Set it at install; changing it
+        later fails the NVSentinel task, because a StatefulSet's volume claims are immutable.
+      type: string
+      section: NVSentinel
     - variable: nvsentinelVersion
       label: NVSentinel Chart and Image Version
       type: string
@@ -481,6 +488,7 @@ spec:
           slinkyNodeSelector: '{{ .Values.nvsentinelSlinkyNodeSelector }}'
           dryRun: '{{ .Values.nvsentinelDryRun | toString }}'
           mongodbReplicas: '{{ .Values.nvsentinelMongodbReplicas }}'
+          mongodbStorageClass: '{{ .Values.nvsentinelMongodbStorageClass }}'
           circuitBreakerEnabled: '{{ .Values.nvsentinelCircuitBreakerEnabled | toString }}'
           circuitBreakerDuration: '{{ .Values.nvsentinelCircuitBreakerDuration }}'
           circuitBreakerPercentage: '{{ .Values.nvsentinelCircuitBreakerPercentage }}'

@@ -409,6 +409,8 @@ if defaults(stack_params).get("cpuNodeSelector"):
     fail("stacktemplate.yaml: cpuNodeSelector must default to empty, so an upgrade keeps workload.example.com/pool=<cpuNodePool>")
 if defaults(stack_params).get("gpuNodeSelector"):
     fail("stacktemplate.yaml: gpuNodeSelector must default to empty, so an upgrade keeps workload.example.com/pool=gpu-compute")
+if defaults(stack_params).get("nvsentinelMongodbStorageClass"):
+    fail("stacktemplate.yaml: nvsentinelMongodbStorageClass must default to empty; the StatefulSet's volume claims cannot change on upgrade")
 if str(defaults(stack_params).get("nvsentinelCircuitBreakerEnabled")) != "true":
     fail("stacktemplate.yaml: NVSentinel's circuit breaker must default to on")
 if not re.fullmatch(r"(?:\d+(?:\.\d+)?(?:h|m|s|ms|us|ns))+", str(defaults(stack_params).get("nvsentinelCircuitBreakerDuration", ""))) \
@@ -455,6 +457,7 @@ VARIANTS = {
     "dra": {"gpuDriverMode": "dra"},
     "dra-alternate": {"gpuDriverMode": "dra", "driverPreinstalled": "true", "waitForClusterPolicy": "true", "minGPUs": "2",
                       "nvsentinelDryRun": "true", "nvsentinelMongodbReplicas": "3", "nvsentinelDrain": "true",
+                      "nvsentinelMongodbStorageClass": "fast-ssd",
                       "nvsentinelCircuitBreakerPercentage": "100", "nvsentinelCircuitBreakerMaxNodes": "2",
                       "nvsentinelCircuitBreakerEnabled": "false", "nvsentinelCircuitBreakerDuration": "1h30m",
                       "nvsentinelSlinkyDrain": "true", "nvsentinelSlinkyNodeSelector": "slurm=worker",
@@ -670,6 +673,11 @@ for variant, overrides in VARIANTS.items():
             fail(f"task nvsentinel ({variant}): global.dryRun={g.get('dryRun')!r} with nvsentinelDryRun={values['nvsentinelDryRun']}")
         mongo = hv["mongodb-store"]["mongodb"]
         replicas = int(values["nvsentinelMongodbReplicas"])
+        # Empty must leave the key out, so an existing StatefulSet's volume claims stay as they are.
+        persistence = mongo.get("persistence") or {}
+        want_sc = values.get("nvsentinelMongodbStorageClass") or None
+        if persistence.get("storageClass") != want_sc or (not want_sc and "storageClass" in persistence):
+            fail(f"task nvsentinel ({variant}): mongodb persistence {persistence}, expected storageClass {want_sc!r}")
         if mongo.get("replicaCount") != replicas or mongo["tls"]["replicaset"]["existingSecrets"] != [f"mongo-server-cert-{i}" for i in range(replicas)]:
             fail(f"task nvsentinel ({variant}): MongoDB needs {replicas} replicas with one server certificate each")
         for path in (("global", "systemNodeSelector"), ("mongodb-store", "mongodb", "nodeSelector"),

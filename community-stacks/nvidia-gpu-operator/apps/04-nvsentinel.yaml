@@ -131,6 +131,11 @@ spec:
       type: number
       defaultValue: '1'
       min: 1
+    - variable: mongodbStorageClass
+      label: MongoDB Storage Class
+      description: StorageClass for the MongoDB volumes. Empty uses the cluster's default StorageClass. Set it at
+        install; a StatefulSet's volume claims cannot change afterwards.
+      type: string
     - variable: dcgmHost
       label: DCGM Service Host
       description: Supplied by the gpuready gate's contract when this template runs inside the nvidia-gpu-operator Stack.
@@ -307,6 +312,10 @@ spec:
                   {{- end }}
                 persistence:
                   size: 10Gi
+                  {{- with .Values.mongodbStorageClass }}
+                  # Fixed once the StatefulSet exists: volumeClaimTemplates are immutable.
+                  storageClass: {{ . | quote }}
+                  {{- end }}
             platformConnector:
               affinity:
                 nodeAffinity:

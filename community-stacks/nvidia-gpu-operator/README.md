@@ -261,8 +261,9 @@ readiness at the Stack level.
 
 - cert-manager in the cluster, unless `nvsentinelCordon` is `false`. The Stack does not install
   it. See [NVSentinel fault handling](#nvsentinel-fault-handling).
-- A default StorageClass in the cluster, unless `nvsentinelCordon` is `false`. NVSentinel's
-  MongoDB store requests a 10Gi volume per replica.
+- A default StorageClass in the cluster, or `nvsentinelMongodbStorageClass` naming one, unless
+  `nvsentinelCordon` is `false`. NVSentinel's MongoDB store requests a 10Gi volume per replica, and
+  without a StorageClass the volumes stay Pending.
 
 ### NVSentinel fault handling
 
@@ -280,6 +281,7 @@ uncordons the node, unless its [circuit breaker](#circuit-breaker) has tripped.
 | `nvsentinelSlinkyNamespace` | `slurm` | Namespace of the Slurm worker pods. |
 | `nvsentinelDryRun` | `false` | `true` keeps quarantine and the drainer running but only logs the cordons and evictions they would make. |
 | `nvsentinelMongodbReplicas` | `1` | Replicas of the MongoDB store that quarantine keeps its state in. |
+| `nvsentinelMongodbStorageClass` | empty | StorageClass for the MongoDB volumes. Empty uses the cluster's default. Set it at install. |
 | `nvsentinelCircuitBreakerEnabled` | `true` | `false` turns the [circuit breaker](#circuit-breaker) off. |
 | `nvsentinelCircuitBreakerDuration` | `5m` | Window the breaker counts cordons in, as a Go duration. |
 | `nvsentinelCircuitBreakerPercentage` | `50` | Share of GPU nodes cordoned within the window that trips the breaker. |
@@ -293,6 +295,12 @@ task does not become healthy. The Stack does not install cert-manager.
 The MongoDB store and fault quarantine run on the CPU pool. Each MongoDB replica requests 1 CPU
 and 1.5Gi, and fault quarantine 250m. One replica fits the recommended 4 cpu / 8Gi CPU worker.
 Three replicas survive the loss of one CPU worker, but each needs room on the CPU pool.
+
+The MongoDB volumes use `nvsentinelMongodbStorageClass`, or the cluster's default StorageClass when
+it is empty. Choose it before the first install. A StatefulSet's volume claims cannot change, so a
+new value makes Argo CD's comparison fail (`ComparisonError` on the `mongodb` StatefulSet) and
+NVSentinel stops updating. Moving to another StorageClass means deleting the StatefulSet and its
+PVCs in `nvsentinel`, which discards quarantine's stored state.
 
 #### Circuit breaker
 
@@ -465,6 +473,7 @@ the Stack parameters through `deploy.stacks`.
 | `nvsentinelSlinkyNamespace` | `slurm` | Namespace of the Slurm worker pods |
 | `nvsentinelDryRun` | `false` | Log cordons and evictions instead of making them |
 | `nvsentinelMongodbReplicas` | `1` | Replicas of NVSentinel's MongoDB store, when cordoning is on |
+| `nvsentinelMongodbStorageClass` | empty | StorageClass for the MongoDB volumes. Empty uses the cluster's default. |
 | `nvsentinelCircuitBreakerEnabled` | `true` | NVSentinel's [circuit breaker](#circuit-breaker) |
 | `nvsentinelCircuitBreakerDuration` | `5m` | Window the breaker counts cordons in |
 | `nvsentinelCircuitBreakerPercentage` | `50` | Share of GPU nodes cordoned within the window that trips the breaker |

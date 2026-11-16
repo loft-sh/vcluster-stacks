@@ -212,6 +212,12 @@ spec:
       defaultValue: "1"
       min: 1
       section: NVSentinel
+    - variable: nvsentinelMongodbStorageClass
+      label: NVSentinel MongoDB Storage Class
+      description: StorageClass for NVSentinel's MongoDB volumes. Empty uses the cluster's default StorageClass.
+        Set it at install; it cannot change afterwards.
+      type: string
+      section: NVSentinel
     - variable: gpuOperatorVersion
       label: GPU Operator Version
       type: string
@@ -311,6 +317,7 @@ spec:
                 nvsentinelSlinkyNodeSelector: {{ .Values.nvsentinelSlinkyNodeSelector | quote }}
                 nvsentinelSlinkyNamespace: {{ .Values.nvsentinelSlinkyNamespace | quote }}
                 nvsentinelMongodbReplicas: {{ .Values.nvsentinelMongodbReplicas | toString | quote }}
+                nvsentinelMongodbStorageClass: {{ .Values.nvsentinelMongodbStorageClass | default "" | quote }}
                 nvsentinelCircuitBreakerEnabled: {{ .Values.nvsentinelCircuitBreakerEnabled | toString | quote }}
                 nvsentinelCircuitBreakerDuration: {{ .Values.nvsentinelCircuitBreakerDuration | quote }}
                 nvsentinelCircuitBreakerPercentage: {{ .Values.nvsentinelCircuitBreakerPercentage | toString | quote }}
