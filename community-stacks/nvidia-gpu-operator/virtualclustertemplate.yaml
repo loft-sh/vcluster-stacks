@@ -137,8 +137,8 @@ spec:
       section: GPU Stack
     - variable: nvsentinelCordon
       label: NVSentinel Cordons Faulty GPU Nodes
-      description: Cordon a GPU node when NVSentinel detects a fault on it. Never reboots.
-        Needs cert-manager in the cluster. Set false for monitoring only.
+      description: Cordon a GPU node when NVSentinel detects a fault on it. Needs cert-manager in the cluster.
+        Set false for monitoring only.
       type: boolean
       defaultValue: "true"
       section: NVSentinel
@@ -148,6 +148,17 @@ spec:
         after 60 minutes. No effect unless cordoning is on.
       type: boolean
       defaultValue: "false"
+      section: NVSentinel
+    - variable: nvsentinelRemediation
+      label: NVSentinel Remediation
+      description: What NVSentinel does to a GPU node it cordoned and drained. none leaves recovery to you,
+        reboot reboots the node, and gpu-reset tries to reset only the faulty GPU first. Needs cordoning and
+        draining. Use with static node pools only.
+      options:
+        - none
+        - reboot
+        - gpu-reset
+      defaultValue: none
       section: NVSentinel
     - variable: nvsentinelSlinkyDrain
       label: NVSentinel Drains Slurm Nodes Through Slinky
@@ -312,6 +323,7 @@ spec:
                 gpuDriverMode: {{ .Values.gpuDriverMode | quote }}
                 nvsentinelCordon: {{ .Values.nvsentinelCordon | toString | quote }}
                 nvsentinelDrain: {{ .Values.nvsentinelDrain | toString | quote }}
+                nvsentinelRemediation: {{ .Values.nvsentinelRemediation | default "none" | quote }}
                 nvsentinelDryRun: {{ .Values.nvsentinelDryRun | toString | quote }}
                 nvsentinelSlinkyDrain: {{ .Values.nvsentinelSlinkyDrain | toString | quote }}
                 nvsentinelSlinkyNodeSelector: {{ .Values.nvsentinelSlinkyNodeSelector | quote }}

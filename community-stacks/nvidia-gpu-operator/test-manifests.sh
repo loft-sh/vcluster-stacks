@@ -416,6 +416,8 @@ if str(defaults(stack_params).get("nvsentinelCircuitBreakerEnabled")) != "true":
 if not re.fullmatch(r"(?:\d+(?:\.\d+)?(?:h|m|s|ms|us|ns))+", str(defaults(stack_params).get("nvsentinelCircuitBreakerDuration", ""))) \
         or not re.search(r"[1-9]", str(defaults(stack_params).get("nvsentinelCircuitBreakerDuration", ""))):
     fail("stacktemplate.yaml: nvsentinelCircuitBreakerDuration must default to a positive Go duration; fault-quarantine refuses to start otherwise")
+if str(defaults(stack_params).get("nvsentinelRemediation")) != "none":
+    fail("stacktemplate.yaml: remediation is opt-in; nvsentinelRemediation must default to none")
 if str(defaults(stack_params).get("nvsentinelSlinkyDrain")) != "false":
     fail("stacktemplate.yaml: Slinky drain is opt-in; nvsentinelSlinkyDrain must default to false")
 
@@ -429,6 +431,7 @@ for stack_var, app, app_var in [
     ("nvsentinelCordon", f"{PREFIX}-nvsentinel", "cordon"),
     ("nvsentinelDryRun", f"{PREFIX}-nvsentinel", "dryRun"),
     ("nvsentinelDrain", f"{PREFIX}-nvsentinel", "drain"),
+    ("nvsentinelRemediation", f"{PREFIX}-nvsentinel", "remediation"),
     ("nvsentinelMongodbReplicas", f"{PREFIX}-nvsentinel", "mongodbReplicas"),
     ("nvsentinelCircuitBreakerEnabled", f"{PREFIX}-nvsentinel", "circuitBreakerEnabled"),
     ("nvsentinelCircuitBreakerDuration", f"{PREFIX}-nvsentinel", "circuitBreakerDuration"),
@@ -451,15 +454,17 @@ VARIANTS = {
     "defaults": {},
     "alternate": {"gpuDriverMode": "device-plugin", "driverPreinstalled": "true", "waitForClusterPolicy": "true", "minGPUs": "2",
                   "nvsentinelCordon": "false", "nvsentinelDryRun": "true", "nvsentinelDrain": "true",
-                  "nvsentinelSlinkyDrain": "true",
+                  "nvsentinelSlinkyDrain": "true", "nvsentinelRemediation": "reboot",
                   "cpuNodeSelector": "foo.acme.corp/cpu-node=true, tier=services",
                   "gpuNodeSelector": "foo.acme.corp/gpu-node=true, tier=gpu"},
     "dra": {"gpuDriverMode": "dra"},
+    "reboot": {"gpuDriverMode": "device-plugin", "nvsentinelDrain": "true", "nvsentinelRemediation": "reboot"},
     "dra-alternate": {"gpuDriverMode": "dra", "driverPreinstalled": "true", "waitForClusterPolicy": "true", "minGPUs": "2",
                       "nvsentinelDryRun": "true", "nvsentinelMongodbReplicas": "3", "nvsentinelDrain": "true",
                       "nvsentinelMongodbStorageClass": "fast-ssd",
                       "nvsentinelCircuitBreakerPercentage": "100", "nvsentinelCircuitBreakerMaxNodes": "2",
                       "nvsentinelCircuitBreakerEnabled": "false", "nvsentinelCircuitBreakerDuration": "1h30m",
+                      "nvsentinelRemediation": "gpu-reset",
                       "nvsentinelSlinkyDrain": "true", "nvsentinelSlinkyNodeSelector": "slurm=worker",
                       "nvsentinelSlinkyNamespace": "hpc",
                       "cpuNodeSelector": "foo.acme.corp/cpu-node=true",
@@ -663,12 +668,42 @@ for variant, overrides in VARIANTS.items():
         # quarantine too, and nothing that remediates or reboots is ever on.
         g = hv["global"]
         cordon = on("nvsentinelCordon")
+        remediate = cordon and on("nvsentinelDrain") and values["nvsentinelRemediation"] in ("reboot", "gpu-reset")
+        gpu_reset = remediate and values["nvsentinelRemediation"] == "gpu-reset"
         for component, want in (("faultQuarantine", cordon), ("mongodbStore", cordon),
                                 ("nodeDrainer", cordon and on("nvsentinelDrain")),
-                                ("faultRemediation", False), ("janitor", False), ("janitorProvider", False),
+                                ("faultRemediation", remediate), ("janitor", remediate), ("janitorProvider", remediate),
                                 ("healthEventsAnalyzer", False), ("preflight", False)):
             if (g.get(component) or {}).get("enabled", False) is not want:
-                fail(f"task nvsentinel ({variant}): global.{component}.enabled must be {want} with nvsentinelCordon={values['nvsentinelCordon']} nvsentinelDrain={values['nvsentinelDrain']}")
+                fail(f"task nvsentinel ({variant}): global.{component}.enabled must be {want} with nvsentinelCordon={values['nvsentinelCordon']} nvsentinelDrain={values['nvsentinelDrain']} nvsentinelRemediation={values['nvsentinelRemediation']}")
+        # Remediation: the generic provider reboots; gpu-reset adds a partial drain and maps
+        # COMPONENT_RESET to GPUReset; without it the chart's reboot mapping stays untouched.
+        provider = ((hv.get("janitor-provider") or {}).get("csp") or {}).get("provider")
+        if (provider == "generic") is not remediate:
+            fail(f"task nvsentinel ({variant}): janitor-provider.csp.provider={provider!r}; it must be generic exactly when remediation is on")
+        if bool(g.get("partialDrainEnabled")) is not gpu_reset:
+            fail(f"task nvsentinel ({variant}): global.partialDrainEnabled={g.get('partialDrainEnabled')!r} with remediation {values['nvsentinelRemediation']}")
+        maint = (hv.get("fault-remediation") or {}).get("maintenance") or {}
+        if gpu_reset:
+            action = (maint.get("actions") or {}).get("COMPONENT_RESET") or {}
+            if (action.get("kind"), action.get("templateFileName"), action.get("impactedEntityScope")) != ("GPUReset", "gpureset-template.yaml", "GPU_UUID") \
+                    or "restart" not in (action.get("supersedingEquivalenceGroups") or []):
+                fail(f"task nvsentinel ({variant}): COMPONENT_RESET must map to a per-GPU GPUReset that supersedes restart, got {action}")
+            tmpl = (maint.get("templates") or {}).get("gpureset-template.yaml", "")
+            if "{{ .ImpactedEntityScopeValue }}" not in tmpl or "{{ .HealthEvent.NodeName }}" not in tmpl:
+                fail(f"task nvsentinel ({variant}): the GPUReset template lost its Go template; fault-remediation must render it, not the Platform")
+            else:
+                try:
+                    if (yaml.safe_load(re.sub(r"\{\{[^}]*\}\}", "x", tmpl)) or {}).get("kind") != "GPUReset":
+                        fail(f"task nvsentinel ({variant}): the GPUReset template is not a GPUReset manifest")
+                except yaml.YAMLError as e:
+                    fail(f"task nvsentinel ({variant}): the GPUReset template is not YAML: {e}")
+        elif maint:
+            fail(f"task nvsentinel ({variant}): overrides fault-remediation.maintenance {maint} without gpu-reset")
+        reset_job = (((((hv.get("janitor") or {}).get("config") or {}).get("controllers") or {}).get("gpuReset") or {}).get("resetJob") or {})
+        want_root = "/" if on("driverPreinstalled") else "/run/nvidia/driver"
+        if reset_job.get("hostDriverRootPath") != want_root:
+            fail(f"task nvsentinel ({variant}): janitor reset Job hostDriverRootPath={reset_job.get('hostDriverRootPath')!r}, expected {want_root!r} with driverPreinstalled={values['driverPreinstalled']}")
         if g.get("dryRun") is not on("nvsentinelDryRun"):
             fail(f"task nvsentinel ({variant}): global.dryRun={g.get('dryRun')!r} with nvsentinelDryRun={values['nvsentinelDryRun']}")
         mongo = hv["mongodb-store"]["mongodb"]

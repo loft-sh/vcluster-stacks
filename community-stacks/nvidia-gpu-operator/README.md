@@ -7,7 +7,7 @@ installs these components in dependency order:
   through Argo CD, with either the device plugin or Dynamic Resource Allocation (DRA). See
   [GPU driver mode](#gpu-driver-mode).
 - [NVSentinel](https://github.com/NVIDIA/NVSentinel), through Argo CD. By default it cordons a GPU
-  node when it detects a fault there. Draining is opt-in, and it never reboots nodes. See
+  node when it detects a fault there. Draining and rebooting are opt-in. See
   [NVSentinel fault handling](#nvsentinel-fault-handling).
 - A task that resolves the GPU driver mode, two readiness gates and a CUDA smoke test, as
   vCluster Platform Apps.
@@ -268,14 +268,16 @@ readiness at the Stack level.
 ### NVSentinel fault handling
 
 By default NVSentinel acts on a GPU fault by cordoning the node, so no new pods land on it. It does
-not drain the node unless you set `nvsentinelDrain`, and it never reboots it: by default running pods
-stay where they are, and recovering the node is left to you. When the fault clears, NVSentinel
+not drain the node unless you set `nvsentinelDrain`, and it does not reboot it unless you set
+[`nvsentinelRemediation`](#remediation): by default running pods stay where they are, and recovering
+the node is left to you. When the fault clears, NVSentinel
 uncordons the node, unless its [circuit breaker](#circuit-breaker) has tripped.
 
 | Parameter | Default | Effect |
 | --- | --- | --- |
 | `nvsentinelCordon` | `true` | Runs NVSentinel's fault quarantine. `false` runs monitoring only: health events and node conditions, no cordon. |
 | `nvsentinelDrain` | `false` | `true` also evicts pods from a node NVSentinel cordoned. No effect when `nvsentinelCordon` is `false`. |
+| `nvsentinelRemediation` | `none` | `reboot` or `gpu-reset` lets NVSentinel recover a drained node. See [Remediation](#remediation). |
 | `nvsentinelSlinkyDrain` | `false` | `true` drains the nodes matching `nvsentinelSlinkyNodeSelector` through Slurm instead of evicting their pods. No effect unless `nvsentinelCordon` and `nvsentinelDrain` are on. See [Drain Slurm nodes through Slinky](#drain-slurm-nodes-through-slinky). |
 | `nvsentinelSlinkyNodeSelector` | `nvidia.com/gpu.present=true` | Nodes that drain through Slurm. |
 | `nvsentinelSlinkyNamespace` | `slurm` | Namespace of the Slurm worker pods. |
@@ -361,9 +363,13 @@ With the cluster's kubeconfig:
    kubectl -n nvsentinel rollout status deploy fault-quarantine
    ```
 
+After a [remediation](#remediation), keep the accumulated events instead: skip step 3, and in
+step 4 set only `"status":"CLOSED"`, leaving the cursor at `RESUME`. Fault quarantine then
+processes the recovery that arrived while it was tripped, and uncordons the node itself.
+
 Upstream's
 [circuit breaker runbook](https://github.com/NVIDIA/NVSentinel/blob/v1.31.0/docs/runbooks/circuit-breaker.md)
-has the full procedure, including when to keep the accumulated events instead.
+has the full procedure.
 
 With `nvsentinelDrain: true`, the node drainer uses NVSentinel's defaults: in every namespace it
 lets pods finish (`AllowCompletion`) and force deletes those still running after 60 minutes. To
@@ -421,8 +427,45 @@ Upstream ships the drainer as kustomize manifests only, so
 [apps/03-slinky-drainer.yaml](apps/03-slinky-drainer.yaml) carries a copy of them from the
 NVSentinel release in `nvsentinelVersion`. The image comes from the same release.
 
-Fault remediation and Janitor, which reboot or replace nodes, stay off in every configuration of
-this Stack.
+#### Remediation
+
+`nvsentinelRemediation` decides what NVSentinel does to a node it cordoned and drained. It needs
+`nvsentinelCordon` and `nvsentinelDrain`, and has no effect without them.
+
+| Value | What happens |
+| --- | --- |
+| `none` | Nothing. Recovering the node is left to you. |
+| `reboot` | NVSentinel reboots the node. When the node is back and its GPUs are healthy, it uncordons it. |
+| `gpu-reset` | For faults where NVSentinel recommends a GPU reset, it evicts only the pods using that GPU and tries to reset it. Faults that need a reboot, and resets that fail, end in a reboot after a full drain. |
+
+NVSentinel's Janitor carries out the reboot with its generic provider: a privileged Job on the node
+runs `reboot` on the host. It needs no cloud credentials and works on any node, but Pod Security
+admission must allow privileged pods in the `nvsentinel` namespace. The provider cannot terminate nodes, so faults
+that NVSentinel would answer with a replacement get no automatic action.
+
+Before you turn it on:
+
+- **Static node pools only.** In a dynamic pool, the autoscaler can delete the drained node while it
+  reboots, and add a new one in its place.
+- **A reboot takes several minutes.** On GCE with T4s and a driver the GPU Operator installs, a
+  node went from fault to uncordoned in about 6.5 minutes: the reboot took about 3, and the GPU
+  stack another 3. Until DCGM is back, NVSentinel reports `GpuDcgmConnectivityFailure` and keeps
+  the node cordoned, with its state label at `remediation-failed`. That is expected, and clears
+  with the GPU stack.
+- **GPU reset needs hardware support.** Many cloud instances and other virtual machines with
+  passed-through GPUs refuse to reset a GPU; GCE does. There every `gpu-reset` ends in a reboot,
+  after the failed reset has already taken the node's GPU services down for a few minutes. Use
+  `gpu-reset` on bare metal, and check `nvidia-smi --gpu-reset -i <uuid>` on an idle GPU first.
+- **With the circuit breaker on, a rebooted node stays cordoned.** On clusters with one or two GPU
+  nodes the first cordon trips the [circuit breaker](#circuit-breaker). NVSentinel still reboots
+  the node, but then stops processing events, so the recovered node stays cordoned until you
+  [reset the breaker](#reset-the-circuit-breaker). There, `nvsentinelCircuitBreakerEnabled: false`
+  lets the whole cycle run without you.
+- **Known upstream issues** in v1.31.0: the node's `dgxc.nvidia.com/nvsentinel-state` label reads
+  `remediation-succeeded` as soon as the reboot is requested, before the node goes down, and
+  Janitor marks the reboot complete when the node is Ready, minutes before its GPUs are back.
+  NVSentinel's own uncordon waits for the GPUs. A fault that clears on its own
+  before the reboot gets the node uncordoned while the reboot is still pending.
 
 ## Files
 
@@ -468,6 +511,7 @@ the Stack parameters through `deploy.stacks`.
 | `gpuOperatorVersion` | `v26.7.2` | GPU Operator chart version. DRA mode needs v26.7.0 or later. |
 | `nvsentinelCordon` | `true` | Cordon GPU nodes with a detected fault. Needs cert-manager. `false` for monitoring only. |
 | `nvsentinelDrain` | `false` | Also evict pods from cordoned GPU nodes |
+| `nvsentinelRemediation` | `none` | `reboot` or `gpu-reset` to let NVSentinel recover drained nodes. See [Remediation](#remediation). |
 | `nvsentinelSlinkyDrain` | `false` | Drain matching nodes through Slurm instead of evicting their pods. Needs the Slinky Slurm operator. |
 | `nvsentinelSlinkyNodeSelector` | `nvidia.com/gpu.present=true` | Nodes that drain through Slurm |
 | `nvsentinelSlinkyNamespace` | `slurm` | Namespace of the Slurm worker pods |
@@ -740,8 +784,9 @@ kubectl delete apps,argocdapplicationtemplates,stacktemplates,virtualclustertemp
 
 ## Known limitations
 
-- NVSentinel never remediates or reboots nodes, and drains them only with `nvsentinelDrain`.
-  Recovering a cordoned node is manual. Prometheus PodMonitor and ServiceMonitor creation is disabled.
+- NVSentinel drains nodes only with `nvsentinelDrain`, and reboots or resets them only with
+  `nvsentinelRemediation`, through Janitor's generic provider. It never replaces nodes. Prometheus
+  PodMonitor and ServiceMonitor creation is disabled.
 - cert-manager is a prerequisite for the default configuration, not part of the Stack. So is the
   Slinky Slurm operator for `nvsentinelSlinkyDrain`.
 - The Slinky drainer's manifests are a copy of upstream's. A `nvsentinelVersion` bump needs them
@@ -869,7 +914,10 @@ only the parameters the task passes. They assert:
 - NVSentinel defaults to cordoning without draining (`nvsentinelCordon: true`,
   `nvsentinelDryRun: false`, `nvsentinelDrain: false`). Fault quarantine and the MongoDB store
   follow `nvsentinelCordon`, the node drainer runs only with both `nvsentinelCordon` and
-  `nvsentinelDrain`, and fault remediation and Janitor are never enabled. MongoDB runs on the CPU pool with one server certificate per replica.
+  `nvsentinelDrain`, and remediation runs only with `nvsentinelRemediation` on top of both, as
+  described in [Remediation](#remediation). The `GPUReset` template reaches fault-remediation
+  unrendered, and the reset Job's driver path follows `driverPreinstalled`. MongoDB runs on the CPU
+  pool with one server certificate per replica.
   The circuit breaker follows `nvsentinelCircuitBreakerEnabled`, with the window, percentage and
   node cap from the parameters. The window default is a valid Go duration.
 - Slinky drain is off by default. The Slinky drainer App renders nothing unless cordon, drain and

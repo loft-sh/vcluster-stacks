@@ -14,8 +14,10 @@
 # (customDrain): node-drainer creates a DrainRequest and the drainer drains the node through Slurm.
 # The drainer, its CRD and the drain template ConfigMap come from the slinky-drainer App, which must
 # be deployed first. Nodes not matching the selector keep the eviction defaults.
-# It never reboots: fault-remediation and janitor stay off. Quarantine keeps its state in NVSentinel's MongoDB store, which gets its TLS
-# certificates from cert-manager, so cordon=true requires cert-manager in the cluster. cordon=false
+# remediation (reboot, gpu-reset) is described in the Stack's README.
+#
+# Quarantine keeps its state in NVSentinel's MongoDB store, which gets its TLS certificates from
+# cert-manager, so cordon=true requires cert-manager in the cluster. cordon=false
 # runs monitoring only, with no MongoDB and no cert-manager dependency. dryRun=true keeps
 # quarantine running but only logs what it would cordon.
 #
@@ -99,6 +101,15 @@ spec:
       description: Log the cordons and drains NVSentinel would make without making them.
       type: boolean
       defaultValue: 'false'
+    - variable: remediation
+      label: Remediation
+      description: What NVSentinel does to a node it cordoned and drained. none leaves it to you. Needs cordon
+        and drain.
+      options:
+        - none
+        - reboot
+        - gpu-reset
+      defaultValue: none
     - variable: circuitBreakerEnabled
       label: Circuit Breaker Enabled
       description: Stop cordoning when too many GPU nodes are cordoned within the window. Off removes that limit,
@@ -184,6 +195,10 @@ spec:
             {{- $cordon := ne (.Values.cordon | toString) "false" }}
             {{- $drain := and $cordon (eq (.Values.drain | toString) "true") }}
             {{- $slinky := and $drain (eq (.Values.slinkyDrain | toString) "true") }}
+            {{- /* Remediation acts on drained nodes, so it needs drain. gpu-reset falls back to a reboot. */}}
+            {{- $remediation := .Values.remediation | default "none" }}
+            {{- $remediate := and $drain (or (eq $remediation "reboot") (eq $remediation "gpu-reset")) }}
+            {{- $gpuReset := and $remediate (eq $remediation "gpu-reset") }}
             {{- $replicas := .Values.mongodbReplicas | default "1" | int }}
             global:
               # Booleans arrive as strings; the default is cordon on, dry run off.
@@ -213,15 +228,19 @@ spec:
                 enabled: {{ $cordon }}
               faultQuarantine:
                 enabled: {{ $cordon }}
-              # Drain is opt-in and needs quarantine. Never reboot.
+              # Drain is opt-in and needs quarantine; remediation is opt-in and needs drain.
               nodeDrainer:
                 enabled: {{ $drain }}
               faultRemediation:
-                enabled: false
+                enabled: {{ $remediate }}
               janitor:
-                enabled: false
+                enabled: {{ $remediate }}
               janitorProvider:
-                enabled: false
+                enabled: {{ $remediate }}
+              {{- if $gpuReset }}
+              # Evict only the pods using the faulty GPU before resetting it.
+              partialDrainEnabled: true
+              {{- end }}
               tracing:
                 enabled: false
                 endpoint: ''
@@ -249,16 +268,53 @@ spec:
               assumeDriverInstalled: {{ .Values.driverPreinstalled | toString }}
             janitor-provider:
               csp:
+                {{- if $remediate }}
+                # Reboots from a privileged Job on the node: no cloud credentials, works on any node.
+                # It cannot terminate nodes, so REPLACE_VM remediations get no automatic action.
+                provider: generic
+                {{- else }}
                 provider: kind
-            {{- if $dra }}
-            # Janitor is always off here. Set anyway, so enabling it in DRA mode does not
-            # fail the render: the janitor chart refuses the default `nvidia` RuntimeClass there.
+                {{- end }}
             janitor:
               config:
                 controllers:
                   gpuReset:
                     resetJob:
+                      {{- if $dra }}
+                      # The janitor chart refuses the default `nvidia` RuntimeClass in DRA mode, which has none.
                       runtimeClassName: ""
+                      {{- end }}
+                      # Where the reset Job finds nvidia-smi: the GPU Operator's driver container, or the
+                      # host when the driver is preinstalled.
+                      hostDriverRootPath: {{ if eq (.Values.driverPreinstalled | toString) "true" }}/{{ else }}/run/nvidia/driver{{ end }}
+            {{- if $gpuReset }}
+            fault-remediation:
+              maintenance:
+                # COMPONENT_RESET resets the faulty GPU instead of rebooting the node (the chart default).
+                actions:
+                  COMPONENT_RESET:
+                    apiGroup: janitor.dgxc.nvidia.com
+                    version: v1alpha1
+                    kind: GPUReset
+                    scope: Cluster
+                    completeConditionType: Complete
+                    templateFileName: gpureset-template.yaml
+                    equivalenceGroup: reset
+                    impactedEntityScope: GPU_UUID
+                    supersedingEquivalenceGroups:
+                      - restart
+                templates:
+                  # fault-remediation renders this itself, so it sits in a raw string the Platform leaves alone.
+                  gpureset-template.yaml: |
+                    {{ `apiVersion: {{ .ApiGroup }}/{{ .Version }}
+                    kind: GPUReset
+                    metadata:
+                      name: maintenance-{{ .HealthEvent.NodeName }}-{{ .HealthEventID }}
+                    spec:
+                      nodeName: {{ .HealthEvent.NodeName }}
+                      selector:
+                        uuids:
+                          - {{ .ImpactedEntityScopeValue }}` }}
             {{- end }}
             {{- if $cordon }}
             fault-quarantine:
