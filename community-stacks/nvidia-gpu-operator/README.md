@@ -628,6 +628,14 @@ containers:
   parameter values rendered at creation. A new or changed template parameter reaches existing
   tenant clusters only after **Sync Template** on the instance, or `spec.templateRef.syncOnce:
   true`. Until then, a new parameter renders as an empty string, with no error.
+- **NVSentinel now cordons by default.** Earlier versions of this Stack ran NVSentinel for
+  monitoring only. Upgrading from one turns fault quarantine on for every install: a GPU fault
+  cordons the node, and NVSentinel deploys its MongoDB store. Before you upgrade:
+  - Install cert-manager, or the `nvsentinel` task never becomes healthy.
+  - Make sure the cluster has a default StorageClass, or set `nvsentinelMongodbStorageClass`.
+  - On clusters with one or two GPU nodes, expect the first fault to trip the
+    [circuit breaker](#circuit-breaker).
+  - To keep monitoring only, set `nvsentinelCordon: false`.
 - **Re-running a gate.** The gate Job name carries a hash of its settings and its check script.
   A Job spec is immutable, so a changed setting creates a new Job, which runs the gate again. The
   `discover` Job works the same way. Upgrading to the version that added `cpuNodeSelector` renames
