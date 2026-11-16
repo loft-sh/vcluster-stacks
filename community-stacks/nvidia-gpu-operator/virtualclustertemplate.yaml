@@ -117,7 +117,7 @@ spec:
       required: true
       section: Versions
       # renovate: datasource=helm depName=gpu-operator registryUrl=https://helm.ngc.nvidia.com/nvidia
-      defaultValue: v26.3.3
+      defaultValue: v26.7.2
     - variable: nvsentinelVersion
       label: NVSentinel Chart and Image Version
       type: string
