@@ -1,0 +1,133 @@
+# vBox Helm chart values.
+
+namespace:
+  # The dedicated namespace vBox runs in. Every namespaced object goes here; the
+  # Helm release record lives in whatever namespace the release is installed into
+  # (helm install -n default), which must be a different one while create is on.
+  # It holds nothing but vBox, because vBox may list the Secrets in it.
+  name: vbox-system
+  # Creates the namespace, with Pod Security "restricted" enforced (vBox meets
+  # it). It is kept on uninstall, so the settings Secret and the audit trail's
+  # PVC inside it survive a reinstall. With false, create it yourself and install
+  # the release into it.
+  create: true
+  podSecurity: restricted
+  labels: {}
+  annotations: {}
+
+image:
+  # The image built from vbox/vbox-ui/Dockerfile and pushed to your registry; see
+  # the "Build and publish vBox" section of agent-sandboxes/README.md. A public
+  # repository pulls without credentials; for a private one set imagePullSecrets
+  # or registryCredentials below.
+  repository: <your-registry>/vbox-ui
+  # Defaults to the chart's appVersion.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+# Names of existing pull secrets in the vBox namespace.
+imagePullSecrets: []
+
+# Creates a pull secret in the vBox namespace from these credentials and uses it.
+# For a private registry the nodes cannot authenticate to on their own, such as
+# ECR on nodes whose kubelet has no ECR credential provider. With ECR, the
+# password is a token from `aws ecr get-login-password`, valid for 12 hours: long
+# enough to pull, but a pod rescheduled to a node without the image after that
+# fails to pull until the release is upgraded with a fresh one.
+registryCredentials:
+  create: false
+  registry: ""
+  username: ""
+  password: ""
+
+# Overrides the name used for every object (default: "<release>-vbox", or the
+# release name when it already contains "vbox").
+fullnameOverride: ""
+nameOverride: ""
+
+serviceAccount:
+  # The ServiceAccount vBox talks to the Kubernetes API as.
+  name: vbox
+  annotations: {}
+
+rbac:
+  # Creates the ClusterRole, Roles and bindings below. With false, bind the
+  # ServiceAccount to equivalent permissions yourself.
+  create: true
+
+service:
+  type: ClusterIP
+  port: 80
+  annotations: {}
+
+# The URL browsers reach vBox at (for example https://vbox.example.com). It is
+# the base of the OIDC redirect URI, so set it whenever vBox sits behind an
+# Ingress or load balancer. Empty: derived from each request's forwarded headers.
+publicUrl: ""
+
+oidc:
+  # vBox finds the Secret holding the OpenID Connect settings by this annotation,
+  # with the value "true", in its own namespace. Exactly one Secret there may
+  # carry it. vBox reads it (changes made with kubectl show up in the UI within
+  # seconds) and writes it when the Settings page is saved. One key per field:
+  # enabled, displayName, issuerUrl, clientId, clientSecret, scopes,
+  # usernameClaim, groupsClaim, allowedGroups (one per line) and providerLogout.
+  annotation: vbox.vcluster.com/oidc-config
+  # The name of that Secret. vBox does not need it to find the Secret, but RBAC
+  # does: update is granted on this name only.
+  secretName: vbox-oidc
+  # Creates the Secret, annotated, from the initial values below. Set false to
+  # bring your own (for example from External Secrets): annotate it, and name it
+  # secretName so the Settings page can save it.
+  createSecret: true
+  # Written into the Secret when it is first created only. After that the Secret
+  # is the source of truth: helm upgrade keeps its current contents (see
+  # templates/secret-oidc.yaml), so changes made in the UI survive upgrades.
+  initial:
+    enabled: false
+    displayName: OpenID Connect
+    issuerUrl: ""
+    clientId: ""
+    clientSecret: ""
+    scopes: openid profile email
+    usernameClaim: email
+    groupsClaim: groups
+    allowedGroups: []
+    providerLogout: false
+
+# Break-glass: true sets VBOX_AUTH=off, which turns sign-in enforcement off
+# whatever the Secret says. For recovering from a provider that locks everyone
+# out; leave false otherwise.
+disableAuth: false
+
+collector:
+  # Records which client used which sandbox (the Audit page).
+  enabled: true
+  # Where the Sandbox Router runs; vBox follows its access log for the steps.
+  routerNamespace: agent-sandbox-system
+  routerSelector: app.kubernetes.io/name=sandbox-router
+
+persistence:
+  # The PersistentVolumeClaim, mounted at /data, that holds the audit trail
+  # (audit.db) and sign-in sessions (auth.db). Kept on uninstall. With false, both
+  # are on an emptyDir and lost whenever the pod is replaced.
+  enabled: true
+  # Use an existing PersistentVolumeClaim instead of creating one.
+  existingClaim: ""
+  storageClassName: ""
+  accessModes:
+    - ReadWriteOnce
+  size: 1Gi
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 192Mi
+  limits:
+    memory: 512Mi
+
+podAnnotations: {}
+podLabels: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}

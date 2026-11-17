@@ -1,0 +1,2441 @@
+# Agent Sandbox on a tenant cluster with private nodes, with Calico as the CNI.
+#
+# PREREQUISITE (tenant cluster config, set at creation time):
+# Calico replaces the default Flannel CNI, so the tenant cluster must be created
+# with Flannel disabled and a pod CIDR that matches the podCIDR parameter below:
+#
+#   privateNodes:
+#     enabled: true
+#   networking:
+#     podCIDR: 10.244.0.0/16
+#   deploy:
+#     cni:
+#       flannel:
+#         enabled: false
+#
+# vNode requirements on every private node: Linux kernel 6.1+ with cgroups v2,
+# containerd 1.7 or 2.0, and a vCluster Platform license that includes vNode.
+# Inside a tenant cluster vNode licenses through the Virtual Control Plane, so no
+# platform host or access key is needed.
+#
+# Task graph:
+#
+#   hostnetpolicy ─► calico ─► calicocrds ─► calicoconfig ─► calicoready ─┬─► preflight ─► vnode ─► vnodeready ──────┐
+#                                                                         └─► controller ─┬─► router ─┬───┐          │
+#                                                                                         │           └─► vbox ◄─────┤
+#                                                                                         └─► guardrails ─┴─► pool ◄─┘
+#                                                                                                              │
+#                                                                                                              └─► verify
+#
+#   hostnetpolicy Lets tigera-operator, calico-system and vnode-runtime use host networking
+#                under the Auto Nodes AWS provider's admission policy (one-shot Job).
+#   calico       Tigera operator Helm chart, installed by a host-network Job so it outlives
+#                the Stack. The operator installs and upgrades the Calico CRDs itself
+#                (they are too large to be stored in a Helm release).
+#   calicocrds   Waits for the operator to create its CRDs (host-network Job: no CNI yet).
+#   calicoconfig Installation (CNI, VXLAN IP pool), APIServer, and optionally Goldmane and
+#               Whisker (calicoObservability, off by default).
+#   calicoready Waits for Calico to report Available and every node to be Ready
+#               (host-network Job, so it never waits Pending for a node).
+#   preflight   Checks every node's kernel and container runtime against vNode's requirements.
+#   vnode       vnode-runtime Helm chart (Helm job, so it outlives the Stack): DaemonSet on
+#               every node tolerating all taints, creates RuntimeClass "vnode".
+#   vnodeready  Waits for the DaemonSet and nodes, then proves UID remapping in a test pod.
+#   controller  Namespaces with Pod Security "restricted", CRDs, and the Agent Sandbox
+#               Helm chart from the pinned release (HA, hardened, extensions on).
+#   router      Go Sandbox Router, ClusterIP only, ingress limited by NetworkPolicy.
+#   guardrails  ValidatingAdmissionPolicy (incl. runtimeClassName: vnode), ResourceQuota,
+#               LimitRange, and claim-only RBAC.
+#   pool        Two hardened SandboxTemplates on vNode (managed NetworkPolicy), the official
+#               Python runtime and Chrome sandboxes, plus a SandboxWarmPool of one of them
+#               (warmPoolType). The other type is claimed cold.
+#   verify      Proves the pool is warm on vNode with remapped UIDs, the NetworkPolicy
+#               exists, and the VAP rejects a non-compliant Sandbox.
+#   vbox        vBox, the web UI for sandboxes, claims and the audit trail, from its
+#               public Helm chart, into its own namespace vbox-system.
+#   teardown    Pre-delete hook: on Stack deletion removes the sandbox objects, then vBox,
+#               the controller and vNode in a safe order. Calico and the CRDs stay.
+#
+# Apply against the vCluster Platform management API:
+#   vcluster platform connect management
+#   kubectl apply -f agent-sandbox-stack-template.yaml
+#
+# Updating it later: use `kubectl replace -f`, not `kubectl apply`. The platform
+# merges spec.parameters and spec.tasks by list position, so applying a version with entries
+# inserted or reordered leaves each entry with the fields of whatever used to sit
+# at its index (a parameter that inherits another's options turns into a dropdown).
+# A replace sends the whole object.
+apiVersion: management.loft.sh/v1
+kind: StackTemplate
+metadata:
+  name: agent-sandbox
+spec:
+  displayName: Agent Sandbox
+  icon: https://agent-sandbox.sigs.k8s.io/assets/icons/color_logo.svg
+  description: >-
+    Installs Calico as the CNI and vNode as the sandbox runtime, then the Kubernetes
+    Agent Sandbox controller (Helm), Sandbox Router, admission and quota guardrails,
+    hardened, vNode-isolated Python and Chrome SandboxTemplates with a warm pool of
+    one of them, and the vBox UI into a tenant cluster with private nodes.
+  parameters:
+    # Versions
+    - variable: vnodeVersion
+      label: vNode runtime chart version
+      description: >-
+        vnode-runtime chart version from https://charts.loft.sh. Empty installs the latest
+        at install time, so pin it (helm search repo loft/vnode-runtime --versions).
+      type: string
+      defaultValue: ""
+      section: Versions
+    - variable: calicoVersion
+      label: Calico version
+      description: >-
+        tigera-operator chart version from https://docs.tigera.io/calico/charts. The
+        operator installs the matching Calico CRDs itself.
+      type: string
+      defaultValue: v3.33.0
+      validation: '^v[0-9]+\.[0-9]+\.[0-9]+$'
+      section: Versions
+    - variable: agentSandboxVersion
+      label: Agent Sandbox version
+      description: Release tag from github.com/kubernetes-sigs/agent-sandbox/releases.
+      type: string
+      defaultValue: v1.0.6
+      validation: '^v[0-9]+\.[0-9]+\.[0-9]+$'
+      section: Versions
+    - variable: routerImageTag
+      label: Sandbox Router image tag
+      description: >-
+        Tag of registry.k8s.io/agent-sandbox/sandbox-router-go. Only release tags are
+        published (no "latest"); keep it equal to agentSandboxVersion.
+      type: string
+      defaultValue: v1.0.6
+      validation: '^v[0-9]+\.[0-9]+\.[0-9]+$'
+      section: Versions
+    - variable: vboxVersion
+      label: vBox chart version
+      description: >-
+        Version of the vBox Helm chart at vboxChart. The chart's appVersion selects the
+        matching image, <your-registry>/vbox-ui:<appVersion> (the chart's image.repository).
+      type: string
+      defaultValue: 0.1.0
+      validation: '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'
+      section: Versions
+    - variable: toolsImage
+      label: Installer image
+      description: >-
+        Image with bash, curl, tar, kubectl and helm used by the install jobs. Keep its
+        kubectl within one minor of the tenant cluster (vCluster v0.37.2 runs Kubernetes
+        v1.36). alpine/k8s tags are rebuilt in place, so pin a digest for production.
+        alpine/k8s:1.36.0 ships Helm 4, whose bare --wait watches resources (kstatus) and
+        failed a controller install with pods up and Ready ("failed post-install: 1 error
+        occurred"); every install here therefore uses --wait=legacy, Helm 3's readiness
+        polling.
+      type: string
+      defaultValue: alpine/k8s:1.36.0
+      section: Versions
+
+    # Networking
+    - variable: podCIDR
+      label: Pod CIDR
+      description: Must equal networking.podCIDR of the tenant cluster.
+      type: string
+      defaultValue: 10.244.0.0/16
+      section: Networking
+    - variable: calicoEncapsulation
+      label: Calico encapsulation
+      description: VXLAN works across any L3 network; VXLANCrossSubnet skips encapsulation within a subnet.
+      type: string
+      options:
+        - VXLAN
+        - VXLANCrossSubnet
+      defaultValue: VXLAN
+      section: Networking
+    - variable: calicoObservability
+      label: Calico flow observability
+      description: >-
+        Deploy Goldmane (flow aggregation) and Whisker (flow UI). Off by default: two
+        more Deployments that nothing in the Stack uses, and that can land on, and hold,
+        an autoscaled sandbox node.
+      type: boolean
+      defaultValue: "false"
+      section: Networking
+
+    # Runtime isolation
+    - variable: vnodeIsolation
+      label: vNode isolation mode
+      description: >-
+        per-pod gives every sandbox its own vNode (own PID namespace and UID range).
+        per-namespace shares one vNode per namespace per node, so sandboxes in the
+        sandbox namespace could see each other's processes. Applies node-wide.
+      type: string
+      options:
+        - per-pod
+        - per-namespace
+      defaultValue: per-pod
+      section: Isolation
+
+    # Control plane components
+    - variable: controllerReplicas
+      label: Controller replicas
+      description: Two or more with leader election for HA.
+      type: number
+      min: 1
+      max: 5
+      defaultValue: "2"
+      section: Control plane
+    - variable: serviceMonitor
+      label: Create ServiceMonitor
+      description: Requires the prometheus-operator CRDs in the tenant cluster.
+      type: boolean
+      defaultValue: "false"
+      section: Control plane
+    - variable: routerReplicas
+      label: Router replicas
+      type: number
+      min: 1
+      max: 20
+      defaultValue: "2"
+      section: Control plane
+    - variable: systemNodeRole
+      label: System node role
+      description: >-
+        Runs the Sandbox Router, the Agent Sandbox controller, the Tigera operator and
+        vBox only on nodes labelled pool.agent-sandbox.io/role=<this>, the always-on
+        base node of the agent-sandbox-aws template. Autoscaled sandbox nodes then hold
+        nothing but sandboxes, so they empty out and are removed. Empty: no restriction.
+      type: string
+      defaultValue: base
+      section: Control plane
+    - variable: apiServerCIDR
+      label: API server CIDR
+      description: >-
+        Router egress to the tenant API server (needed by its Pod-IP cache). With private
+        nodes the API server is outside the pod network; narrow this to its endpoint.
+      type: string
+      defaultValue: 0.0.0.0/0
+      section: Control plane
+
+    # Agents and sandboxes
+    - variable: agentNamespace
+      label: Agent namespace
+      description: Namespace where in-cluster agents run. Only it may reach the router.
+      type: string
+      defaultValue: agents
+      validation: '^[a-z0-9]([-a-z0-9]*[a-z0-9])?$'
+      section: Sandboxes
+    - variable: agentServiceAccount
+      label: Agent service account
+      description: ServiceAccount in the agent namespace granted claim-only access.
+      type: string
+      defaultValue: agent
+      section: Sandboxes
+    - variable: sandboxNamespace
+      label: Sandbox namespace
+      description: Namespace for the SandboxTemplates, SandboxWarmPool and sandbox pods.
+      type: string
+      defaultValue: agent-sandboxes
+      validation: '^[a-z0-9]([-a-z0-9]*[a-z0-9])?$'
+      section: Sandboxes
+    - variable: warmPoolType
+      label: Warm sandbox type
+      description: >-
+        Both SandboxTemplates are always installed: python-template (the Python runtime
+        API on port 8888, reached through the Sandbox Router) and chrome-template
+        (Chromium with the DevTools Protocol on port 9222, which Chromium binds to
+        localhost only, so agents reach it with kubectl port-forward). This picks which
+        one the warm pool keeps ready; claims of the other start cold.
+      type: string
+      options:
+        - python
+        - chrome
+      defaultValue: python
+      section: Sandboxes
+    - variable: pythonSandboxImage
+      label: Python sandbox image override
+      description: >-
+        Empty runs the official registry.k8s.io/agent-sandbox/python-runtime-sandbox at
+        agentSandboxVersion. Set it only for a mirror or rebuild of that same image.
+      type: string
+      defaultValue: ""
+      section: Sandboxes
+    - variable: chromeSandboxImage
+      label: Chrome sandbox image override
+      description: >-
+        Empty runs the official registry.k8s.io/agent-sandbox/chrome-sandbox at
+        agentSandboxVersion. Set it only for a mirror or rebuild of that same image: the
+        template relies on its user (UID 996) and its probe command.
+      type: string
+      defaultValue: ""
+      section: Sandboxes
+    - variable: warmPoolReplicas
+      label: Warm pool size
+      type: number
+      min: 0
+      max: 200
+      defaultValue: "2"
+      section: Sandboxes
+    - variable: sandboxEgress
+      label: Sandbox egress
+      description: >-
+        public-internet keeps the upstream managed NetworkPolicy (public IPs only, private
+        ranges and metadata blocked) and resolves DNS through public resolvers. none blocks
+        all egress.
+      type: string
+      options:
+        - public-internet
+        - none
+      defaultValue: public-internet
+      section: Sandboxes
+    - variable: quotaPods
+      label: Max sandbox pods
+      type: number
+      min: 1
+      max: 1000
+      defaultValue: "50"
+      section: Sandboxes
+    - variable: quotaCPU
+      label: Sandbox namespace CPU limit total
+      type: string
+      defaultValue: "32"
+      section: Sandboxes
+    - variable: quotaMemory
+      label: Sandbox namespace memory limit total
+      type: string
+      defaultValue: 64Gi
+      section: Sandboxes
+
+    # vBox
+    - variable: vboxEnabled
+      label: Install vBox
+      description: >-
+        The vBox web UI for sandboxes, claims and the audit trail, in its own namespace
+        vbox-system. Turning it off uninstalls it; its namespace, settings Secret and
+        audit trail volume are kept.
+      type: boolean
+      defaultValue: "true"
+      section: vBox
+    - variable: vboxChart
+      label: vBox chart
+      description: >-
+        OCI reference of the vBox Helm chart, as pushed by `helm push` (see
+        agent-sandboxes/README.md). The install job pulls it without credentials, so the
+        repository must be public.
+      type: string
+      defaultValue: oci://<your-registry>/vbox
+      section: vBox
+    - variable: vboxPublicUrl
+      label: vBox public URL
+      description: >-
+        The URL browsers reach vBox at, the base of its OpenID Connect redirect URI.
+        Empty: derived from each request, which is right for kubectl port-forward.
+      type: string
+      defaultValue: ""
+      section: vBox
+    - variable: vboxServiceType
+      label: vBox service type
+      description: >-
+        internal: a ClusterIP Service, reached with kubectl port-forward. exposed: a
+        LoadBalancer Service annotated for an AWS Network Load Balancer, which needs the
+        AWS CCM in the tenant cluster. Sign-in is off until it is configured on vBox's
+        Settings page, so an exposed vBox is open to anyone who can reach the address
+        until then.
+      type: string
+      options:
+        - internal
+        - exposed
+      defaultValue: internal
+      section: vBox
+
+  tasks:
+    # 1. Calico operator. Installed by a host-network Helm-hook Job running helm, not
+    #    as a chart App, on purpose. Deleting a tenant cluster deletes its Stack first,
+    #    and the platform uninstalls all tasks at once: the tigera-operator chart's own
+    #    pre-delete hook then deletes the Installation ("cleaned up prior to tearing
+    #    down the operator"), the operator removes calico-node, and every pod still
+    #    running can no longer have its network torn down ("plugin type=calico failed
+    #    (delete)"). They hang in Terminating, vBox's PVC with them, and the cluster
+    #    deletion waits forever. A release installed by this Job is never uninstalled
+    #    by the platform, so Calico outlives the Stack, like vNode does; deleting the
+    #    task removes only its ConfigMap. Remove Calico by hand with
+    #    `helm uninstall calico -n tigera-operator` (its hook tears Calico down).
+    #    A bash task cannot do this: its pod needs the pod network Calico provides.
+    #    The operator installs and upgrades the Calico CRDs itself (manageCRDs). The
+    #    CRDs are too large for a Helm release (the release Secret would exceed 1 MiB),
+    #    and the chart's own Installation/APIServer/Goldmane/Whisker resources would
+    #    fail before they exist, so those are created by the calicoconfig task.
+    - name: calico
+      dependsOn:
+        - hostnetpolicy
+      timeout: 15m
+      app:
+        template:
+          spec:
+            displayName: Calico (tigera-operator)
+            description: Tigera operator, installed by a host-network helm Job; creates and manages the Calico CRDs.
+            defaultNamespace: kube-system
+            wait: true
+            config:
+              manifests: |-
+                # Regular resource so the release is never empty; documents what it installs.
+                apiVersion: v1
+                kind: ConfigMap
+                metadata:
+                  name: agent-sandbox-calico-installer
+                  namespace: kube-system
+                data:
+                  release: calico in tigera-operator, chart tigera-operator {{ .Values.calicoVersion }}
+                ---
+                apiVersion: v1
+                kind: ServiceAccount
+                metadata:
+                  name: calico-installer
+                  namespace: kube-system
+                  annotations:
+                    helm.sh/hook: post-install,post-upgrade
+                    helm.sh/hook-weight: "-10"
+                    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+                ---
+                # Installs a chart that creates CRDs, RBAC and cluster-wide objects.
+                # Deleted again once the Job has succeeded.
+                apiVersion: rbac.authorization.k8s.io/v1
+                kind: ClusterRoleBinding
+                metadata:
+                  name: calico-installer
+                  annotations:
+                    helm.sh/hook: post-install,post-upgrade
+                    helm.sh/hook-weight: "-10"
+                    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+                roleRef:
+                  apiGroup: rbac.authorization.k8s.io
+                  kind: ClusterRole
+                  name: cluster-admin
+                subjects:
+                  - kind: ServiceAccount
+                    name: calico-installer
+                    namespace: kube-system
+                ---
+                apiVersion: batch/v1
+                kind: Job
+                metadata:
+                  name: calico-install
+                  namespace: kube-system
+                  annotations:
+                    helm.sh/hook: post-install,post-upgrade
+                    helm.sh/hook-weight: "0"
+                    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+                spec:
+                  backoffLimit: 2
+                  activeDeadlineSeconds: 900
+                  template:
+                    spec:
+                      serviceAccountName: calico-installer
+                      restartPolicy: Never
+                      # No CNI yet: host networking needs none. The node's own resolver
+                      # (dnsPolicy Default) reaches the chart repository through the
+                      # VPC's NAT gateway, and kubectl/helm reach the API server through
+                      # KUBERNETES_SERVICE_HOST.
+                      hostNetwork: true
+                      dnsPolicy: Default
+                      priorityClassName: system-cluster-critical
+                      tolerations:
+                        - operator: Exists
+                      securityContext:
+                        runAsNonRoot: true
+                        runAsUser: 65534
+                        runAsGroup: 65534
+                        seccompProfile:
+                          type: RuntimeDefault
+                      containers:
+                        - name: install
+                          image: {{ .Values.toolsImage }}
+                          env:
+                            - name: HOME
+                              value: /tmp
+                            - name: HELM_CACHE_HOME
+                              value: /tmp/helm/cache
+                            - name: HELM_CONFIG_HOME
+                              value: /tmp/helm/config
+                            - name: HELM_DATA_HOME
+                              value: /tmp/helm/data
+                          command: ["/bin/bash", "-c"]
+                          args:
+                            - |
+                              set -euo pipefail
+                              cat > /tmp/values.yaml <<'EOF'
+                              manageCRDs: true
+                              # On the system node, so it never holds an autoscaled sandbox node.
+                              nodeSelector:
+                                kubernetes.io/os: linux
+                              {{- if .Values.systemNodeRole }}
+                                pool.agent-sandbox.io/role: {{ .Values.systemNodeRole }}
+                              {{- end }}
+                              # Created by the calicoconfig task once the operator has installed the CRDs.
+                              installation:
+                                enabled: false
+                              apiServer:
+                                enabled: false
+                              goldmane:
+                                enabled: false
+                              whisker:
+                                enabled: false
+                              EOF
+                              helm upgrade --install calico tigera-operator \
+                                --repo https://docs.tigera.io/calico/charts \
+                                --version "{{ .Values.calicoVersion }}" \
+                                --namespace tigera-operator --create-namespace \
+                                -f /tmp/values.yaml \
+                                --wait=legacy --timeout 10m
+                              kubectl -n tigera-operator get deployment tigera-operator
+                          resources:
+                            requests:
+                              cpu: 50m
+                              memory: 128Mi
+                            limits:
+                              memory: 512Mi
+                          securityContext:
+                            allowPrivilegeEscalation: false
+                            readOnlyRootFilesystem: true
+                            capabilities:
+                              drop: ["ALL"]
+                          volumeMounts:
+                            - name: tmp
+                              mountPath: /tmp
+                      volumes:
+                        - name: tmp
+                          emptyDir: {}
+
+    # 2. Health gate: Calico Available and every node Ready. A host-network Helm-hook
+    #    Job tolerating every taint rather than a bash task, on purpose: a bash task's
+    #    pod needs the pod network, so it sat Pending on not-ready nodes while Calico
+    #    came up, and the autoscaler answered every such pending pod with another
+    #    sandbox node. Each Stack (re)install added one or two nodes that then never
+    #    emptied out. This Job runs on whichever node exists, before the CNI is ready,
+    #    and its RBAC is deleted once it succeeds.
+    - name: calicoready
+      dependsOn:
+        - calicoconfig
+      timeout: 25m
+      app:
+        template:
+          spec:
+            displayName: Wait for Calico
+            description: Fails fast if Flannel is still running next to Calico.
+            defaultNamespace: kube-system
+            wait: true
+            config:
+              manifests: |-
+                # Regular resource so the release is never empty; documents what it checks.
+                apiVersion: v1
+                kind: ConfigMap
+                metadata:
+                  name: agent-sandbox-calico-ready
+                  namespace: kube-system
+                data:
+                  checks: no Flannel, tigerastatus calico and apiserver Available, all nodes Ready
+                ---
+                apiVersion: v1
+                kind: ServiceAccount
+                metadata:
+                  name: calico-ready-waiter
+                  namespace: kube-system
+                  annotations:
+                    helm.sh/hook: post-install,post-upgrade
+                    helm.sh/hook-weight: "-10"
+                    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+                ---
+                apiVersion: rbac.authorization.k8s.io/v1
+                kind: ClusterRole
+                metadata:
+                  name: calico-ready-waiter
+                  annotations:
+                    helm.sh/hook: post-install,post-upgrade
+                    helm.sh/hook-weight: "-10"
+                    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+                rules:
+                  - apiGroups: ["apps"]
+                    resources: ["daemonsets"]
+                    verbs: ["list"]
+                  - apiGroups: ["operator.tigera.io"]
+                    resources: ["tigerastatuses"]
+                    verbs: ["get", "list", "watch"]
+                  - apiGroups: [""]
+                    resources: ["nodes"]
+                    verbs: ["get", "list", "watch"]
+                  - apiGroups: ["projectcalico.org"]
+                    resources: ["ippools"]
+                    verbs: ["get", "list"]
+                ---
+                apiVersion: rbac.authorization.k8s.io/v1
+                kind: ClusterRoleBinding
+                metadata:
+                  name: calico-ready-waiter
+                  annotations:
+                    helm.sh/hook: post-install,post-upgrade
+                    helm.sh/hook-weight: "-10"
+                    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+                roleRef:
+                  apiGroup: rbac.authorization.k8s.io
+                  kind: ClusterRole
+                  name: calico-ready-waiter
+                subjects:
+                  - kind: ServiceAccount
+                    name: calico-ready-waiter
+                    namespace: kube-system
+                ---
+                apiVersion: batch/v1
+                kind: Job
+                metadata:
+                  name: calico-ready-wait
+                  namespace: kube-system
+                  annotations:
+                    helm.sh/hook: post-install,post-upgrade
+                    helm.sh/hook-weight: "0"
+                    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+                spec:
+                  backoffLimit: 2
+                  activeDeadlineSeconds: 1500
+                  template:
+                    spec:
+                      serviceAccountName: calico-ready-waiter
+                      restartPolicy: Never
+                      # No pod network yet: host networking needs none, and kubectl
+                      # reaches the API server through KUBERNETES_SERVICE_HOST.
+                      hostNetwork: true
+                      dnsPolicy: Default
+                      priorityClassName: system-cluster-critical
+                      tolerations:
+                        - operator: Exists
+                      securityContext:
+                        runAsNonRoot: true
+                        runAsUser: 65534
+                        runAsGroup: 65534
+                        seccompProfile:
+                          type: RuntimeDefault
+                      containers:
+                        - name: wait
+                          image: {{ .Values.toolsImage }}
+                          env:
+                            - name: HOME
+                              value: /tmp
+                          command: ["/bin/bash", "-c"]
+                          args:
+                            - |
+                              set -euo pipefail
+                              if kubectl get daemonsets -A -o name | grep -qi flannel; then
+                                echo "ERROR: Flannel is still deployed. Recreate the tenant cluster with deploy.cni.flannel.enabled=false."
+                                exit 1
+                              fi
+                              for i in $(seq 1 90); do
+                                if kubectl get tigerastatus calico >/dev/null 2>&1; then break; fi
+                                sleep 10
+                              done
+                              kubectl wait --for=condition=Available tigerastatus/calico --timeout=15m
+                              kubectl wait --for=condition=Available tigerastatus/apiserver --timeout=10m
+                              kubectl wait --for=condition=Ready nodes --all --timeout=10m
+                              kubectl get tigerastatus
+                              kubectl get ippools.projectcalico.org -o wide || true
+                          resources:
+                            requests:
+                              cpu: 50m
+                              memory: 64Mi
+                            limits:
+                              memory: 256Mi
+                          securityContext:
+                            allowPrivilegeEscalation: false
+                            readOnlyRootFilesystem: true
+                            capabilities:
+                              drop: ["ALL"]
+                          volumeMounts:
+                            - name: tmp
+                              mountPath: /tmp
+                      volumes:
+                        - name: tmp
+                          emptyDir: {}
+
+    # 3. vNode preflight: fail early on nodes vNode can't run on.
+    - name: preflight
+      dependsOn:
+        - calicoready
+      timeout: 10m
+      app:
+        template:
+          spec:
+            displayName: vNode preflight
+            description: Kernel 6.1+ and containerd on every node.
+            defaultNamespace: kube-system
+            wait: true
+            config:
+              bash:
+                image: "{{ .Values.toolsImage }}"
+                clusterRole: cluster-admin
+                script: |-
+                  set -euo pipefail
+                  FAIL=0
+                  kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.status.nodeInfo.kernelVersion}{" "}{.status.nodeInfo.containerRuntimeVersion}{"\n"}{end}' > /tmp/nodes.txt
+                  while read -r NODE KERNEL RUNTIME; do
+                    MAJOR=$(echo "$KERNEL" | cut -d. -f1)
+                    MINOR=$(echo "$KERNEL" | cut -d. -f2 | cut -d- -f1)
+                    if [ "$MAJOR" -lt 6 ] || { [ "$MAJOR" -eq 6 ] && [ "$MINOR" -lt 1 ]; }; then
+                      echo "FAIL ${NODE}: kernel ${KERNEL} is older than 6.1"; FAIL=1
+                    fi
+                    case "$RUNTIME" in
+                      containerd://1.7.*|containerd://2.0.*) echo "OK   ${NODE}: runtime ${RUNTIME} (kernel ${KERNEL})" ;;
+                      containerd://*) echo "WARN ${NODE}: ${RUNTIME} is outside the documented 1.7/2.0 range; vnodeready will confirm it works" ;;
+                      *) echo "FAIL ${NODE}: ${RUNTIME} is not containerd"; FAIL=1 ;;
+                    esac
+                  done < /tmp/nodes.txt
+                  exit "$FAIL"
+
+    # 4. vNode runtime on every node. Inside a tenant cluster it licenses through the
+    #    Virtual Control Plane, so no platform host or access key is configured.
+    #    Installed by a Helm job rather than as a chart App, on purpose: the platform
+    #    uninstalls all of a Stack's tasks at once when the Stack is deleted, ignoring
+    #    dependsOn. A chart App's DaemonSet was gone within a second, while the sandbox
+    #    pods were still stopping, and the kubelet cannot stop a vNode container without
+    #    the vNode manager, so they hung in Terminating. Deleting a bash task removes only
+    #    its Job, so vNode outlives the Stack, like the controller and vBox do, and a
+    #    recreated Stack upgrades the same release. Remove it by hand with
+    #    `helm uninstall vnode-runtime -n vnode-runtime` once no sandbox pods are left.
+    - name: vnode
+      dependsOn:
+        - preflight
+      timeout: 15m
+      app:
+        template:
+          spec:
+            displayName: vNode runtime
+            description: vnode-runtime DaemonSet; registers the "vnode" RuntimeClass.
+            defaultNamespace: kube-system
+            wait: true
+            config:
+              bash:
+                image: "{{ .Values.toolsImage }}"
+                clusterRole: cluster-admin
+                script: |-
+                  set -euo pipefail
+                  WORK=$(mktemp -d)
+                  cat > "$WORK/values.yaml" <<EOF
+                  daemonSet:
+                    # Tolerate every taint, like calico-node. Deleting a tenant cluster
+                    # taints its nodes vcluster.com/cleanup:NoExecute, which evicts any pod
+                    # that does not tolerate it, and without the vNode manager the sandbox
+                    # pods cannot be stopped ("vNode proxy: cannot forward request to vNode
+                    # manager"): they stay Terminating, hold their PVCs, and the deletion
+                    # waits on them forever.
+                    tolerations:
+                      - operator: Exists
+                    env:
+                      # per-pod: every sandbox gets its own vNode. The sandboxes share one
+                      # namespace, so per-namespace mode would let them see each other.
+                      - name: VNODE_PER_POD
+                        value: {{ if eq (print .Values.vnodeIsolation) "per-pod" }}"true"{{ else }}"false"{{ end }}
+                  EOF
+                  VERSION="{{ .Values.vnodeVersion }}"
+                  # Empty vnodeVersion installs the latest chart, as the chart App did.
+                  helm upgrade --install vnode-runtime vnode-runtime \
+                    --repo https://charts.loft.sh ${VERSION:+--version "$VERSION"} \
+                    --namespace vnode-runtime --create-namespace \
+                    -f "$WORK/values.yaml" \
+                    --wait=legacy --timeout 10m
+                  kubectl -n vnode-runtime get daemonset vnode-runtime
+
+    # 5. vNode health gate. vNode restarts containerd on each node when it starts, so
+    #    wait for nodes to come back and prove a pod really runs in a user namespace.
+    - name: vnodeready
+      dependsOn:
+        - vnode
+      timeout: 20m
+      app:
+        template:
+          spec:
+            displayName: Verify vNode
+            description: RuntimeClass present, nodes Ready, UID 0 remapped in a test pod.
+            defaultNamespace: kube-system
+            wait: true
+            config:
+              bash:
+                image: "{{ .Values.toolsImage }}"
+                clusterRole: cluster-admin
+                script: |-
+                  set -euo pipefail
+                  kubectl -n vnode-runtime rollout status daemonset --timeout=10m
+                  for i in $(seq 1 60); do
+                    if kubectl get runtimeclass vnode >/dev/null 2>&1; then break; fi
+                    sleep 10
+                  done
+                  kubectl get runtimeclass vnode
+                  # Some kubelet units have BindsTo=containerd.service and stay down after
+                  # vNode restarts containerd. Nodes stuck NotReady here need a reboot.
+                  kubectl wait --for=condition=Ready nodes --all --timeout=10m
+
+                  kubectl -n kube-system delete pod vnode-smoke --ignore-not-found --wait=true
+                  cat <<EOF | kubectl apply -f -
+                  apiVersion: v1
+                  kind: Pod
+                  metadata:
+                    name: vnode-smoke
+                    namespace: kube-system
+                  spec:
+                    runtimeClassName: vnode
+                    restartPolicy: Never
+                    terminationGracePeriodSeconds: 1
+                    containers:
+                      - name: smoke
+                        image: busybox:1.36
+                        command: ["sh", "-c", "cat /proc/self/uid_map"]
+                  EOF
+                  kubectl -n kube-system wait pod/vnode-smoke \
+                    --for=jsonpath='{.status.phase}'=Succeeded --timeout=5m
+                  MAP=$(kubectl -n kube-system logs vnode-smoke)
+                  kubectl -n kube-system delete pod vnode-smoke --wait=false
+                  echo "uid_map: ${MAP}"
+                  # Identity map "0 0 4294967295" means the pod did NOT run under vNode.
+                  HOSTUID=$(echo "$MAP" | awk 'NR==1 {print $2}')
+                  [ "$HOSTUID" != "0" ] || { echo "ERROR: UID 0 is not remapped; containerd was not reconfigured for vNode"; exit 1; }
+                  echo "OK: container root maps to host UID ${HOSTUID}"
+
+    # 6. Agent Sandbox controller via its Helm chart at the pinned release tag.
+    - name: controller
+      dependsOn:
+        - calicoready
+      timeout: 15m
+      app:
+        template:
+          spec:
+            displayName: Agent Sandbox controller
+            description: CRDs plus the upstream Helm chart, HA and hardened.
+            defaultNamespace: kube-system
+            wait: true
+            config:
+              bash:
+                image: "{{ .Values.toolsImage }}"
+                clusterRole: cluster-admin
+                script: |-
+                  set -euo pipefail
+                  V="{{ .Values.agentSandboxVersion }}"
+
+                  # Namespaces with Pod Security Admission "restricted" enforced.
+                  for NS in agent-sandbox-system "{{ .Values.sandboxNamespace }}"; do
+                    kubectl create namespace "$NS" --dry-run=client -o yaml | kubectl apply -f -
+                    kubectl label namespace "$NS" --overwrite \
+                      pod-security.kubernetes.io/enforce=restricted \
+                      pod-security.kubernetes.io/audit=restricted \
+                      pod-security.kubernetes.io/warn=restricted
+                  done
+
+                  # The chart is not published to a Helm repo; use the release source tarball.
+                  WORK=$(mktemp -d)
+                  curl -fsSL "https://codeload.github.com/kubernetes-sigs/agent-sandbox/tar.gz/refs/tags/${V}" | tar xz -C "$WORK"
+                  CHART=$(echo "$WORK"/agent-sandbox-*/helm)
+
+                  # Helm never upgrades crds/, so apply them explicitly on every run.
+                  kubectl apply --server-side --force-conflicts -f "$CHART/crds/"
+                  kubectl wait --for=condition=Established --timeout=5m \
+                    crd/sandboxes.agents.x-k8s.io \
+                    crd/sandboxtemplates.extensions.agents.x-k8s.io \
+                    crd/sandboxwarmpools.extensions.agents.x-k8s.io \
+                    crd/sandboxclaims.extensions.agents.x-k8s.io
+
+                  cat > "$WORK/values.yaml" <<EOF
+                  replicaCount: {{ .Values.controllerReplicas }}
+                  namespace:
+                    create: false
+                    name: agent-sandbox-system
+                  controller:
+                    extensions: true
+                    leaderElect: true
+                    cacheLabelSelectors: true
+                    separateWatchConnection: true
+                  resources:
+                    requests:
+                      cpu: 100m
+                      memory: 256Mi
+                    limits:
+                      memory: 1Gi
+                  podSecurityContext:
+                    runAsNonRoot: true
+                    seccompProfile:
+                      type: RuntimeDefault
+                  containerSecurityContext:
+                    allowPrivilegeEscalation: false
+                    readOnlyRootFilesystem: true
+                    capabilities:
+                      drop: ["ALL"]
+                  metrics:
+                    serviceMonitor:
+                      enabled: {{ .Values.serviceMonitor }}
+                  {{- if .Values.systemNodeRole }}
+                  # On the system node, so it never holds an autoscaled sandbox node.
+                  nodeSelector:
+                    pool.agent-sandbox.io/role: {{ .Values.systemNodeRole }}
+                  {{- end }}
+                  EOF
+
+                  helm upgrade --install agent-sandbox "$CHART" \
+                    --namespace agent-sandbox-system \
+                    --set image.tag="$V" \
+                    -f "$WORK/values.yaml" \
+                    --wait=legacy --timeout 10m
+                  kubectl -n agent-sandbox-system get deploy
+
+    # 7. Go Sandbox Router (from sandbox-router/deploy at the release tag, tightened).
+    - name: router
+      dependsOn:
+        - controller
+      app:
+        template:
+          spec:
+            displayName: Sandbox Router
+            description: Data-plane proxy the SDKs reach as sandbox-router-svc.
+            defaultNamespace: agent-sandbox-system
+            wait: true
+            config:
+              manifests: |-
+                apiVersion: v1
+                kind: ServiceAccount
+                metadata:
+                  name: sandbox-router
+                  namespace: agent-sandbox-system
+                  labels:
+                    app.kubernetes.io/name: sandbox-router
+                    app.kubernetes.io/component: sandbox-router
+                automountServiceAccountToken: true
+                ---
+                # Pod read access for the router's Pod-IP cache (--cache-enabled=true).
+                apiVersion: rbac.authorization.k8s.io/v1
+                kind: ClusterRole
+                metadata:
+                  name: sandbox-router
+                rules:
+                  - apiGroups: [""]
+                    resources: ["pods"]
+                    verbs: ["get", "list", "watch"]
+                ---
+                apiVersion: rbac.authorization.k8s.io/v1
+                kind: ClusterRoleBinding
+                metadata:
+                  name: sandbox-router
+                roleRef:
+                  apiGroup: rbac.authorization.k8s.io
+                  kind: ClusterRole
+                  name: sandbox-router
+                subjects:
+                  - kind: ServiceAccount
+                    name: sandbox-router
+                    namespace: agent-sandbox-system
+                ---
+                apiVersion: apps/v1
+                kind: Deployment
+                metadata:
+                  name: sandbox-router
+                  namespace: agent-sandbox-system
+                  labels:
+                    app: sandbox-router
+                    app.kubernetes.io/name: sandbox-router
+                    app.kubernetes.io/component: sandbox-router
+                spec:
+                  replicas: {{ .Values.routerReplicas }}
+                  selector:
+                    matchLabels:
+                      app.kubernetes.io/name: sandbox-router
+                      app.kubernetes.io/component: sandbox-router
+                  template:
+                    metadata:
+                      labels:
+                        # "app: sandbox-router" is what the managed sandbox NetworkPolicy admits.
+                        app: sandbox-router
+                        app.kubernetes.io/name: sandbox-router
+                        app.kubernetes.io/component: sandbox-router
+                      annotations:
+                        prometheus.io/scrape: "true"
+                        prometheus.io/port: "9090"
+                        prometheus.io/path: /metrics
+                    spec:
+                      serviceAccountName: sandbox-router
+                {{- if .Values.systemNodeRole }}
+                      # On the system node, so it never holds an autoscaled sandbox node.
+                      nodeSelector:
+                        pool.agent-sandbox.io/role: {{ .Values.systemNodeRole }}
+                {{- end }}
+                      securityContext:
+                        runAsNonRoot: true
+                        seccompProfile:
+                          type: RuntimeDefault
+                      topologySpreadConstraints:
+                        - maxSkew: 1
+                          topologyKey: kubernetes.io/hostname
+                          whenUnsatisfiable: ScheduleAnyway
+                          labelSelector:
+                            matchLabels:
+                              app.kubernetes.io/name: sandbox-router
+                      containers:
+                        - name: sandbox-router
+                          image: registry.k8s.io/agent-sandbox/sandbox-router-go:{{ .Values.routerImageTag }}
+                          imagePullPolicy: IfNotPresent
+                          args:
+                            - --http-bind-address=:8080
+                            - --metrics-bind-address=:9090
+                            - --health-probe-bind-address=:8081
+                            - --cluster-domain=cluster.local
+                            - --proxy-timeout=180s
+                            - --upstream-max-retries=3
+                            - --cache-enabled=true
+                            - --max-request-body-bytes=104857600
+                          ports:
+                            - name: proxy
+                              containerPort: 8080
+                              protocol: TCP
+                            - name: metrics
+                              containerPort: 9090
+                              protocol: TCP
+                            - name: healthz
+                              containerPort: 8081
+                              protocol: TCP
+                          livenessProbe:
+                            httpGet:
+                              path: /healthz
+                              port: healthz
+                            initialDelaySeconds: 5
+                            periodSeconds: 10
+                            failureThreshold: 3
+                          readinessProbe:
+                            httpGet:
+                              path: /readyz
+                              port: healthz
+                            initialDelaySeconds: 1
+                            periodSeconds: 5
+                            failureThreshold: 2
+                          resources:
+                            requests:
+                              cpu: 250m
+                              memory: 256Mi
+                            limits:
+                              cpu: "2"
+                              memory: 1Gi
+                          securityContext:
+                            allowPrivilegeEscalation: false
+                            readOnlyRootFilesystem: true
+                            runAsNonRoot: true
+                            capabilities:
+                              drop: ["ALL"]
+                            seccompProfile:
+                              type: RuntimeDefault
+                      terminationGracePeriodSeconds: 45
+                ---
+                apiVersion: v1
+                kind: Service
+                metadata:
+                  name: sandbox-router-svc
+                  namespace: agent-sandbox-system
+                  labels:
+                    app.kubernetes.io/name: sandbox-router
+                    app.kubernetes.io/component: sandbox-router
+                spec:
+                  type: ClusterIP
+                  selector:
+                    app.kubernetes.io/name: sandbox-router
+                    app.kubernetes.io/component: sandbox-router
+                  ports:
+                    - name: proxy
+                      port: 8080
+                      targetPort: proxy
+                      protocol: TCP
+                ---
+                apiVersion: policy/v1
+                kind: PodDisruptionBudget
+                metadata:
+                  name: sandbox-router
+                  namespace: agent-sandbox-system
+                spec:
+                  maxUnavailable: 1
+                  selector:
+                    matchLabels:
+                      app.kubernetes.io/name: sandbox-router
+                      app.kubernetes.io/component: sandbox-router
+                ---
+                apiVersion: networking.k8s.io/v1
+                kind: NetworkPolicy
+                metadata:
+                  name: sandbox-router
+                  namespace: agent-sandbox-system
+                spec:
+                  podSelector:
+                    matchLabels:
+                      app.kubernetes.io/name: sandbox-router
+                      app.kubernetes.io/component: sandbox-router
+                  policyTypes: ["Ingress", "Egress"]
+                  ingress:
+                    # Only the agent namespace may call the router. kubectl port-forward
+                    # (SDK Tunnel mode) enters the pod network namespace directly and
+                    # is governed by RBAC on pods/portforward instead.
+                    - from:
+                        - namespaceSelector:
+                            matchLabels:
+                              kubernetes.io/metadata.name: {{ .Values.agentNamespace }}
+                      ports:
+                        - protocol: TCP
+                          port: 8080
+                    - ports:
+                        - protocol: TCP
+                          port: 8081
+                    - from:
+                        - namespaceSelector:
+                            matchLabels:
+                              kubernetes.io/metadata.name: monitoring
+                      ports:
+                        - protocol: TCP
+                          port: 9090
+                  egress:
+                    - to:
+                        - namespaceSelector:
+                            matchLabels:
+                              kubernetes.io/metadata.name: kube-system
+                      ports:
+                        - protocol: UDP
+                          port: 53
+                        - protocol: TCP
+                          port: 53
+                    # The sandboxes' ports: 8888 for the Python runtime, 9222 (CDP) for Chrome.
+                    - to:
+                        - namespaceSelector:
+                            matchLabels:
+                              kubernetes.io/metadata.name: {{ .Values.sandboxNamespace }}
+                      ports:
+                        - protocol: TCP
+                          port: 8888
+                        - protocol: TCP
+                          port: 9222
+                    # Tenant API server for the Pod-IP cache. With private nodes it is
+                    # outside the pod network, so a namespaceSelector can't match it.
+                    - to:
+                        - ipBlock:
+                            cidr: {{ .Values.apiServerCIDR }}
+                      ports:
+                        - protocol: TCP
+                          port: 443
+                        - protocol: TCP
+                          port: 6443
+      outputs:
+        - name: clusterip
+          fromResource:
+            apiVersion: v1
+            kind: Service
+            namespace: agent-sandbox-system
+            name: sandbox-router-svc
+            jsonPath: "{.spec.clusterIP}"
+
+    # 8. Guardrails: admission policy, quotas and least-privilege RBAC.
+    - name: guardrails
+      dependsOn:
+        - controller
+      app:
+        template:
+          spec:
+            displayName: Sandbox guardrails
+            description: VAP adapted from upstream examples/policy/vap (vNode required), quota, limits, RBAC.
+            defaultNamespace: "{{ .Values.sandboxNamespace }}"
+            wait: true
+            config:
+              manifests: |-
+                # Upstream secure-sandbox-policy without the gVisor and GKE-only rules.
+                apiVersion: admissionregistration.k8s.io/v1
+                kind: ValidatingAdmissionPolicy
+                metadata:
+                  name: secure-sandbox-policy
+                spec:
+                  failurePolicy: Fail
+                  matchConstraints:
+                    resourceRules:
+                      - apiGroups: ["agents.x-k8s.io"]
+                        apiVersions: ["v1beta1"]
+                        operations: ["CREATE", "UPDATE"]
+                        resources: ["sandboxes"]
+                  variables:
+                    - name: spec
+                      expression: object.spec.podTemplate.spec
+                    - name: allContainers
+                      expression: >-
+                        object.spec.podTemplate.spec.containers +
+                        (has(object.spec.podTemplate.spec.initContainers) ? object.spec.podTemplate.spec.initContainers : []) +
+                        (has(object.spec.podTemplate.spec.ephemeralContainers) ? object.spec.podTemplate.spec.ephemeralContainers : [])
+                  validations:
+                    # Runtime isolation: every sandbox must run under vNode.
+                    - expression: "has(variables.spec.runtimeClassName) && variables.spec.runtimeClassName == 'vnode'"
+                      message: "Sandboxes must use runtimeClassName: vnode."
+                    - expression: "!has(variables.spec.hostNetwork) || variables.spec.hostNetwork == false"
+                      message: "hostNetwork is not allowed for sandboxes."
+                    - expression: "(!has(variables.spec.hostPID) || variables.spec.hostPID == false) && (!has(variables.spec.hostIPC) || variables.spec.hostIPC == false)"
+                      message: "hostPID and hostIPC must be false."
+                    - expression: "has(variables.spec.automountServiceAccountToken) && variables.spec.automountServiceAccountToken == false"
+                      message: "automountServiceAccountToken must be explicitly false."
+                    - expression: >-
+                        !has(variables.spec.volumes) ||
+                        !variables.spec.volumes.exists(v, has(v.hostPath) ||
+                          (has(v.projected) && has(v.projected.sources) &&
+                           v.projected.sources.exists(s, has(s.serviceAccountToken) || has(s.clusterTrustBundle) || has(s.podCertificate))))
+                      message: "hostPath volumes and projected tokens or certificates are not allowed."
+                    - expression: >-
+                        !has(variables.spec.securityContext) ||
+                        !has(variables.spec.securityContext.sysctls) ||
+                        size(variables.spec.securityContext.sysctls) == 0
+                      message: "Custom sysctls are not allowed."
+                    - expression: >-
+                        variables.allContainers.all(c,
+                          !has(c.securityContext) || !has(c.securityContext.privileged) || c.securityContext.privileged == false)
+                      message: "Privileged containers are not allowed."
+                    - expression: >-
+                        variables.allContainers.all(c,
+                          has(c.securityContext) && has(c.securityContext.capabilities) &&
+                          has(c.securityContext.capabilities.drop) && 'ALL' in c.securityContext.capabilities.drop &&
+                          (!has(c.securityContext.capabilities.add) || size(c.securityContext.capabilities.add) == 0))
+                      message: "Containers must drop ALL capabilities and add none."
+                    - expression: >-
+                        variables.allContainers.all(c,
+                          has(c.resources) && has(c.resources.limits) &&
+                          has(c.resources.limits.cpu) && has(c.resources.limits.memory))
+                      message: "Containers must set CPU and memory limits."
+                    - expression: >-
+                        variables.allContainers.all(c,
+                          (has(c.securityContext) && has(c.securityContext.runAsNonRoot) && c.securityContext.runAsNonRoot == true) ||
+                          ((!has(c.securityContext) || !has(c.securityContext.runAsNonRoot)) &&
+                           has(variables.spec.securityContext) && has(variables.spec.securityContext.runAsNonRoot) &&
+                           variables.spec.securityContext.runAsNonRoot == true))
+                      message: "Sandboxes must run as non-root."
+                    - expression: >-
+                        variables.allContainers.all(c, !has(c.ports) || c.ports.all(p, !has(p.hostPort)))
+                      message: "hostPort is not allowed."
+                    - expression: >-
+                        variables.allContainers.all(c,
+                          !has(c.securityContext) || !has(c.securityContext.procMount) || c.securityContext.procMount == 'Default')
+                      message: "procMount must be Default."
+                ---
+                apiVersion: admissionregistration.k8s.io/v1
+                kind: ValidatingAdmissionPolicyBinding
+                metadata:
+                  name: secure-sandbox-binding
+                spec:
+                  policyName: secure-sandbox-policy
+                  validationActions: [Deny]
+                  matchResources:
+                    namespaceSelector:
+                      matchExpressions:
+                        - key: kubernetes.io/metadata.name
+                          operator: NotIn
+                          values: ["kube-system", "agent-sandbox-system"]
+                ---
+                apiVersion: v1
+                kind: ResourceQuota
+                metadata:
+                  name: sandbox-quota
+                  namespace: {{ .Values.sandboxNamespace }}
+                spec:
+                  hard:
+                    pods: "{{ .Values.quotaPods }}"
+                    limits.cpu: "{{ .Values.quotaCPU }}"
+                    limits.memory: "{{ .Values.quotaMemory }}"
+                    persistentvolumeclaims: "{{ .Values.quotaPods }}"
+                    requests.storage: 200Gi
+                    services.loadbalancers: "0"
+                    services.nodeports: "0"
+                ---
+                apiVersion: v1
+                kind: LimitRange
+                metadata:
+                  name: sandbox-limits
+                  namespace: {{ .Values.sandboxNamespace }}
+                spec:
+                  limits:
+                    - type: Container
+                      default:
+                        cpu: "1"
+                        memory: 1Gi
+                      defaultRequest:
+                        cpu: 250m
+                        memory: 512Mi
+                      max:
+                        cpu: "4"
+                        memory: 8Gi
+                    - type: PersistentVolumeClaim
+                      max:
+                        storage: 10Gi
+                ---
+                # Agents claim sandboxes from templates; they never create raw Sandboxes.
+                apiVersion: rbac.authorization.k8s.io/v1
+                kind: ClusterRole
+                metadata:
+                  name: agent-sandbox-user
+                rules:
+                  - apiGroups: ["extensions.agents.x-k8s.io"]
+                    resources: ["sandboxclaims"]
+                    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+                  - apiGroups: ["extensions.agents.x-k8s.io"]
+                    resources: ["sandboxtemplates", "sandboxwarmpools"]
+                    verbs: ["get", "list", "watch"]
+                  - apiGroups: ["agents.x-k8s.io"]
+                    resources: ["sandboxes"]
+                    verbs: ["get", "list", "watch"]
+                  # Chrome sandboxes: Chromium binds CDP to localhost, so the router cannot
+                  # reach it, and agents port-forward to their sandbox pod instead. Bound
+                  # in the sandbox namespace only (RoleBinding below).
+                  - apiGroups: [""]
+                    resources: ["pods"]
+                    verbs: ["get", "list"]
+                  - apiGroups: [""]
+                    resources: ["pods/portforward"]
+                    verbs: ["create"]
+                ---
+                apiVersion: rbac.authorization.k8s.io/v1
+                kind: RoleBinding
+                metadata:
+                  name: agent-sandbox-user
+                  namespace: {{ .Values.sandboxNamespace }}
+                roleRef:
+                  apiGroup: rbac.authorization.k8s.io
+                  kind: ClusterRole
+                  name: agent-sandbox-user
+                subjects:
+                  - kind: ServiceAccount
+                    name: {{ .Values.agentServiceAccount }}
+                    namespace: {{ .Values.agentNamespace }}
+
+    # 9. Two hardened SandboxTemplates on vNode, the official Python runtime and Chrome
+    #    sandboxes, always both: agents claim whichever they need. The warm pool keeps
+    #    one of them ready (warmPoolType); claims of the other start cold.
+    - name: pool
+      dependsOn:
+        - router
+        - guardrails
+        - vnodeready
+      app:
+        template:
+          spec:
+            displayName: Sandbox templates and warm pool
+            description: vNode-isolated, restricted-PSA-compliant Python and Chrome SandboxTemplates plus a SandboxWarmPool.
+            defaultNamespace: "{{ .Values.sandboxNamespace }}"
+            wait: true
+            config:
+              manifests: |-
+                # Python runtime API on port 8888, reached through the Sandbox Router.
+                apiVersion: extensions.agents.x-k8s.io/v1beta1
+                kind: SandboxTemplate
+                metadata:
+                  name: python-template
+                  namespace: {{ .Values.sandboxNamespace }}
+                spec:
+                  podTemplate:
+                    spec:
+                      # User-namespace sandbox: a container escape lands in the vNode,
+                      # not on the private node.
+                      runtimeClassName: vnode
+                      automountServiceAccountToken: false
+                      enableServiceLinks: false
+                      restartPolicy: OnFailure
+                      securityContext:
+                        runAsNonRoot: true
+                        runAsUser: 1000
+                        runAsGroup: 1000
+                        fsGroup: 1000
+                        seccompProfile:
+                          type: RuntimeDefault
+                {{- if eq (print .Values.sandboxEgress) "public-internet" }}
+                      # The managed policy blocks cluster DNS (no service discovery for
+                      # agents), so resolve names through public resolvers instead.
+                      dnsPolicy: None
+                      dnsConfig:
+                        nameservers:
+                          - 1.1.1.1
+                          - 8.8.8.8
+                        options:
+                          - name: ndots
+                            value: "1"
+                {{- end }}
+                      containers:
+                        - name: python-runtime
+                          image: {{ if .Values.pythonSandboxImage }}{{ .Values.pythonSandboxImage }}{{ else }}registry.k8s.io/agent-sandbox/python-runtime-sandbox:{{ .Values.agentSandboxVersion }}{{ end }}
+                          ports:
+                            - containerPort: 8888
+                              protocol: TCP
+                          env:
+                            - name: SANDBOX_BASE_DIR
+                              value: /workspace
+                            - name: HOME
+                              value: /workspace
+                            - name: TMPDIR
+                              value: /tmp
+                            - name: PYTHONDONTWRITEBYTECODE
+                              value: "1"
+                          readinessProbe:
+                            httpGet:
+                              path: /
+                              port: 8888
+                            periodSeconds: 1
+                          livenessProbe:
+                            httpGet:
+                              path: /
+                              port: 8888
+                            initialDelaySeconds: 5
+                            periodSeconds: 10
+                          resources:
+                            requests:
+                              cpu: 250m
+                              memory: 512Mi
+                              ephemeral-storage: 256Mi
+                            limits:
+                              cpu: "1"
+                              memory: 1Gi
+                              ephemeral-storage: 1Gi
+                          securityContext:
+                            allowPrivilegeEscalation: false
+                            readOnlyRootFilesystem: true
+                            runAsNonRoot: true
+                            capabilities:
+                              drop: ["ALL"]
+                          volumeMounts:
+                            - name: workspace
+                              mountPath: /workspace
+                            - name: tmp
+                              mountPath: /tmp
+                      volumes:
+                        - name: tmp
+                          emptyDir:
+                            sizeLimit: 256Mi
+                {{- if eq (print .Values.sandboxEgress) "none" }}
+                  # Router-only ingress and no egress at all.
+                  networkPolicy:
+                    ingress:
+                      - from:
+                          - namespaceSelector:
+                              matchLabels:
+                                kubernetes.io/metadata.name: agent-sandbox-system
+                            podSelector:
+                              matchLabels:
+                                app: sandbox-router
+                        ports:
+                          - protocol: TCP
+                            port: 8888
+                {{- end }}
+                  # Omitting networkPolicy (public-internet) keeps the controller's managed
+                  # default: router-only ingress, public egress, RFC1918 and metadata blocked.
+                  networkPolicyManagement: Managed
+                  volumeClaimTemplatesPolicy: Overrides
+                  volumeClaimTemplates:
+                    - metadata:
+                        name: workspace
+                      spec:
+                        accessModes: ["ReadWriteOnce"]
+                        resources:
+                          requests:
+                            storage: 1Gi
+                ---
+                # Xvnc on display :1 and Chromium with the DevTools Protocol on
+                # localhost:9222, reached with kubectl port-forward. No workspace volume:
+                # its state is a browser profile, kept on the pod's emptyDirs.
+                apiVersion: extensions.agents.x-k8s.io/v1beta1
+                kind: SandboxTemplate
+                metadata:
+                  name: chrome-template
+                  namespace: {{ .Values.sandboxNamespace }}
+                spec:
+                  podTemplate:
+                    spec:
+                      runtimeClassName: vnode
+                      automountServiceAccountToken: false
+                      enableServiceLinks: false
+                      restartPolicy: OnFailure
+                      securityContext:
+                        runAsNonRoot: true
+                        # The image's "chrome" user. Its USER is a name, which the kubelet
+                        # cannot check against runAsNonRoot, so the number is spelled out.
+                        runAsUser: 996
+                        runAsGroup: 996
+                        fsGroup: 996
+                        seccompProfile:
+                          type: RuntimeDefault
+                {{- if eq (print .Values.sandboxEgress) "public-internet" }}
+                      dnsPolicy: None
+                      dnsConfig:
+                        nameservers:
+                          - 1.1.1.1
+                          - 8.8.8.8
+                        options:
+                          - name: ndots
+                            value: "1"
+                {{- end }}
+                      containers:
+                        - name: chrome-sandbox
+                          image: {{ if .Values.chromeSandboxImage }}{{ .Values.chromeSandboxImage }}{{ else }}registry.k8s.io/agent-sandbox/chrome-sandbox:{{ .Values.agentSandboxVersion }}{{ end }}
+                          ports:
+                            - name: cdp
+                              containerPort: 9222
+                              protocol: TCP
+                          env:
+                            # Chromium writes its profile, NSS database and caches under
+                            # HOME; the root filesystem is read-only.
+                            - name: HOME
+                              value: /home/chrome
+                          # Upstream's own check: GET localhost:9222/json/version. An exec
+                          # probe, because CDP is not listening on the pod IP.
+                          readinessProbe:
+                            exec:
+                              command: ["/chrome-sandbox-entrypoint", "probe"]
+                            initialDelaySeconds: 1
+                            periodSeconds: 1
+                            timeoutSeconds: 2
+                          livenessProbe:
+                            exec:
+                              command: ["/chrome-sandbox-entrypoint", "probe"]
+                            initialDelaySeconds: 15
+                            periodSeconds: 10
+                            timeoutSeconds: 2
+                            failureThreshold: 3
+                          resources:
+                            requests:
+                              cpu: 500m
+                              memory: 1Gi
+                              ephemeral-storage: 512Mi
+                            limits:
+                              cpu: "2"
+                              memory: 2Gi
+                              ephemeral-storage: 2Gi
+                          securityContext:
+                            allowPrivilegeEscalation: false
+                            readOnlyRootFilesystem: true
+                            runAsNonRoot: true
+                            capabilities:
+                              drop: ["ALL"]
+                          volumeMounts:
+                            - name: home
+                              mountPath: /home/chrome
+                            # X11 sockets and Chromium's user data dir; also its shared
+                            # memory, since it runs with --disable-dev-shm-usage.
+                            - name: tmp
+                              mountPath: /tmp
+                      volumes:
+                        - name: home
+                          emptyDir:
+                            sizeLimit: 512Mi
+                        - name: tmp
+                          emptyDir:
+                            sizeLimit: 1Gi
+                {{- if eq (print .Values.sandboxEgress) "none" }}
+                  networkPolicy:
+                    ingress:
+                      - from:
+                          - namespaceSelector:
+                              matchLabels:
+                                kubernetes.io/metadata.name: agent-sandbox-system
+                            podSelector:
+                              matchLabels:
+                                app: sandbox-router
+                        ports:
+                          - protocol: TCP
+                            port: 9222
+                {{- end }}
+                  networkPolicyManagement: Managed
+                ---
+                apiVersion: extensions.agents.x-k8s.io/v1beta1
+                kind: SandboxWarmPool
+                metadata:
+                  name: {{ .Values.warmPoolType }}-pool
+                  namespace: {{ .Values.sandboxNamespace }}
+                spec:
+                  replicas: {{ .Values.warmPoolReplicas }}
+                  sandboxTemplateRef:
+                    name: {{ .Values.warmPoolType }}-template
+      outputs:
+        - name: sandboxnamespace
+          fromResource:
+            apiVersion: extensions.agents.x-k8s.io/v1beta1
+            kind: SandboxWarmPool
+            namespace: "{{ .Values.sandboxNamespace }}"
+            name: "{{ .Values.warmPoolType }}-pool"
+            jsonPath: "{.metadata.namespace}"
+        - name: warmpoolname
+          fromResource:
+            apiVersion: extensions.agents.x-k8s.io/v1beta1
+            kind: SandboxWarmPool
+            namespace: "{{ .Values.sandboxNamespace }}"
+            name: "{{ .Values.warmPoolType }}-pool"
+            jsonPath: "{.metadata.name}"
+
+    # 10. End-to-end verification of the security posture.
+    - name: verify
+      dependsOn:
+        - pool
+      timeout: 20m
+      app:
+        template:
+          spec:
+            displayName: Verify install
+            description: Both templates present, warm pool ready on vNode, NetworkPolicy present, VAP enforcing.
+            defaultNamespace: kube-system
+            wait: true
+            config:
+              bash:
+                image: "{{ .Values.toolsImage }}"
+                clusterRole: cluster-admin
+                script: |-
+                  set -euo pipefail
+                  NS="{{ .Values.sandboxNamespace }}"
+                  WANT="{{ .Values.warmPoolReplicas }}"
+                  POOL="{{ .Values.warmPoolType }}-pool"
+                  CONTAINER="{{ if eq (print .Values.warmPoolType) "chrome" }}chrome-sandbox{{ else }}python-runtime{{ end }}"
+
+                  echo "Checking that both sandbox templates are installed..."
+                  kubectl -n "$NS" get sandboxtemplate python-template chrome-template
+
+                  READY=0
+                  for i in $(seq 1 100); do
+                    READY=$(kubectl -n "$NS" get sandboxwarmpool "$POOL" -o jsonpath='{.status.readyReplicas}' || true)
+                    READY=${READY:-0}
+                    echo "warm pool ready: ${READY}/${WANT}"
+                    if [ "$READY" -ge "$WANT" ]; then break; fi
+                    sleep 10
+                  done
+                  [ "$READY" -ge "$WANT" ] || { kubectl -n "$NS" describe sandboxwarmpool "$POOL"; exit 1; }
+
+                  # A pool of 0 has no warm sandbox to inspect, so the vNode checks need
+                  # one; vnodeready has already proven vNode with its own test pod.
+                  if [ "$WANT" -gt 0 ]; then
+                    echo "Checking that warm sandboxes run under vNode..."
+                    kubectl -n "$NS" get pods -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.spec.runtimeClassName}{"\n"}{end}' > /tmp/pods.txt
+                    cat /tmp/pods.txt
+                    if awk '$2 != "vnode" {bad=1} END {exit !bad}' /tmp/pods.txt; then
+                      echo "ERROR: a sandbox pod is not using runtimeClassName vnode"; exit 1
+                    fi
+                    # A pod running the warm type's container, not just the first pod in
+                    # the namespace: a cold-started sandbox of the other type would not
+                    # have that container.
+                    kubectl -n "$NS" get pods --field-selector=status.phase=Running \
+                      -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.spec.containers[0].name}{"\n"}{end}' > /tmp/running.txt
+                    POD=$(awk -v c="$CONTAINER" '$2 == c {print $1; exit}' /tmp/running.txt)
+                    [ -n "$POD" ] || { echo "ERROR: no running ${CONTAINER} pod in ${NS}"; exit 1; }
+                    MAP=$(kubectl -n "$NS" exec "$POD" -c "$CONTAINER" -- cat /proc/self/uid_map)
+                    echo "uid_map in ${POD}: ${MAP}"
+                    [ "$(echo "$MAP" | awk 'NR==1 {print $2}')" != "0" ] || { echo "ERROR: ${POD} is not UID-remapped"; exit 1; }
+                  else
+                    echo "Warm pool size is 0: no warm sandbox to check; vnodeready already proved vNode."
+                  fi
+
+                  echo "NetworkPolicies in ${NS}:"
+                  kubectl -n "$NS" get networkpolicy
+                  [ "$(kubectl -n "$NS" get networkpolicy -o name | wc -l)" -ge 1 ] || { echo "ERROR: no managed NetworkPolicy"; exit 1; }
+
+                  echo "Checking that the admission policy rejects a privileged Sandbox..."
+                  if cat <<EOF | kubectl create --dry-run=server -f - 2>/tmp/vap.err
+                  apiVersion: agents.x-k8s.io/v1beta1
+                  kind: Sandbox
+                  metadata:
+                    name: vap-probe
+                    namespace: ${NS}
+                  spec:
+                    podTemplate:
+                      spec:
+                        hostNetwork: true
+                        containers:
+                          - name: probe
+                            image: busybox:1.36
+                            securityContext:
+                              privileged: true
+                  EOF
+                  then
+                    echo "ERROR: a privileged Sandbox was admitted"; exit 1
+                  fi
+                  grep -q "secure-sandbox-policy" /tmp/vap.err && echo "OK: rejected by secure-sandbox-policy"
+      outputs:
+        - name: readyreplicas
+          fromResource:
+            apiVersion: extensions.agents.x-k8s.io/v1beta1
+            kind: SandboxWarmPool
+            namespace: "{{ .Values.sandboxNamespace }}"
+            name: "{{ .Values.warmPoolType }}-pool"
+            jsonPath: "{.status.readyReplicas}"
+
+    # 11. Calico configuration: the Installation, APIServer and (optional) Goldmane and
+    #    Whisker resources the operator acts on. Equivalent to what the tigera-operator
+    #    chart renders, but applied after the operator has created the CRDs, which the
+    #    calicocrds task waits for.
+    #    Applied by a host-network Helm-hook Job (kubectl apply --server-side), not as
+    #    release manifests, on purpose. They must outlive the Stack: deleting the
+    #    Installation makes the operator tear Calico down while pods still need the CNI
+    #    to stop. As release manifests that took helm.sh/resource-policy: keep, which
+    #    did keep them, but still owned by the deleted release, so the next Stack's
+    #    release (another name) refused them: "APIServer default exists and cannot be
+    #    imported into the current release: invalid ownership metadata". Applied by
+    #    the Job they belong to no release: every install re-applies them, any Stack
+    #    can, and deleting the Stack leaves them alone.
+    #    Listed last on purpose: task order in this list is irrelevant (dependsOn
+    #    defines execution order), but keeping tasks at stable positions matters
+    #    because a server-side apply merges this list by position.
+    - name: calicoconfig
+      dependsOn:
+        - calicocrds
+      timeout: 15m
+      app:
+        template:
+          spec:
+            displayName: Calico configuration
+            description: Installation (VXLAN IP pool), APIServer, and optionally Goldmane and Whisker, applied by a host-network Job.
+            defaultNamespace: kube-system
+            wait: true
+            config:
+              manifests: |-
+                # Regular resource so the release is never empty; documents what the Job applies.
+                apiVersion: v1
+                kind: ConfigMap
+                metadata:
+                  name: agent-sandbox-calico-config
+                  namespace: kube-system
+                data:
+                  applies: Installation, APIServer{{ if eq (print .Values.calicoObservability) "true" }}, Goldmane, Whisker{{ end }} (operator.tigera.io/v1, name default)
+                ---
+                apiVersion: v1
+                kind: ServiceAccount
+                metadata:
+                  name: calico-config-applier
+                  namespace: kube-system
+                  annotations:
+                    helm.sh/hook: post-install,post-upgrade
+                    helm.sh/hook-weight: "-10"
+                    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+                ---
+                apiVersion: rbac.authorization.k8s.io/v1
+                kind: ClusterRole
+                metadata:
+                  name: calico-config-applier
+                  annotations:
+                    helm.sh/hook: post-install,post-upgrade
+                    helm.sh/hook-weight: "-10"
+                    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+                rules:
+                  - apiGroups: ["operator.tigera.io"]
+                    resources: ["installations", "apiservers", "goldmanes", "whiskers"]
+                    verbs: ["get", "list", "create", "patch", "update", "delete"]
+                ---
+                apiVersion: rbac.authorization.k8s.io/v1
+                kind: ClusterRoleBinding
+                metadata:
+                  name: calico-config-applier
+                  annotations:
+                    helm.sh/hook: post-install,post-upgrade
+                    helm.sh/hook-weight: "-10"
+                    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+                roleRef:
+                  apiGroup: rbac.authorization.k8s.io
+                  kind: ClusterRole
+                  name: calico-config-applier
+                subjects:
+                  - kind: ServiceAccount
+                    name: calico-config-applier
+                    namespace: kube-system
+                ---
+                apiVersion: batch/v1
+                kind: Job
+                metadata:
+                  name: calico-config-apply
+                  namespace: kube-system
+                  annotations:
+                    helm.sh/hook: post-install,post-upgrade
+                    helm.sh/hook-weight: "0"
+                    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+                spec:
+                  backoffLimit: 2
+                  activeDeadlineSeconds: 240
+                  template:
+                    spec:
+                      serviceAccountName: calico-config-applier
+                      restartPolicy: Never
+                      # No pod network yet: these objects are what brings it up.
+                      hostNetwork: true
+                      dnsPolicy: Default
+                      priorityClassName: system-cluster-critical
+                      tolerations:
+                        - operator: Exists
+                      securityContext:
+                        runAsNonRoot: true
+                        runAsUser: 65534
+                        runAsGroup: 65534
+                        seccompProfile:
+                          type: RuntimeDefault
+                      containers:
+                        - name: apply
+                          image: {{ .Values.toolsImage }}
+                          env:
+                            - name: HOME
+                              value: /tmp
+                          command: ["/bin/bash", "-c"]
+                          args:
+                            - |
+                              set -euo pipefail
+                              kubectl apply --server-side --force-conflicts --field-manager=agent-sandbox -f - <<'EOF'
+                              apiVersion: operator.tigera.io/v1
+                              kind: Installation
+                              metadata:
+                                name: default
+                              spec:
+                                cni:
+                                  type: Calico
+                                # Calico's control plane (kube-controllers, webhooks, apiserver) is
+                                # created while every node is still not-ready, waiting for this CNI.
+                                # Without these it sat Pending, and the autoscaler added a sandbox node
+                                # for it on every (re)install. With them it schedules onto the existing
+                                # nodes and starts as soon as their network is up.
+                                controlPlaneTolerations:
+                                  - key: node.kubernetes.io/not-ready
+                                    operator: Exists
+                                    effect: NoSchedule
+                                  - key: node.kubernetes.io/network-unavailable
+                                    operator: Exists
+                                    effect: NoSchedule
+                                  - key: node.cloudprovider.kubernetes.io/uninitialized
+                                    operator: Exists
+                                    effect: NoSchedule
+                                calicoNetwork:
+                                  bgp: Disabled
+                                  ipPools:
+                                    - name: default-ipv4-ippool
+                                      cidr: {{ .Values.podCIDR }}
+                                      encapsulation: {{ .Values.calicoEncapsulation }}
+                                      natOutgoing: Enabled
+                                      nodeSelector: all()
+                                      blockSize: 26
+                              ---
+                              apiVersion: operator.tigera.io/v1
+                              kind: APIServer
+                              metadata:
+                                name: default
+                              spec: {}
+                              {{- if eq (print .Values.calicoObservability) "true" }}
+                              ---
+                              apiVersion: operator.tigera.io/v1
+                              kind: Goldmane
+                              metadata:
+                                name: default
+                              spec: {}
+                              ---
+                              apiVersion: operator.tigera.io/v1
+                              kind: Whisker
+                              metadata:
+                                name: default
+                              spec: {}
+                              {{- end }}
+                              EOF
+                              {{- if ne (print .Values.calicoObservability) "true" }}
+                              # Observability off: remove what an earlier install applied.
+                              kubectl delete goldmane.operator.tigera.io/default whisker.operator.tigera.io/default --ignore-not-found
+                              {{- end }}
+                              # Objects an earlier Stack created as release manifests still
+                              # carry that release's ownership; drop it, they belong to no
+                              # release any more.
+                              for O in installation.operator.tigera.io/default apiserver.operator.tigera.io/default goldmane.operator.tigera.io/default whisker.operator.tigera.io/default; do
+                                kubectl get "$O" >/dev/null 2>&1 || continue
+                                kubectl annotate "$O" meta.helm.sh/release-name- meta.helm.sh/release-namespace- helm.sh/resource-policy- >/dev/null 2>&1 || true
+                                kubectl label "$O" app.kubernetes.io/managed-by- >/dev/null 2>&1 || true
+                              done
+                              kubectl get installation,apiserver
+                          resources:
+                            requests:
+                              cpu: 50m
+                              memory: 64Mi
+                            limits:
+                              memory: 256Mi
+                          securityContext:
+                            allowPrivilegeEscalation: false
+                            readOnlyRootFilesystem: true
+                            capabilities:
+                              drop: ["ALL"]
+                          volumeMounts:
+                            - name: tmp
+                              mountPath: /tmp
+                      volumes:
+                        - name: tmp
+                          emptyDir: {}
+
+    # 12. Allow host networking for Calico and vNode in the Auto Nodes AWS provider's
+    #    admission policy. The quickstart provider installs "hostnetwork-allowed-*",
+    #    which permits hostNetwork only in kube-system and kube-flannel, so the Tigera
+    #    operator, calico-node/Typha and vNode would be rejected. This is the same
+    #    change as auto-nodes-aws-agent-sandbox.patch, applied in-cluster so it also
+    #    covers tenant clusters from an unpatched provider. No-op if already allowed
+    #    or if the policy doesn't exist.
+    #    Runs before any CNI exists: the platform applies the manifests, and the Job
+    #    uses host networking in kube-system (allowed by that policy) and tolerates
+    #    not-ready nodes. As a Helm hook it blocks until done, re-runs on every
+    #    upgrade (re-applying the fix if the provider restores its policy), and its
+    #    RBAC is deleted once it succeeds.
+    #    Listed last on purpose: keep tasks at stable positions in this list.
+    - name: hostnetpolicy
+      timeout: 15m
+      app:
+        template:
+          spec:
+            displayName: Host network policy for Calico and vNode
+            description: Extends the Auto Nodes provider's hostNetwork allowlist to tigera-operator, calico-system and vnode-runtime.
+            defaultNamespace: kube-system
+            wait: true
+            config:
+              manifests: |-
+                # Regular resource so the release is never empty; documents what ran.
+                apiVersion: v1
+                kind: ConfigMap
+                metadata:
+                  name: agent-sandbox-hostnet-policy
+                  namespace: kube-system
+                data:
+                  allowed-namespaces: kube-system,kube-flannel,tigera-operator,calico-system,vnode-runtime
+                ---
+                apiVersion: v1
+                kind: ServiceAccount
+                metadata:
+                  name: hostnet-policy-patcher
+                  namespace: kube-system
+                  annotations:
+                    helm.sh/hook: post-install,post-upgrade
+                    helm.sh/hook-weight: "-10"
+                    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+                ---
+                apiVersion: rbac.authorization.k8s.io/v1
+                kind: ClusterRole
+                metadata:
+                  name: hostnet-policy-patcher
+                  annotations:
+                    helm.sh/hook: post-install,post-upgrade
+                    helm.sh/hook-weight: "-10"
+                    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+                rules:
+                  - apiGroups: ["admissionregistration.k8s.io"]
+                    resources: ["validatingadmissionpolicies"]
+                    verbs: ["get", "list", "patch"]
+                ---
+                apiVersion: rbac.authorization.k8s.io/v1
+                kind: ClusterRoleBinding
+                metadata:
+                  name: hostnet-policy-patcher
+                  annotations:
+                    helm.sh/hook: post-install,post-upgrade
+                    helm.sh/hook-weight: "-10"
+                    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+                roleRef:
+                  apiGroup: rbac.authorization.k8s.io
+                  kind: ClusterRole
+                  name: hostnet-policy-patcher
+                subjects:
+                  - kind: ServiceAccount
+                    name: hostnet-policy-patcher
+                    namespace: kube-system
+                ---
+                apiVersion: batch/v1
+                kind: Job
+                metadata:
+                  name: hostnet-policy-patch
+                  namespace: kube-system
+                  annotations:
+                    helm.sh/hook: post-install,post-upgrade
+                    helm.sh/hook-weight: "0"
+                    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+                spec:
+                  backoffLimit: 6
+                  activeDeadlineSeconds: 600
+                  template:
+                    spec:
+                      serviceAccountName: hostnet-policy-patcher
+                      restartPolicy: Never
+                      # No CNI yet: host networking needs none, and kubectl reaches the
+                      # API server through KUBERNETES_SERVICE_HOST (no cluster DNS).
+                      hostNetwork: true
+                      dnsPolicy: Default
+                      priorityClassName: system-cluster-critical
+                      tolerations:
+                        - operator: Exists
+                      securityContext:
+                        runAsNonRoot: true
+                        runAsUser: 65534
+                        runAsGroup: 65534
+                        seccompProfile:
+                          type: RuntimeDefault
+                      containers:
+                        - name: patch
+                          image: {{ .Values.toolsImage }}
+                          env:
+                            - name: HOME
+                              value: /tmp
+                          command: ["/bin/sh", "-c"]
+                          args:
+                            - |
+                              set -eu
+                              ALLOWED="'kube-system','kube-flannel','tigera-operator','calico-system','vnode-runtime'"
+                              EXPR="request.namespace in [${ALLOWED}]\n|| !(has(object.spec.hostNetwork) && object.spec.hostNetwork == true)\n"
+                              MSG="hostNetwork is allowed only in kube-system, kube-flannel, tigera-operator, calico-system and vnode-runtime."
+                              FOUND=0
+                              for P in $(kubectl get validatingadmissionpolicies -o name | grep '/hostnetwork-allowed-' || true); do
+                                FOUND=1
+                                CUR=$(kubectl get "$P" -o jsonpath='{.spec.validations[0].expression}')
+                                if echo "$CUR" | grep -q "tigera-operator"; then
+                                  echo "$P already allows Calico and vNode"; continue
+                                fi
+                                kubectl patch "$P" --type=json -p "[{\"op\":\"replace\",\"path\":\"/spec/validations/0/expression\",\"value\":\"${EXPR}\"},{\"op\":\"replace\",\"path\":\"/spec/validations/0/message\",\"value\":\"${MSG}\"}]"
+                                echo "patched $P"
+                              done
+                              [ "$FOUND" = 1 ] || echo "no hostnetwork-allowed-* policy found; nothing to do"
+                          resources:
+                            requests:
+                              cpu: 50m
+                              memory: 64Mi
+                            limits:
+                              memory: 256Mi
+                          securityContext:
+                            allowPrivilegeEscalation: false
+                            readOnlyRootFilesystem: true
+                            capabilities:
+                              drop: ["ALL"]
+                          volumeMounts:
+                            - name: tmp
+                              mountPath: /tmp
+                      volumes:
+                        - name: tmp
+                          emptyDir: {}
+
+    # 13. vBox, the web UI for the sandboxes, from its public Helm chart. A Helm job
+    #    rather than a chart App, like the controller task, because the chart is an
+    #    OCI artifact. The release record goes in default: the chart creates the
+    #    vbox-system namespace itself and refuses to be installed into it.
+    #    After router, so the Agent Sandbox CRDs and agent-sandbox-system (where the
+    #    chart puts the Role for reading the router's access log) exist. After
+    #    vnodeready too: vNode restarts containerd on every node as it installs, which
+    #    can take the vBox pod down while helm --wait is still waiting for it.
+    #    Listed last on purpose: keep tasks at stable positions in this list.
+    - name: vbox
+      dependsOn:
+        - router
+        - vnodeready
+      timeout: 15m
+      app:
+        template:
+          spec:
+            displayName: vBox
+            description: Web UI for sandboxes, claims and the audit trail, in vbox-system.
+            defaultNamespace: kube-system
+            wait: true
+            config:
+              bash:
+                image: "{{ .Values.toolsImage }}"
+                clusterRole: cluster-admin
+                script: |-
+                  set -euo pipefail
+                  {{- if eq (print .Values.vboxEnabled) "true" }}
+                  {{- if eq (print .Values.vboxServiceType) "exposed" }}
+                  # Exposed as a Network Load Balancer: the AWS CCM creates one in the
+                  # nodes' region and VPC for a Service annotated
+                  # aws-load-balancer-type: nlb (a Classic ELB without it). The CCM never
+                  # converts an existing load balancer, so a LoadBalancer Service created
+                  # without the annotation is deleted first; the CCM then removes its
+                  # Classic ELB, and helm recreates the Service, which gets an NLB.
+                  LBTYPE=$(kubectl -n vbox-system get svc vbox -o jsonpath='{.spec.type}/{.metadata.annotations.service\.beta\.kubernetes\.io/aws-load-balancer-type}' 2>/dev/null || true)
+                  if [ "${LBTYPE%%/*}" = LoadBalancer ] && [ "${LBTYPE#*/}" != nlb ]; then
+                    echo "Replacing the vbox Service's Classic ELB with an NLB"
+                    kubectl -n vbox-system delete svc vbox --wait --timeout=5m
+                  fi
+                  {{- end }}
+                  helm upgrade --install vbox "{{ .Values.vboxChart }}" \
+                    --version "{{ .Values.vboxVersion }}" \
+                    --namespace default \
+                    --set-string publicUrl="{{ .Values.vboxPublicUrl }}" \
+                    --set collector.routerNamespace=agent-sandbox-system \
+                    {{- if .Values.systemNodeRole }}
+                    --set-string 'nodeSelector.pool\.agent-sandbox\.io/role={{ .Values.systemNodeRole }}' \
+                    {{- end }}
+                    {{- if eq (print .Values.vboxServiceType) "exposed" }}
+                    --set service.type=LoadBalancer \
+                    --set-string 'service.annotations.service\.beta\.kubernetes\.io/aws-load-balancer-type=nlb' \
+                    {{- else }}
+                    --set service.type=ClusterIP \
+                    {{- end }}
+                    --wait=legacy --timeout 10m
+                  kubectl -n vbox-system get deployment,service,persistentvolumeclaim
+                  {{- if eq (print .Values.vboxServiceType) "exposed" }}
+                  # helm --wait does not wait for a load balancer address, so report
+                  # whichever there is rather than failing the install over it.
+                  ADDR=""
+                  for i in $(seq 1 30); do
+                    ADDR=$(kubectl -n vbox-system get svc vbox -o jsonpath='{.status.loadBalancer.ingress[0].hostname}{.status.loadBalancer.ingress[0].ip}')
+                    if [ -n "$ADDR" ]; then break; fi
+                    sleep 10
+                  done
+                  if [ -n "$ADDR" ]; then
+                    VBOX_ADDRESS="http://${ADDR}"
+                    echo "Open vBox: ${VBOX_ADDRESS}"
+                  else
+                    VBOX_ADDRESS="pending: the vbox LoadBalancer had no address after 5 minutes"
+                    echo "WARN: the vbox LoadBalancer Service has no address after 5 minutes."
+                    echo "      Is a load balancer controller running in this tenant cluster?"
+                  fi
+                  echo "Or: kubectl -n vbox-system port-forward svc/vbox 8080:80"
+                  {{- else }}
+                  VBOX_ADDRESS=$(kubectl -n vbox-system get svc vbox -o jsonpath='{.spec.clusterIP}')
+                  echo "Open vBox: kubectl -n vbox-system port-forward svc/vbox 8080:80 (ClusterIP ${VBOX_ADDRESS})"
+                  {{- end }}
+                  {{- else }}
+                  # Disabled: remove the release. The chart keeps vbox-system, the
+                  # settings Secret and the audit trail volume.
+                  helm uninstall vbox --namespace default --ignore-not-found --wait=legacy
+                  VBOX_ADDRESS="disabled"
+                  {{- end }}
+
+                  # Recorded for the Stack's vboxAddress output. A ConfigMap rather than
+                  # the Service itself, because the value depends on the service type
+                  # (load balancer URL or ClusterIP) and the Service does not exist at
+                  # all while vBox is disabled.
+                  kubectl -n kube-system create configmap agent-sandbox-vbox \
+                    --from-literal=address="${VBOX_ADDRESS}" \
+                    --dry-run=client -o yaml | kubectl apply -f -
+      outputs:
+        - name: address
+          fromResource:
+            apiVersion: v1
+            kind: ConfigMap
+            namespace: kube-system
+            name: agent-sandbox-vbox
+            jsonPath: "{.data.address}"
+
+    # 14. Gate between the operator and its configuration. The tigera-operator chart
+    #    ships no CRDs: the operator creates them itself a few seconds after it starts
+    #    (manageCRDs), and the calico task counts as done as soon as the release is
+    #    deployed. Without this gate calicoconfig raced the operator and failed its
+    #    first attempt with "no matches for kind Installation", then passed on retry.
+    #    A host-network Helm-hook Job like hostnetpolicy's, because there is no pod
+    #    network yet: the release blocks until the CRDs are Established, and the Job's
+    #    RBAC is deleted once it succeeds.
+    #    Listed last on purpose: keep tasks at stable positions in this list.
+    - name: calicocrds
+      dependsOn:
+        - calico
+      timeout: 15m
+      app:
+        template:
+          spec:
+            displayName: Wait for Calico CRDs
+            description: Blocks until the Tigera operator has created and established its CRDs.
+            defaultNamespace: kube-system
+            wait: true
+            config:
+              manifests: |-
+                # Regular resource so the release is never empty; documents what it waits for.
+                apiVersion: v1
+                kind: ConfigMap
+                metadata:
+                  name: agent-sandbox-calico-crds
+                  namespace: kube-system
+                data:
+                  crds: installations,apiservers,goldmanes,whiskers .operator.tigera.io
+                ---
+                apiVersion: v1
+                kind: ServiceAccount
+                metadata:
+                  name: calico-crds-waiter
+                  namespace: kube-system
+                  annotations:
+                    helm.sh/hook: post-install,post-upgrade
+                    helm.sh/hook-weight: "-10"
+                    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+                ---
+                apiVersion: rbac.authorization.k8s.io/v1
+                kind: ClusterRole
+                metadata:
+                  name: calico-crds-waiter
+                  annotations:
+                    helm.sh/hook: post-install,post-upgrade
+                    helm.sh/hook-weight: "-10"
+                    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+                rules:
+                  - apiGroups: ["apiextensions.k8s.io"]
+                    resources: ["customresourcedefinitions"]
+                    verbs: ["get", "list", "watch"]
+                ---
+                apiVersion: rbac.authorization.k8s.io/v1
+                kind: ClusterRoleBinding
+                metadata:
+                  name: calico-crds-waiter
+                  annotations:
+                    helm.sh/hook: post-install,post-upgrade
+                    helm.sh/hook-weight: "-10"
+                    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+                roleRef:
+                  apiGroup: rbac.authorization.k8s.io
+                  kind: ClusterRole
+                  name: calico-crds-waiter
+                subjects:
+                  - kind: ServiceAccount
+                    name: calico-crds-waiter
+                    namespace: kube-system
+                ---
+                apiVersion: batch/v1
+                kind: Job
+                metadata:
+                  name: calico-crds-wait
+                  namespace: kube-system
+                  annotations:
+                    helm.sh/hook: post-install,post-upgrade
+                    helm.sh/hook-weight: "0"
+                    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+                spec:
+                  backoffLimit: 2
+                  activeDeadlineSeconds: 600
+                  template:
+                    spec:
+                      serviceAccountName: calico-crds-waiter
+                      restartPolicy: Never
+                      # No CNI yet: host networking needs none, and kubectl reaches the
+                      # API server through KUBERNETES_SERVICE_HOST (no cluster DNS).
+                      hostNetwork: true
+                      dnsPolicy: Default
+                      priorityClassName: system-cluster-critical
+                      tolerations:
+                        - operator: Exists
+                      securityContext:
+                        runAsNonRoot: true
+                        runAsUser: 65534
+                        runAsGroup: 65534
+                        seccompProfile:
+                          type: RuntimeDefault
+                      containers:
+                        - name: wait
+                          image: {{ .Values.toolsImage }}
+                          env:
+                            - name: HOME
+                              value: /tmp
+                          command: ["/bin/sh", "-c"]
+                          args:
+                            - |
+                              set -eu
+                              CRDS="installations apiservers goldmanes whiskers"
+                              # kubectl wait fails at once on a CRD that does not exist yet,
+                              # so first wait for all of them to appear.
+                              for i in $(seq 1 90); do
+                                MISSING=""
+                                for C in $CRDS; do
+                                  kubectl get crd "$C.operator.tigera.io" >/dev/null 2>&1 || MISSING="$MISSING $C"
+                                done
+                                [ -z "$MISSING" ] && break
+                                echo "waiting for the operator to create:$MISSING"
+                                sleep 5
+                              done
+                              [ -z "$MISSING" ] || { echo "ERROR: the Tigera operator did not create$MISSING within 7.5 minutes"; exit 1; }
+                              for C in $CRDS; do
+                                kubectl wait --for=condition=Established --timeout=2m "crd/$C.operator.tigera.io"
+                              done
+                          resources:
+                            requests:
+                              cpu: 50m
+                              memory: 64Mi
+                            limits:
+                              memory: 256Mi
+                          securityContext:
+                            allowPrivilegeEscalation: false
+                            readOnlyRootFilesystem: true
+                            capabilities:
+                              drop: ["ALL"]
+                          volumeMounts:
+                            - name: tmp
+                              mountPath: /tmp
+                      volumes:
+                        - name: tmp
+                          emptyDir: {}
+
+    # 15. Ordered teardown when the Stack is deleted. The platform uninstalls every
+    #    task at once, ignoring dependsOn, and only removes what each task created
+    #    itself, so the releases the bash and Job tasks installed (vBox, the
+    #    controller, vNode) outlived the Stack. This task's release carries a Helm
+    #    pre-delete hook, so its uninstall runs this Job first: it removes what the
+    #    platform cannot, in an order the platform cannot:
+    #      1. sandbox claims, warm pools and sandboxes, so nothing recreates pods
+    #      2. wait until no vNode pod is left (vNode is still installed, so they stop)
+    #      3. vBox and its ConfigMap, 4. the controller, 5. vNode, only if step 2
+    #         confirmed no vNode pod remains, so it can never cause the deadlock the
+    #         vnode task comment describes.
+    #    Kept on purpose: Calico, the cluster's network, which goes with the cluster;
+    #    the Agent Sandbox CRDs, whose deletion would delete every sandbox and claim;
+    #    vBox's namespace, settings Secret and audit trail (the chart keeps them).
+    #    Host-network and tolerating every taint, so it also runs while the tenant
+    #    cluster itself is being deleted. It always exits 0 and has a deadline below
+    #    Helm's 5m hook timeout: a cleanup problem must never block a deletion.
+    #    Listed last on purpose: keep tasks at stable positions in this list.
+    - name: teardown
+      dependsOn:
+        - vbox
+      timeout: 10m
+      app:
+        template:
+          spec:
+            displayName: Teardown on Stack deletion
+            description: Pre-delete hook that removes vBox, the controller and vNode in a safe order.
+            defaultNamespace: kube-system
+            wait: true
+            config:
+              manifests: |-
+                # Regular resource so the release is never empty; documents what the hook removes.
+                apiVersion: v1
+                kind: ConfigMap
+                metadata:
+                  name: agent-sandbox-teardown
+                  namespace: kube-system
+                data:
+                  removes: sandbox objects, then vBox, the Agent Sandbox controller and vNode
+                  keeps: Calico, the Agent Sandbox CRDs, vBox's namespace and audit trail
+                ---
+                apiVersion: v1
+                kind: ServiceAccount
+                metadata:
+                  name: agent-sandbox-teardown
+                  namespace: kube-system
+                  annotations:
+                    helm.sh/hook: pre-delete
+                    helm.sh/hook-weight: "-10"
+                    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+                ---
+                # Uninstalls Helm releases cluster-wide. Deleted again once the Job is done.
+                apiVersion: rbac.authorization.k8s.io/v1
+                kind: ClusterRoleBinding
+                metadata:
+                  name: agent-sandbox-teardown
+                  annotations:
+                    helm.sh/hook: pre-delete
+                    helm.sh/hook-weight: "-10"
+                    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+                roleRef:
+                  apiGroup: rbac.authorization.k8s.io
+                  kind: ClusterRole
+                  name: cluster-admin
+                subjects:
+                  - kind: ServiceAccount
+                    name: agent-sandbox-teardown
+                    namespace: kube-system
+                ---
+                apiVersion: batch/v1
+                kind: Job
+                metadata:
+                  name: agent-sandbox-teardown
+                  namespace: kube-system
+                  annotations:
+                    helm.sh/hook: pre-delete
+                    helm.sh/hook-weight: "0"
+                    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+                spec:
+                  backoffLimit: 0
+                  activeDeadlineSeconds: 270
+                  template:
+                    spec:
+                      serviceAccountName: agent-sandbox-teardown
+                      restartPolicy: Never
+                      # Runs on cordoned, tainted nodes during a cluster deletion too,
+                      # and needs no pod network: kubectl and helm reach the API server
+                      # through KUBERNETES_SERVICE_HOST.
+                      hostNetwork: true
+                      dnsPolicy: Default
+                      priorityClassName: system-cluster-critical
+                      tolerations:
+                        - operator: Exists
+                      securityContext:
+                        runAsNonRoot: true
+                        runAsUser: 65534
+                        runAsGroup: 65534
+                        seccompProfile:
+                          type: RuntimeDefault
+                      containers:
+                        - name: teardown
+                          image: {{ .Values.toolsImage }}
+                          env:
+                            - name: HOME
+                              value: /tmp
+                            - name: HELM_CACHE_HOME
+                              value: /tmp/helm/cache
+                            - name: HELM_CONFIG_HOME
+                              value: /tmp/helm/config
+                            - name: HELM_DATA_HOME
+                              value: /tmp/helm/data
+                          command: ["/bin/bash", "-c"]
+                          args:
+                            - |
+                              # No set -e: every step runs, and the Job always succeeds.
+                              set -uo pipefail
+                              NS="{{ .Values.sandboxNamespace }}"
+                              vnode_pods() {
+                                kubectl get pods -A -o jsonpath='{range .items[*]}{.spec.runtimeClassName}{"\n"}{end}' 2>/dev/null | grep -c '^vnode$'
+                              }
+
+                              echo "1. Deleting sandbox claims, warm pools and sandboxes in ${NS}"
+                              for R in sandboxclaims.extensions.agents.x-k8s.io sandboxwarmpools.extensions.agents.x-k8s.io sandboxes.agents.x-k8s.io; do
+                                kubectl -n "$NS" delete "$R" --all --wait=false --ignore-not-found 2>&1 || true
+                              done
+
+                              echo "2. Waiting for vNode pods to stop (vNode stays installed until they have)"
+                              LEFT=$(vnode_pods)
+                              # Worst case adds up to 120s here plus 120s of helm timeouts
+                              # below: inside the Job's 270s deadline, so the hook itself
+                              # can never fail and block the Stack's deletion.
+                              for i in $(seq 1 24); do
+                                [ "$LEFT" -eq 0 ] && break
+                                echo "   ${LEFT} vNode pod(s) still running"
+                                sleep 5
+                                LEFT=$(vnode_pods)
+                              done
+
+                              echo "3. Removing vBox (its namespace, settings and audit trail are kept)"
+                              helm uninstall vbox --namespace default --ignore-not-found --wait=legacy --timeout 45s 2>&1 || true
+                              kubectl -n kube-system delete configmap agent-sandbox-vbox --ignore-not-found 2>&1 || true
+
+                              echo "4. Removing the Agent Sandbox controller (its CRDs are kept)"
+                              helm uninstall agent-sandbox --namespace agent-sandbox-system --ignore-not-found --wait=legacy --timeout 45s 2>&1 || true
+
+                              if [ "$LEFT" -eq 0 ]; then
+                                echo "5. Removing vNode"
+                                helm uninstall vnode-runtime --namespace vnode-runtime --ignore-not-found --wait=legacy --timeout 30s 2>&1 || true
+                              else
+                                echo "5. Keeping vNode: ${LEFT} vNode pod(s) still running, and they could not be stopped without it."
+                                echo "   Remove it later with: helm uninstall vnode-runtime -n vnode-runtime"
+                              fi
+                              echo "Calico is kept: it is the cluster's network and goes with the cluster."
+                              exit 0
+                          resources:
+                            requests:
+                              cpu: 50m
+                              memory: 128Mi
+                            limits:
+                              memory: 512Mi
+                          securityContext:
+                            allowPrivilegeEscalation: false
+                            readOnlyRootFilesystem: true
+                            capabilities:
+                              drop: ["ALL"]
+                          volumeMounts:
+                            - name: tmp
+                              mountPath: /tmp
+                      volumes:
+                        - name: tmp
+                          emptyDir: {}
+
+  publishedOutputs:
+    - name: routerClusterIP
+      fromTask:
+        task: router
+        output: clusterip
+    - name: warmPoolReady
+      fromTask:
+        task: verify
+        output: readyreplicas
+    # Where agents claim sandboxes: SandboxClaims go in sandboxNamespace and name
+    # warmPoolName as their warm pool (the SDK's create_sandbox(warmpool=, namespace=)).
+    - name: sandboxNamespace
+      fromTask:
+        task: pool
+        output: sandboxnamespace
+    - name: warmPoolName
+      fromTask:
+        task: pool
+        output: warmpoolname
+    # http://<load balancer> when vboxServiceType is exposed, the Service's ClusterIP
+    # when internal, "disabled" when vboxEnabled is false.
+    - name: vboxAddress
+      fromTask:
+        task: vbox
+        output: address
