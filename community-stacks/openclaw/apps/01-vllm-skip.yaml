@@ -104,7 +104,7 @@ spec:
       type: string
       required: true
       # renovate: datasource=docker depName=vllm/vllm-openai
-      defaultValue: vllm/vllm-openai:v0.30.0
+      defaultValue: vllm/vllm-openai:v0.34.0
     - variable: modelCache
       label: Model cache storage
       description: Ignored. No model cache is created.
