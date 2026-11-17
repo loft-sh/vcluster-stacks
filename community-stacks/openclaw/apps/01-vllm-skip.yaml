@@ -103,6 +103,7 @@ spec:
       description: Ignored. No vLLM is started.
       type: string
       required: true
+      # renovate: datasource=docker depName=vllm/vllm-openai
       defaultValue: vllm/vllm-openai:v0.30.0
     - variable: modelCache
       label: Model cache storage
