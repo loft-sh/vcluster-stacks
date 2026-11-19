@@ -276,7 +276,10 @@ uncordons the node, unless its [circuit breaker](#circuit-breaker) has tripped.
 | Parameter | Default | Effect |
 | --- | --- | --- |
 | `nvsentinelCordon` | `true` | Runs NVSentinel's fault quarantine. `false` runs monitoring only: health events and node conditions, no cordon. |
-| `nvsentinelDrain` | `false` | `true` also evicts pods from a node NVSentinel cordoned. No effect when `nvsentinelCordon` is `false`. |
+| `nvsentinelDrain` | `false` | `true` also evicts pods from a node NVSentinel cordoned. No effect when `nvsentinelCordon` is `false`. See [Drain](#drain). |
+| `nvsentinelDrainMode` | `Immediate` | How the drain treats pods in user namespaces: `AllowCompletion`, `DeleteAfterTimeout` or `Immediate`. |
+| `nvsentinelDrainTimeoutMinutes` | `60` | With `DeleteAfterTimeout`, minutes after the fault at which remaining pods are force deleted. |
+| `nvsentinelDrainImmediateNamespaces` | empty | Comma-separated namespaces or globs whose pods are evicted at once, whatever the mode. |
 | `nvsentinelRemediation` | `none` | `reboot` or `gpu-reset` lets NVSentinel recover a drained node. See [Remediation](#remediation). |
 | `nvsentinelSlinkyDrain` | `false` | `true` drains the nodes matching `nvsentinelSlinkyNodeSelector` through Slurm instead of evicting their pods. No effect unless `nvsentinelCordon` and `nvsentinelDrain` are on. See [Drain Slurm nodes through Slinky](#drain-slurm-nodes-through-slinky). |
 | `nvsentinelSlinkyNodeSelector` | `nvidia.com/gpu.present=true` | Nodes that drain through Slurm. |
@@ -371,10 +374,22 @@ Upstream's
 [circuit breaker runbook](https://github.com/NVIDIA/NVSentinel/blob/v1.31.0/docs/runbooks/circuit-breaker.md)
 has the full procedure.
 
-With `nvsentinelDrain: true`, the node drainer uses NVSentinel's defaults: in every namespace it
-lets pods finish (`AllowCompletion`) and force deletes those still running after 60 minutes. To
-evict some namespaces at once, set `node-drainer.userNamespaces` in the NVSentinel
-ArgoCDApplicationTemplate. The node stays cordoned after the drain, until the fault clears.
+#### Drain
+
+With `nvsentinelDrain: true`, the node drainer evicts pods in user namespaces from a cordoned
+node. It skips DaemonSet pods and NVSentinel's system namespaces (`kube-system`, `gpu-operator`,
+`nvsentinel` and a few more). `nvsentinelDrainMode` sets how it treats the rest:
+
+| Mode | Behavior |
+| --- | --- |
+| `Immediate` (default) | Evicts pods at once through the Eviction API, like `kubectl drain`, so PodDisruptionBudgets apply. A pod a budget keeps blocking holds the drain open, and the drainer retries until the budget allows it. Each eviction gives the pod 60 seconds to shut down, NVSentinel's `evictionTimeoutInSeconds`, in place of its own `terminationGracePeriodSeconds`; a pod still there after that is force deleted. |
+| `AllowCompletion` | Waits for pods to finish on their own, with no time limit, and never evicts them. A Deployment's pods never finish, so the drain stays open until someone deletes them. |
+| `DeleteAfterTimeout` | Waits for pods to finish, then force deletes those still running `nvsentinelDrainTimeoutMinutes` after the fault was detected, without the Eviction API: budgets and graceful shutdown do not apply. The timer starts at the health event, not at the start of the drain. |
+
+`nvsentinelDrainImmediateNamespaces` evicts the listed namespaces at once whatever the mode, for
+example a test namespace next to workloads that keep `AllowCompletion`. Remediation starts only
+after the drain completes, so with `AllowCompletion` a node can wait for a reboot indefinitely.
+The node stays cordoned after the drain, until the fault clears.
 
 #### Drain Slurm nodes through Slinky
 
@@ -412,8 +427,9 @@ Requirements and behavior to know:
   `nvsentinelSlinkyNamespace`; any other pod stays on the node. The default selector,
   `nvidia.com/gpu.present=true`, matches every GPU node, because a default Slinky install runs its
   workers wherever they fit and labels no nodes. If some GPU nodes run other workloads, label the
-  Slurm nodes and set the selector to that label. Nodes not matching it keep the eviction
-  defaults above.
+  Slurm nodes and set the selector to that label. Nodes not matching it drain as
+  `nvsentinelDrainMode` says, see [Drain](#drain). The drain mode and
+  `nvsentinelDrainImmediateNamespaces` do not apply to matching nodes.
 - **Every pod in `nvsentinelSlinkyNamespace` on the node is deleted**, not just Slurm workers,
   with a 30 second grace period and without the Eviction API, so PodDisruptionBudgets do not
   apply. Do not run other workloads in that namespace.
@@ -682,15 +698,15 @@ containers:
   - To keep monitoring only, set `nvsentinelCordon: false`.
 - **Re-running a gate.** The gate Job name carries a hash of its settings and its check script.
   A Job spec is immutable, so a changed setting creates a new Job, which runs the gate again. The
-  `discover` Job works the same way. Upgrading to the version that added `cpuNodeSelector` renames
-  both gate Jobs and `discover` once, so they run again.
+  `discover` Job works the same way. Upgrading from an earlier version of this Stack renames both
+  gate Jobs once, because the hash now also covers the check script and the new settings, so both
+  gates run again. `discover` is new and runs for the first time.
 - **CPU node selector.** An empty `cpuNodeSelector`, its default, keeps
   `workload.example.com/pool=<cpuNodePool>`. A tenant cluster that has not synced its template yet
   also passes it empty. Either way an upgrade renders the same node selectors and moves nothing.
   To change it, see [Change the CPU node selector](#change-the-cpu-node-selector).
 - **GPU node selector.** An empty `gpuNodeSelector`, its default, keeps
-  `workload.example.com/pool=gpu-compute`, and an upgrade moves nothing. The version that added it
-  also adds `gpuNodeSelector` to the gate's contract, so `gpuready` runs once more. Changing it
+  `workload.example.com/pool=gpu-compute`, and an upgrade moves nothing. Changing it
   moves the NFD workers and NVSentinel's GPU agents, and re-runs `gpuready` and the smoke test
   against the new nodes. Nothing on the GPU side holds a volume. Label the GPU workers first: until
   enough GPUs match, `gpuready` holds and then fails, while NVSentinel's agents already move,

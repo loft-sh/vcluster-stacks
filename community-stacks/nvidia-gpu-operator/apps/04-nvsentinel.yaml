@@ -8,12 +8,13 @@
 # the namespace it creates. The label is "false" in device-plugin mode, which grants nothing.
 #
 # Fault handling: by default NVSentinel cordons a GPU node it finds faulty (fault quarantine,
-# dryRun off). drain=true also evicts pods from a cordoned node (node-drainer, with the chart's
-# eviction defaults); it has no effect without cordon, since the drainer acts on quarantined nodes.
+# dryRun off). drain=true also evicts pods from a cordoned node (node-drainer, as drainMode,
+# drainTimeoutMinutes and drainImmediateNamespaces say); it has no effect without cordon, since the
+# drainer acts on quarantined nodes.
 # slinkyDrain=true hands nodes matching slinkyNodeSelector to NVSentinel's Slinky drainer instead
 # (customDrain): node-drainer creates a DrainRequest and the drainer drains the node through Slurm.
 # The drainer, its CRD and the drain template ConfigMap come from the slinky-drainer App, which must
-# be deployed first. Nodes not matching the selector keep the eviction defaults.
+# be deployed first. Nodes not matching the selector drain as drainMode says.
 # remediation (reboot, gpu-reset) is described in the Stack's README.
 #
 # Quarantine keeps its state in NVSentinel's MongoDB store, which gets its TLS certificates from
@@ -79,10 +80,33 @@ spec:
       defaultValue: 'true'
     - variable: drain
       label: Drain Cordoned GPU Nodes
-      description: Also evict pods from a node NVSentinel cordoned. Pods get to finish, and are force deleted
-        after 60 minutes. No effect unless cordoning is on.
+      description: Also evict pods from a node NVSentinel cordoned, as drainMode says. No effect unless cordoning
+        is on.
       type: boolean
       defaultValue: 'false'
+    - variable: drainMode
+      label: Drain Mode
+      description: How the drain treats pods in user namespaces. Immediate evicts them at once through the
+        Eviction API, honoring PodDisruptionBudgets. AllowCompletion waits, with no time limit, for pods to
+        finish on their own. DeleteAfterTimeout waits too, then force deletes the ones still running after
+        drainTimeoutMinutes.
+      options:
+        - Immediate
+        - AllowCompletion
+        - DeleteAfterTimeout
+      defaultValue: Immediate
+    - variable: drainTimeoutMinutes
+      label: Drain Timeout Minutes
+      description: With DeleteAfterTimeout, minutes after the fault was detected at which pods still running are
+        force deleted.
+      type: number
+      defaultValue: '60'
+      min: 1
+    - variable: drainImmediateNamespaces
+      label: Drain Immediate Namespaces
+      description: Comma-separated namespaces, or globs such as test-*, whose pods are evicted at once whatever
+        drainMode says.
+      type: string
     - variable: slinkyDrain
       label: Drain Slurm Nodes Through Slinky
       description: Hand cordoned nodes matching the Slinky node selector to NVSentinel's Slinky drainer, which
@@ -330,8 +354,22 @@ spec:
                 percentage: {{ .Values.circuitBreakerPercentage | default "50" | int }}
                 maxNodes: {{ .Values.circuitBreakerMaxNodes | default "0" | int }}
             {{- end }}
-            {{- if $slinky }}
+            {{- if $drain }}
             node-drainer:
+              # Namespaces in drainImmediateNamespaces also match "*"; node-drainer evicts Immediate
+              # namespaces first, so the stricter mode wins.
+              userNamespaces:
+              {{- range splitList "," (.Values.drainImmediateNamespaces | default "") }}
+              {{- if trim . }}
+              - name: {{ trim . | quote }}
+                mode: Immediate
+              {{- end }}
+              {{- end }}
+              - name: "*"
+                mode: {{ .Values.drainMode | default "Immediate" | quote }}
+              # Counted from the health event's creation, not from the start of the drain.
+              deleteAfterTimeoutMinutes: {{ .Values.drainTimeoutMinutes | default "60" | int }}
+              {{- if $slinky }}
               customDrain:
                 enabled: true
                 # Never empty: an empty selector sends every node through the Slinky drainer.
@@ -350,6 +388,7 @@ spec:
                 # Whole seconds as a string. node-drainer v1.31.0 fails to start on the chart's
                 # own default, "30m".
                 timeout: "1800"
+              {{- end }}
             {{- end }}
             mongodb-store:
               mongodb:

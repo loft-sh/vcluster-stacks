@@ -144,10 +144,36 @@ spec:
       section: NVSentinel
     - variable: nvsentinelDrain
       label: NVSentinel Drains Cordoned GPU Nodes
-      description: Also evict pods from a GPU node NVSentinel cordoned. Pods get to finish, and are force deleted
-        after 60 minutes. No effect unless cordoning is on.
+      description: Also evict pods from a GPU node NVSentinel cordoned, as the drain mode says. No effect unless
+        cordoning is on.
       type: boolean
       defaultValue: "false"
+      section: NVSentinel
+    - variable: nvsentinelDrainMode
+      label: NVSentinel Drain Mode
+      description: How the drain treats pods in user namespaces. Immediate evicts them at once through the
+        Eviction API, honoring PodDisruptionBudgets. AllowCompletion waits, with no time limit, for pods to
+        finish on their own. DeleteAfterTimeout waits too, then force deletes the ones still running after
+        the drain timeout.
+      options:
+        - Immediate
+        - AllowCompletion
+        - DeleteAfterTimeout
+      defaultValue: Immediate
+      section: NVSentinel
+    - variable: nvsentinelDrainTimeoutMinutes
+      label: NVSentinel Drain Timeout Minutes
+      description: With DeleteAfterTimeout, minutes after the fault was detected at which pods still running are
+        force deleted.
+      type: number
+      defaultValue: "60"
+      min: 1
+      section: NVSentinel
+    - variable: nvsentinelDrainImmediateNamespaces
+      label: NVSentinel Drain Immediate Namespaces
+      description: Comma-separated namespaces, or globs such as test-*, whose pods are evicted at once whatever
+        the drain mode says.
+      type: string
       section: NVSentinel
     - variable: nvsentinelRemediation
       label: NVSentinel Remediation
@@ -323,6 +349,9 @@ spec:
                 gpuDriverMode: {{ .Values.gpuDriverMode | quote }}
                 nvsentinelCordon: {{ .Values.nvsentinelCordon | toString | quote }}
                 nvsentinelDrain: {{ .Values.nvsentinelDrain | toString | quote }}
+                nvsentinelDrainMode: {{ .Values.nvsentinelDrainMode | default "Immediate" | quote }}
+                nvsentinelDrainTimeoutMinutes: {{ .Values.nvsentinelDrainTimeoutMinutes | toString | quote }}
+                nvsentinelDrainImmediateNamespaces: {{ .Values.nvsentinelDrainImmediateNamespaces | default "" | quote }}
                 nvsentinelRemediation: {{ .Values.nvsentinelRemediation | default "none" | quote }}
                 nvsentinelDryRun: {{ .Values.nvsentinelDryRun | toString | quote }}
                 nvsentinelSlinkyDrain: {{ .Values.nvsentinelSlinkyDrain | toString | quote }}

@@ -418,6 +418,8 @@ if not re.fullmatch(r"(?:\d+(?:\.\d+)?(?:h|m|s|ms|us|ns))+", str(defaults(stack_
     fail("stacktemplate.yaml: nvsentinelCircuitBreakerDuration must default to a positive Go duration; fault-quarantine refuses to start otherwise")
 if str(defaults(stack_params).get("nvsentinelRemediation")) != "none":
     fail("stacktemplate.yaml: remediation is opt-in; nvsentinelRemediation must default to none")
+if str(defaults(stack_params).get("nvsentinelDrainMode")) != "Immediate":
+    fail("stacktemplate.yaml: nvsentinelDrainMode must default to Immediate, the only mode that evicts through the Eviction API")
 if str(defaults(stack_params).get("nvsentinelSlinkyDrain")) != "false":
     fail("stacktemplate.yaml: Slinky drain is opt-in; nvsentinelSlinkyDrain must default to false")
 
@@ -431,6 +433,9 @@ for stack_var, app, app_var in [
     ("nvsentinelCordon", f"{PREFIX}-nvsentinel", "cordon"),
     ("nvsentinelDryRun", f"{PREFIX}-nvsentinel", "dryRun"),
     ("nvsentinelDrain", f"{PREFIX}-nvsentinel", "drain"),
+    ("nvsentinelDrainMode", f"{PREFIX}-nvsentinel", "drainMode"),
+    ("nvsentinelDrainTimeoutMinutes", f"{PREFIX}-nvsentinel", "drainTimeoutMinutes"),
+    ("nvsentinelDrainImmediateNamespaces", f"{PREFIX}-nvsentinel", "drainImmediateNamespaces"),
     ("nvsentinelRemediation", f"{PREFIX}-nvsentinel", "remediation"),
     ("nvsentinelMongodbReplicas", f"{PREFIX}-nvsentinel", "mongodbReplicas"),
     ("nvsentinelCircuitBreakerEnabled", f"{PREFIX}-nvsentinel", "circuitBreakerEnabled"),
@@ -458,13 +463,16 @@ VARIANTS = {
                   "cpuNodeSelector": "foo.acme.corp/cpu-node=true, tier=services",
                   "gpuNodeSelector": "foo.acme.corp/gpu-node=true, tier=gpu"},
     "dra": {"gpuDriverMode": "dra"},
-    "reboot": {"gpuDriverMode": "device-plugin", "nvsentinelDrain": "true", "nvsentinelRemediation": "reboot"},
+    "reboot": {"gpuDriverMode": "device-plugin", "nvsentinelDrain": "true", "nvsentinelRemediation": "reboot",
+               "nvsentinelDrainMode": "AllowCompletion"},
     "dra-alternate": {"gpuDriverMode": "dra", "driverPreinstalled": "true", "waitForClusterPolicy": "true", "minGPUs": "2",
                       "nvsentinelDryRun": "true", "nvsentinelMongodbReplicas": "3", "nvsentinelDrain": "true",
                       "nvsentinelMongodbStorageClass": "fast-ssd",
                       "nvsentinelCircuitBreakerPercentage": "100", "nvsentinelCircuitBreakerMaxNodes": "2",
                       "nvsentinelCircuitBreakerEnabled": "false", "nvsentinelCircuitBreakerDuration": "1h30m",
                       "nvsentinelRemediation": "gpu-reset",
+                      "nvsentinelDrainMode": "DeleteAfterTimeout", "nvsentinelDrainTimeoutMinutes": "10",
+                      "nvsentinelDrainImmediateNamespaces": "gpu-test, demo-* ,",
                       "nvsentinelSlinkyDrain": "true", "nvsentinelSlinkyNodeSelector": "slurm=worker",
                       "nvsentinelSlinkyNamespace": "hpc",
                       "cpuNodeSelector": "foo.acme.corp/cpu-node=true",
@@ -760,8 +768,22 @@ for variant, overrides in VARIANTS.items():
                 if dep["spec"]["template"]["spec"].get("nodeSelector") != cpu_pod_sel:
                     fail(f"{where}: the controller is not on the CPU services pool")
     if "nvsentinel" in rendered:
-        cd = (rendered["nvsentinel"]["values"].get("node-drainer") or {}).get("customDrain") or {}
+        nd = rendered["nvsentinel"]["values"].get("node-drainer") or {}
+        cd = nd.get("customDrain") or {}
         where = f"task nvsentinel ({variant})"
+        # Drain settings: the listed namespaces Immediate, then "*" in the chosen mode. The chart
+        # writes the list as TOML, so it must render as a list of name/mode pairs.
+        if on("nvsentinelCordon") and on("nvsentinelDrain"):
+            immediate = [n.strip() for n in str(values.get("nvsentinelDrainImmediateNamespaces") or "").split(",") if n.strip()]
+            want_ns = [{"name": n, "mode": "Immediate"} for n in immediate] + [{"name": "*", "mode": values["nvsentinelDrainMode"]}]
+            if nd.get("userNamespaces") != want_ns:
+                fail(f"{where}: node-drainer.userNamespaces {nd.get('userNamespaces')}, expected {want_ns}")
+            if nd.get("deleteAfterTimeoutMinutes") != int(values["nvsentinelDrainTimeoutMinutes"]):
+                fail(f"{where}: node-drainer.deleteAfterTimeoutMinutes {nd.get('deleteAfterTimeoutMinutes')!r}, expected {values['nvsentinelDrainTimeoutMinutes']}")
+            if nd.get("podDrainPolicies"):
+                fail(f"{where}: node-drainer.podDrainPolicies is set; the chart rejects it next to userNamespaces")
+        elif nd:
+            fail(f"{where}: renders node-drainer values {sorted(nd)} with the drainer off")
         if bool(cd.get("enabled")) is not slinky:
             fail(f"{where}: node-drainer.customDrain.enabled={cd.get('enabled')!r} with Slinky drain {'on' if slinky else 'off'}")
         if slinky:

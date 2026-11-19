@@ -139,10 +139,36 @@ spec:
       section: NVSentinel
     - variable: nvsentinelDrain
       label: NVSentinel Drains Cordoned GPU Nodes
-      description: Also evict pods from a GPU node NVSentinel cordoned. Pods get to finish, and are force deleted
-        after 60 minutes. No effect unless nvsentinelCordon is on.
+      description: Also evict pods from a GPU node NVSentinel cordoned, as nvsentinelDrainMode says. No effect
+        unless nvsentinelCordon is on.
       type: boolean
       defaultValue: 'false'
+      section: NVSentinel
+    - variable: nvsentinelDrainMode
+      label: NVSentinel Drain Mode
+      description: How the drain treats pods in user namespaces. Immediate evicts them at once through the
+        Eviction API, like kubectl drain, honoring PodDisruptionBudgets. AllowCompletion waits, with no time
+        limit, for pods to finish on their own, so a Deployment's pods hold the drain open. DeleteAfterTimeout
+        waits too, then force deletes the ones still running after nvsentinelDrainTimeoutMinutes.
+      options:
+        - Immediate
+        - AllowCompletion
+        - DeleteAfterTimeout
+      defaultValue: Immediate
+      section: NVSentinel
+    - variable: nvsentinelDrainTimeoutMinutes
+      label: NVSentinel Drain Timeout Minutes
+      description: With DeleteAfterTimeout, minutes after the fault was detected at which pods still running are
+        force deleted.
+      type: number
+      defaultValue: '60'
+      min: 1
+      section: NVSentinel
+    - variable: nvsentinelDrainImmediateNamespaces
+      label: NVSentinel Drain Immediate Namespaces
+      description: Comma-separated namespaces, or globs such as test-*, whose pods are evicted at once whatever
+        nvsentinelDrainMode says.
+      type: string
       section: NVSentinel
     - variable: nvsentinelRemediation
       label: NVSentinel Remediation
@@ -496,6 +522,9 @@ spec:
           gpuDriverMode: '{{ .Outputs.discover.mode }}'
           cordon: '{{ .Values.nvsentinelCordon | toString }}'
           drain: '{{ .Values.nvsentinelDrain | toString }}'
+          drainMode: '{{ .Values.nvsentinelDrainMode }}'
+          drainTimeoutMinutes: '{{ .Values.nvsentinelDrainTimeoutMinutes }}'
+          drainImmediateNamespaces: '{{ .Values.nvsentinelDrainImmediateNamespaces }}'
           remediation: '{{ .Values.nvsentinelRemediation }}'
           slinkyDrain: '{{ and (eq (toString .Values.nvsentinelCordon) "true") (eq (toString .Values.nvsentinelDrain) "true") (eq (toString .Values.nvsentinelSlinkyDrain) "true") }}'
           slinkyNodeSelector: '{{ .Values.nvsentinelSlinkyNodeSelector }}'
