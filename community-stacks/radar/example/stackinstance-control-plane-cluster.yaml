@@ -1,0 +1,18 @@
+# Installs Radar into a control plane cluster, a cluster connected to the Platform, instead of a
+# tenant cluster. Apply it in a project namespace that is allowed to use that cluster.
+apiVersion: management.loft.sh/v1
+kind: StackInstance
+metadata:
+  name: radar-control-plane-cluster
+  labels:
+    app.kubernetes.io/part-of: radar-stack
+spec:
+  displayName: Radar
+  owner:
+    user: admin
+  destination:
+    cluster:
+      name: loft-cluster
+  templateRef:
+    name: radar
+  prunePolicy: Prune

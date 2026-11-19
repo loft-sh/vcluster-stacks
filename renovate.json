@@ -97,6 +97,22 @@
       "matchStrings": [
         "# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+)(?: extractVersion=(?<extractVersion>\\S+))?\\s+version: \"?(?<currentValue>[^\\s\"]+)\"?"
       ]
+    },
+    {
+      "customType": "regex",
+      "description": "Radar: chart version pinned in the App",
+      "fileMatch": ["^community-stacks/radar/apps/.+\\.yaml$"],
+      "matchStrings": [
+        "# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+)\\s+version: \"?(?<currentValue>[^\\s\"]+)\"?"
+      ]
+    },
+    {
+      "customType": "regex",
+      "description": "Radar: vCluster version pinned in the tenant cluster template",
+      "fileMatch": ["^community-stacks/radar/virtualclustertemplate\\.yaml$"],
+      "matchStrings": [
+        "# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+)(?: extractVersion=(?<extractVersion>\\S+))?\\s+version: \"?(?<currentValue>[^\\s\"]+)\"?"
+      ]
     }
   ]
 }

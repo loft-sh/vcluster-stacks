@@ -1,0 +1,160 @@
+# Installs Radar from its public Helm chart into the destination cluster.
+#
+# radarValues is merged into the chart's values. Left empty, Radar runs with the chart defaults
+# and only inside the cluster. The Radar Cloud connect page hands out a block to paste there.
+apiVersion: management.loft.sh/v1
+kind: App
+metadata:
+  name: radar-stack-radar
+  labels:
+    app.kubernetes.io/part-of: radar-stack
+spec:
+  displayName: Radar
+  description: Installs Radar, an open source Kubernetes UI for humans and AI agents, from its Helm chart.
+  # Radar's icon.
+  icon: https://radarhq.io/radar/icon.svg
+  readme: |-
+    ## Overview
+
+    Radar is the open-source Kubernetes UI, for humans and AI agents. kubectl answers one question at a time. Radar shows the whole cluster: how resources connect, what is failing and why, what changed and when, and the traffic between services. AI agents such as Claude Code, Codex and Cursor get the same view through Radar's built-in MCP server. It works with what your cluster already runs, including Cilium Hubble, Flux, Prometheus, cert-manager, Velero and OpenCost, so there is nothing to set up. Radar is Apache 2.0 open source, built in the open on GitHub with weekly releases.
+
+    ## Key Features
+
+    On each cluster, free and open source:
+
+    - **Find and fix failures:** failing workloads folded to their cause, with the resources each one affects, then the logs, events, YAML and related resources one click away.
+    - **For AI agents:** a built-in MCP server gives Claude Code, Codex, Cursor and other agents Radar's view of the cluster instead of raw kubectl output.
+    - **Live topology:** how workloads, Services and Ingresses connect, updated as the cluster changes.
+    - **Network traffic from Hubble:** which services talk to each other, read from Cilium Hubble where the cluster runs it.
+    - **Events and change history:** Kubernetes events and resource changes, with a diff of each change.
+    - **Helm and Flux:** Helm release values, history and diffs between revisions, Flux sync state and drift, and Argo CD if you run it. Upgrade or roll back from the UI when you allow it. The Helm views are off until you turn them on (see "Views that are off by default" below).
+    - **Metrics, cost and backups:** workload CPU, memory and throttling from Prometheus, cost from OpenCost, and Velero backups and restores.
+    - **Certificates:** cert-manager Certificates and Issuers, and whether each one is ready.
+    - **[Checks](https://radarhq.io/docs/features/cluster-audit):** best-practice checks for security, reliability and efficiency, labeled with NSA/CISA and CIS, an [upgrade impact](https://radarhq.io/docs/features/upgrade-impact) report before you move to a new Kubernetes version, and [who can do what](https://radarhq.io/docs/features/access-control) through RBAC, once you turn that view on.
+
+    With Radar Cloud, free to start ([pricing](https://radarhq.io/pricing)):
+
+    - **Alerts:** one alert per failure, not one per pod, sent to Slack or any webhook.
+    - **AI investigations:** a root cause with evidence, run automatically on the alerts you choose or on demand.
+    - **Every cluster in one place:** issues, checks, certificates and search across all your clusters, and a side-by-side diff when two clusters disagree.
+    - **History:** events and changes kept long after Kubernetes deletes them, even after the pods involved are gone.
+    - **Your team:** share any view by link, scoped by your Kubernetes RBAC, so nobody hands out a kubeconfig.
+
+    ## Getting started
+
+    **On each cluster:**
+
+    1. In the vCluster Platform UI, open your tenant cluster, go to **Stacks**, select **Install Stack** and pick Radar. Radar needs no settings.
+    2. Open Radar with a port-forward to the cluster, then go to `http://localhost:9280`:
+
+    ```bash
+    kubectl -n radar port-forward svc/radar 9280:9280
+    ```
+
+    Nothing leaves the cluster.
+
+    **With Radar Cloud:**
+
+    **[Connect your tenant clusters to Radar Cloud](https://app.radarhq.io/partners/vcluster?utm_source=vcluster&utm_medium=marketplace&utm_campaign=vcluster-stacks)**
+
+    Radar Cloud has a free plan that needs no credit card, and paid plans start with a free trial. See [Radar Cloud pricing](https://radarhq.io/pricing).
+
+    The connect page creates an enrollment key and gives you the settings to paste into **Radar settings** (see "Connecting to Radar Cloud" below). Connected clusters open an outbound connection to Radar Cloud, and you open them from Radar Cloud instead of a port-forward. No outbound access, or an air-gapped site? Run [Radar Cloud on your own infrastructure](https://radarhq.io/docs/cloud/self-hosted), [air-gapped](https://radarhq.io/docs/cloud/self-hosted/install#air-gapped-install) if needed.
+
+    ## Security and access
+
+    On each cluster:
+
+    - **No sign-in by default.** Radar is not exposed outside the cluster. Anyone who can port-forward to the `radar` Service can open it. To put a sign-in in front of it, see [Radar authentication](https://radarhq.io/docs/configuration/authentication).
+    - **Read-only by default.** Radar doesn't read Secrets, open a shell in a pod or change Helm releases unless you turn those on.
+
+    With Radar Cloud:
+
+    - **[Single sign-on](https://radarhq.io/docs/cloud/sso)** with SAML or OIDC, with [identity provider groups](https://radarhq.io/docs/cloud/idp-groups) mapped to Kubernetes permissions.
+    - **[Your identity provider's own tokens](https://radarhq.io/docs/cloud/self-hosted/user-tokens).** With a self-managed Radar Cloud, clusters call the Kubernetes API with each person's own SSO token, so the RBAC you already have applies unchanged.
+    - **[Audit log](https://radarhq.io/docs/cloud/audit-log)** of sign-ins, membership and credential changes, pod terminal sessions and AI assistant tool calls, exportable as JSON or CSV.
+    - **[Personal access tokens](https://radarhq.io/docs/cloud/personal-access-tokens)** for AI assistants and CI: per person, revocable at any time.
+
+    ## Configuration
+
+    Radar needs no input. **Radar settings** takes Radar Helm chart values, as YAML, and applies them over the defaults.
+
+    ### Views that are off by default
+
+    The Helm views need read access to every Secret in the cluster, where Helm stores its releases. The RBAC view needs read access to Roles, ClusterRoles and their bindings. To turn them on, override:
+
+    ```yaml
+    rbac:
+      secrets: true
+      viewRBAC: true
+    ```
+
+    ### Storage
+
+    The event history is kept in memory, up to 10,000 events, and is lost when the Radar pod restarts.
+
+    ### Connecting to Radar Cloud
+
+    The connect page creates an enrollment key and gives you these settings filled in, to paste into **Radar settings**:
+
+    ```yaml
+    cloud:
+      enabled: true
+      hubURL: https://api.radarhq.io
+      enrollment:
+        key: <enrollment key>
+    rbac:
+      helm: true
+      secrets: true
+      podExec: true
+      portForward: true
+      metrics: true
+    ```
+
+    The key is stored with the install, so anyone who can read the install in its project can see it. Each cluster appears in Radar Cloud under the name in **Cluster name in Radar Cloud**. Tenant clusters created from the `radar-tenant` template appear under their tenant cluster name.
+
+    All settings are in the [Radar Helm chart values](https://github.com/skyhook-io/radar/blob/v1.20.3/deploy/helm/radar/values.yaml).
+
+    ## Support
+
+    Radar is open source: ask questions and report issues on [GitHub](https://github.com/skyhook-io/radar/issues). Paid Radar Cloud plans include support by email at support@radarhq.io and in a dedicated Slack channel, with response times by plan. See [Radar support](https://radarhq.io/support).
+
+    ## More Information
+
+    - [Radar documentation](https://radarhq.io/docs)
+    - [Radar Cloud pricing](https://radarhq.io/pricing)
+    - [Radar on GitHub](https://github.com/skyhook-io/radar)
+    - [Radar community](https://radarhq.io/community): GitHub Discussions and time with the maintainers
+  defaultNamespace: radar
+  wait: true
+  timeout: 10m0s
+  config:
+    chart:
+      name: radar
+      repoURL: oci://ghcr.io/skyhook-io/charts
+      # The Platform does not template the chart version, so it cannot be a parameter.
+      # renovate: datasource=docker depName=ghcr.io/skyhook-io/charts/radar
+      version: 1.20.3
+    values: |-
+      {{- /* The pasted settings, plus the cluster name when they connect Radar to Radar Cloud
+             and do not name the cluster, plus the fixed resource name, so the Service is
+             always radar/radar. */ -}}
+      {{- $values := fromYaml (.Values.radarValues | default "") -}}
+      {{- if hasKey $values "Error" -}}
+      {{- fail (printf "Radar settings are not valid YAML: %s" (get $values "Error")) -}}
+      {{- end -}}
+      {{- $cloud := get $values "cloud" -}}
+      {{- if and .Values.clusterName (kindIs "map" $cloud) (not (hasKey $cloud "clusterName")) -}}
+      {{- $_ := set $cloud "clusterName" .Values.clusterName -}}
+      {{- end -}}
+      {{- $_ := set $values "fullnameOverride" "radar" -}}
+      {{ toYaml $values }}
+  parameters:
+    - variable: radarValues
+      label: Radar settings
+      description: Optional. Radar Helm chart values as YAML. Leave empty to run Radar only inside the cluster. To connect to Radar Cloud, paste the settings from https://app.radarhq.io/partners/vcluster
+      type: multiline
+    - variable: clusterName
+      label: Cluster name in Radar Cloud
+      description: Optional. Used only when the settings connect Radar to Radar Cloud. Leave empty to let Radar pick a name.
+      type: string
