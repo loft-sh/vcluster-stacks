@@ -36,7 +36,7 @@ spec:
   config:
     manifests: |-
       {{- if eq (.Values.enabled | toString) "true" }}
-      {{- $version := .Values.version | default "v1.32.0" }}
+      {{- $version := .Values.version }}
       {{- /* cpuNodeSelector (comma-separated key=value), or workload.example.com/pool=<cpuNodePool> when empty. */}}
       {{- $cpuNodeSelector := dict "kubernetes.io/os" "linux" }}
       {{- range splitList "," (.Values.cpuNodeSelector | default (printf "workload.example.com/pool=%s" (.Values.cpuNodePool | default "cpu-services"))) }}
@@ -361,6 +361,7 @@ spec:
       description: Tag of the slinky-drainer image and of the upstream manifests copied here. Keep it equal to
         the NVSentinel chart version.
       type: string
+      required: true
       # renovate: datasource=github-releases depName=NVIDIA/NVSentinel
       defaultValue: v1.32.0
     - variable: slinkyNamespace
