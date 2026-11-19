@@ -1,0 +1,41 @@
+# Radar as a vCluster Platform Stack: one task that installs the public Radar Helm chart.
+#
+# Apply apps/ together with this template. A templateRef is resolved when the task runs, so a
+# missing App shows as TemplateNotFound on the task.
+#
+# The task passes every parameter the App declares: a task that omits one gets an empty value,
+# not the App's default.
+#
+# The task timeout exceeds the App timeout, so the task timeout is the reporting path for a stuck
+# install. Durations are written with seconds (12m0s), the form the API server stores.
+apiVersion: management.loft.sh/v1
+kind: StackTemplate
+metadata:
+  name: radar
+  labels:
+    app.kubernetes.io/part-of: radar-stack
+spec:
+  displayName: Radar
+  description: >-
+    Open source Kubernetes UI for humans and AI agents. See what is failing and why, topology,
+    traffic, Helm and GitOps state. Optionally connect the cluster to Radar Cloud.
+  # Radar's icon.
+  icon: https://radarhq.io/radar/icon.svg
+  parameters:
+    - variable: radarValues
+      label: Radar settings
+      description: Optional. Radar Helm chart values as YAML. Leave empty to run Radar only inside the cluster. To connect to Radar Cloud, paste the settings from https://app.radarhq.io/partners/vcluster
+      type: multiline
+    - variable: clusterName
+      label: Cluster name in Radar Cloud
+      description: Optional. Used only when the settings connect Radar to Radar Cloud. Leave empty to let Radar pick a name.
+      type: string
+  tasks:
+    - name: radar
+      timeout: 12m0s
+      app:
+        templateRef:
+          name: radar-stack-radar
+        parameters:
+          radarValues: "{{ .Values.radarValues }}"
+          clusterName: "{{ .Values.clusterName }}"
