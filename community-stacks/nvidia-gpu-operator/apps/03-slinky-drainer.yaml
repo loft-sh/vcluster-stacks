@@ -36,7 +36,7 @@ spec:
   config:
     manifests: |-
       {{- if eq (.Values.enabled | toString) "true" }}
-      {{- $version := .Values.version | default "v1.31.0" }}
+      {{- $version := .Values.version | default "v1.32.0" }}
       {{- /* cpuNodeSelector (comma-separated key=value), or workload.example.com/pool=<cpuNodePool> when empty. */}}
       {{- $cpuNodeSelector := dict "kubernetes.io/os" "linux" }}
       {{- range splitList "," (.Values.cpuNodeSelector | default (printf "workload.example.com/pool=%s" (.Values.cpuNodePool | default "cpu-services"))) }}
@@ -362,7 +362,7 @@ spec:
         the NVSentinel chart version.
       type: string
       # renovate: datasource=github-releases depName=NVIDIA/NVSentinel
-      defaultValue: v1.31.0
+      defaultValue: v1.32.0
     - variable: slinkyNamespace
       label: Slinky Namespace
       description: Namespace of the Slurm worker pods, slurm in a default Slinky install. On a drained node the
