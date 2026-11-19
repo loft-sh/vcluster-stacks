@@ -90,6 +90,18 @@ spec:
       required: true
       defaultValue: cpu-services
       section: Node Pools
+    - variable: cpuNodeSelector
+      label: CPU Node Selector
+      description: Leave empty. The NodeProfiles label the CPU pool with workload.example.com/pool, which the
+        Stack selects by default.
+      type: string
+      section: Node Pools
+    - variable: gpuNodeSelector
+      label: GPU Node Selector
+      description: Leave empty. The NodeProfiles label the GPU pool with workload.example.com/pool=gpu-compute,
+        which the Stack selects by default.
+      type: string
+      section: Node Pools
     - variable: minGPUs
       label: Minimum Allocatable GPUs
       description: How many GPUs the scheduler must advertise before the gpuready gate passes.
@@ -97,6 +109,17 @@ spec:
       required: true
       defaultValue: "1"
       min: 1
+      section: GPU Stack
+    - variable: gpuDriverMode
+      label: GPU Driver Mode
+      description: How Kubernetes consumes GPUs. device-plugin requests nvidia.com/gpu; dra (experimental in the
+        GPU Operator) publishes GPUs through the NVIDIA DRA driver and requests them through ResourceClaims.
+        auto keeps an existing GPU Operator's mode and otherwise installs device-plugin. NVSentinel follows.
+      options:
+        - auto
+        - device-plugin
+        - dra
+      defaultValue: auto
       section: GPU Stack
     - variable: driverPreinstalled
       label: NVIDIA Driver Preinstalled
@@ -106,11 +129,132 @@ spec:
       section: GPU Stack
     - variable: waitForClusterPolicy
       label: Gate On ClusterPolicy As Well As GPU Capacity
-      description: Off by default. The gpuready gate verifies allocatable GPU capacity, which is what decides
-        whether a GPU pod can be scheduled. Enable to also wait for every GPU Operator operand to be healthy.
+      description: Off by default. The gpuready gate verifies GPU capacity, which is what decides whether a GPU
+        pod can be scheduled. Enable to also wait for every GPU Operator operand to be healthy (ClusterPolicy, or
+        GPUCluster with dra).
       type: boolean
       defaultValue: "false"
       section: GPU Stack
+    - variable: nvsentinelCordon
+      label: NVSentinel Cordons Faulty GPU Nodes
+      description: Cordon a GPU node when NVSentinel detects a fault on it. Needs cert-manager in the cluster.
+        Set false for monitoring only.
+      type: boolean
+      defaultValue: "true"
+      section: NVSentinel
+    - variable: nvsentinelDrain
+      label: NVSentinel Drains Cordoned GPU Nodes
+      description: Also evict pods from a GPU node NVSentinel cordoned, as the drain mode says. No effect unless
+        cordoning is on.
+      type: boolean
+      defaultValue: "false"
+      section: NVSentinel
+    - variable: nvsentinelDrainMode
+      label: NVSentinel Drain Mode
+      description: How the drain treats pods in user namespaces. Immediate evicts them at once through the
+        Eviction API, honoring PodDisruptionBudgets. AllowCompletion waits, with no time limit, for pods to
+        finish on their own. DeleteAfterTimeout waits too, then force deletes the ones still running after
+        the drain timeout.
+      options:
+        - Immediate
+        - AllowCompletion
+        - DeleteAfterTimeout
+      defaultValue: Immediate
+      section: NVSentinel
+    - variable: nvsentinelDrainTimeoutMinutes
+      label: NVSentinel Drain Timeout Minutes
+      description: With DeleteAfterTimeout, minutes after the fault was detected at which pods still running are
+        force deleted.
+      type: number
+      defaultValue: "60"
+      min: 1
+      section: NVSentinel
+    - variable: nvsentinelDrainImmediateNamespaces
+      label: NVSentinel Drain Immediate Namespaces
+      description: Comma-separated namespaces, or globs such as test-*, whose pods are evicted at once whatever
+        the drain mode says.
+      type: string
+      section: NVSentinel
+    - variable: nvsentinelRemediation
+      label: NVSentinel Remediation
+      description: What NVSentinel does to a GPU node it cordoned and drained. none leaves recovery to you,
+        reboot reboots the node, and gpu-reset tries to reset only the faulty GPU first. Needs cordoning and
+        draining. Use with static node pools only.
+      options:
+        - none
+        - reboot
+        - gpu-reset
+      defaultValue: none
+      section: NVSentinel
+    - variable: nvsentinelSlinkyDrain
+      label: NVSentinel Drains Slurm Nodes Through Slinky
+      description: Drain cordoned GPU nodes that match the Slinky node selector through Slurm instead of evicting
+        their pods. Needs the Slinky Slurm operator. No effect unless cordoning and draining are on.
+      type: boolean
+      defaultValue: "false"
+      section: NVSentinel
+    - variable: nvsentinelSlinkyNodeSelector
+      label: NVSentinel Slinky Node Selector
+      description: Label selector for the nodes that drain through Slurm. The default matches every GPU node.
+      type: string
+      defaultValue: nvidia.com/gpu.present=true
+      section: NVSentinel
+    - variable: nvsentinelSlinkyNamespace
+      label: NVSentinel Slinky Namespace
+      description: Namespace of the Slurm worker pods. On a drained node, every pod in it is deleted.
+      type: string
+      defaultValue: slurm
+      section: NVSentinel
+    - variable: nvsentinelDryRun
+      label: NVSentinel Dry Run
+      description: Log the cordons and drains NVSentinel would make without making them.
+      type: boolean
+      defaultValue: "false"
+      section: NVSentinel
+    - variable: nvsentinelCircuitBreakerEnabled
+      label: NVSentinel Circuit Breaker Enabled
+      description: Stop cordoning when too many GPU nodes are cordoned within the window. Off removes that
+        limit, but one or two GPU nodes then recover without a manual reset.
+      type: boolean
+      defaultValue: "true"
+      section: NVSentinel
+    - variable: nvsentinelCircuitBreakerDuration
+      label: NVSentinel Circuit Breaker Window
+      description: Window the circuit breaker counts cordons in, as a Go duration such as 5m or 1h.
+      type: string
+      defaultValue: 5m
+      section: NVSentinel
+    - variable: nvsentinelCircuitBreakerPercentage
+      label: NVSentinel Circuit Breaker Percentage
+      description: Share of GPU nodes cordoned within the window that trips NVSentinel's circuit breaker,
+        which then stops all cordoning and uncordoning until reset by hand. With one GPU node, the first
+        cordon trips it.
+      type: number
+      defaultValue: "50"
+      min: 1
+      section: NVSentinel
+    - variable: nvsentinelCircuitBreakerMaxNodes
+      label: NVSentinel Circuit Breaker Max Nodes
+      description: Cordons within the window that trip the breaker regardless of fleet size. 0 uses the
+        percentage alone.
+      type: number
+      defaultValue: "0"
+      min: 0
+      section: NVSentinel
+    - variable: nvsentinelMongodbReplicas
+      label: NVSentinel MongoDB Replicas
+      description: Replicas of NVSentinel's MongoDB store, used when cordoning is on. Each requests 1 CPU and 1.5Gi
+        on the CPU services pool.
+      type: number
+      defaultValue: "1"
+      min: 1
+      section: NVSentinel
+    - variable: nvsentinelMongodbStorageClass
+      label: NVSentinel MongoDB Storage Class
+      description: StorageClass for NVSentinel's MongoDB volumes. Empty uses the cluster's default StorageClass.
+        Set it at install; it cannot change afterwards.
+      type: string
+      section: NVSentinel
     - variable: gpuOperatorVersion
       label: GPU Operator Version
       type: string
@@ -199,7 +343,26 @@ spec:
               parameters:
                 argoProject: {{ .Values.argoProject | quote }}
                 cpuNodePool: {{ .Values.cpuNodePool | quote }}
+                cpuNodeSelector: {{ .Values.cpuNodeSelector | default "" | quote }}
+                gpuNodeSelector: {{ .Values.gpuNodeSelector | default "" | quote }}
                 minGPUs: {{ .Values.minGPUs | toString | quote }}
+                gpuDriverMode: {{ .Values.gpuDriverMode | quote }}
+                nvsentinelCordon: {{ .Values.nvsentinelCordon | toString | quote }}
+                nvsentinelDrain: {{ .Values.nvsentinelDrain | toString | quote }}
+                nvsentinelDrainMode: {{ .Values.nvsentinelDrainMode | default "Immediate" | quote }}
+                nvsentinelDrainTimeoutMinutes: {{ .Values.nvsentinelDrainTimeoutMinutes | toString | quote }}
+                nvsentinelDrainImmediateNamespaces: {{ .Values.nvsentinelDrainImmediateNamespaces | default "" | quote }}
+                nvsentinelRemediation: {{ .Values.nvsentinelRemediation | default "none" | quote }}
+                nvsentinelDryRun: {{ .Values.nvsentinelDryRun | toString | quote }}
+                nvsentinelSlinkyDrain: {{ .Values.nvsentinelSlinkyDrain | toString | quote }}
+                nvsentinelSlinkyNodeSelector: {{ .Values.nvsentinelSlinkyNodeSelector | quote }}
+                nvsentinelSlinkyNamespace: {{ .Values.nvsentinelSlinkyNamespace | quote }}
+                nvsentinelMongodbReplicas: {{ .Values.nvsentinelMongodbReplicas | toString | quote }}
+                nvsentinelMongodbStorageClass: {{ .Values.nvsentinelMongodbStorageClass | default "" | quote }}
+                nvsentinelCircuitBreakerEnabled: {{ .Values.nvsentinelCircuitBreakerEnabled | toString | quote }}
+                nvsentinelCircuitBreakerDuration: {{ .Values.nvsentinelCircuitBreakerDuration | quote }}
+                nvsentinelCircuitBreakerPercentage: {{ .Values.nvsentinelCircuitBreakerPercentage | toString | quote }}
+                nvsentinelCircuitBreakerMaxNodes: {{ .Values.nvsentinelCircuitBreakerMaxNodes | toString | quote }}
                 driverPreinstalled: {{ .Values.driverPreinstalled | toString | quote }}
                 waitForClusterPolicy: {{ .Values.waitForClusterPolicy | toString | quote }}
                 gpuOperatorVersion: {{ .Values.gpuOperatorVersion | quote }}
