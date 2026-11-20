@@ -43,7 +43,9 @@ how to use them if applicable, including whether they are sensitive.
 ## Remove
 
 Show removal commands and ordering. Identify retained data and resources, manual
-cleanup, and destructive steps. Say if removal has not been verified.
+cleanup, and destructive steps. Say if removal has not been verified. Deleting the
+StackInstance starts teardown; `prunePolicy` applies only to tasks removed from
+the graph during an update.
 
 ## Tested environment and limitations
 

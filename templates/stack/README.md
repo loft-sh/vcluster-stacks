@@ -130,15 +130,16 @@ cluster; do not interpret the minimum version as a live-test result.
 
 ## Build your own integration
 
-Copy this folder to `community-stacks/<integration>/`. Rename `starter-stack`,
-the `starter-*` ConfigMaps, and the destination namespace consistently, including
-output sources, example references, and checks. Replace tasks with your workload,
-add functional verification, and adapt the [README outline](../README-template.md)
-and [contribution requirements](../../CONTRIBUTING.md).
+Copy this folder to `community-stacks/<integration>/`. The starter's
+`test-manifests.sh` illustrates a check specific to its two-task handoff. Replace
+or remove it when that behavior no longer applies; a simple Community Stack can
+rely on shared validation without providing its own script.
 
-The starter's `test-manifests.sh` illustrates a check specific to its two-task
-handoff. Replace or remove it when that behavior no longer applies. A simple
-Community Stack can rely on shared validation without providing its own script.
+Rename `starter-stack`, the `starter-*` ConfigMaps, and the destination namespace
+consistently, including output sources, example references, and any checks you
+keep. Replace tasks with your workload, add functional verification, and adapt the
+[README outline](../README-template.md) and
+[contribution requirements](../../CONTRIBUTING.md).
 
 Report example issues through the repository's GitHub issues. Licensed under
 [Apache License 2.0](../../LICENSE).

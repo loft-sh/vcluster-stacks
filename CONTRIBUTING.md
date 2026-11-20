@@ -61,10 +61,14 @@ value follows the installed Platform. Renovate annotations are helpful when an
 existing manager supports the dependency; maintainers can help add them.
 
 Provide removal commands and identify resources or data that remain, including
-manual or destructive cleanup. If you have not verified removal, say so. When a
-change affects existing installations, explain the update path and known restart,
-migration, or recovery requirements. A first contribution does not need a full
-upgrade and failure-recovery test suite.
+manual or destructive cleanup. If you have not verified removal, say so. Deleting
+a StackInstance starts child teardown regardless of `prunePolicy`, which only
+controls tasks removed from the graph during an update (`Retain` by default).
+
+When a change affects existing installations, explain the update path and known
+restart, migration, or recovery requirements. Existing instances resolve a
+referenced StackTemplate during reconciliation, so editing it can change them.
+A first contribution does not need a full upgrade and failure-recovery test suite.
 
 ## Disclose operational effects
 
@@ -99,13 +103,24 @@ references, and literal README defaults. CI discovers new integration folders
 and performs strict Platform admission dry runs. It runs on a fresh GitHub-hosted
 VM without repository secrets; it does not deploy your application.
 
+To reproduce an admission failure, run the dry runs against your own **test**
+Platform after confirming your context. Dry runs do not deploy Stacks:
+
+```bash
+vcluster platform connect management
+python3 hack/validate_stacks.py --server
+```
+
 Use `p-default` for project-scoped examples so admission checks can use the test
 Platform's default project. Tell readers to customize the namespace, owner, and
 destination. If validation flags a dependency supplied outside this repository,
 document how to obtain it in your README and ask a maintainer to help register
 that external reference for CI.
 
-Run an existing integration's check script when changing behavior it covers. For
+Run an existing integration's check script when changing behavior it covers.
+`python3 hack/validate_stacks.py --run-checks` runs every discovered script. Existing
+scripts use Bash 4 or later, Helm, `rg`, and sometimes `jq`, and some fetch upstream
+charts; see the integration README. For
 a new stack, add focused checks when they protect behavior the shared validator
 cannot check, such as generated files or conditional template references.
 Maintainers can help wire them into CI. Do not add a script that merely repeats
