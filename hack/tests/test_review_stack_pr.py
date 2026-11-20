@@ -1,4 +1,5 @@
 import base64
+import io
 import json
 import os
 from pathlib import Path
@@ -16,11 +17,13 @@ class StackReviewTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             summary = Path(tmp) / "summary"
             with patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": str(summary)}, clear=True), \
-                    patch.object(reviewer, "github") as api, patch.object(reviewer, "generate_review") as model:
+                    patch.object(reviewer, "github") as api, patch.object(reviewer, "generate_review") as model, \
+                    patch("sys.stdout", new_callable=io.StringIO) as output:
                 self.assertEqual(reviewer.main(), 0)
             api.assert_not_called()
             model.assert_not_called()
             self.assertIn("was not run", summary.read_text())
+            self.assertIn("::warning::", output.getvalue())
 
     def test_context_uses_immutable_blob_and_records_missing_diff(self):
         files = [{"filename": "new/README.md", "status": "added", "sha": "a" * 40}]
