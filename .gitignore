@@ -39,3 +39,6 @@ graphify-out
 .pi-subagents
 issues
 scripts
+.venv/
+__pycache__/
+.pytest_cache/

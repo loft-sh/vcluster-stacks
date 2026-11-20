@@ -328,10 +328,10 @@ instance.
 | `stateSize` | Storage | string | `20Gi` | Size of the state volume. |
 | `requireCpuNode` | Scheduling | boolean | `false` | Schedule OpenClaw only on nodes without `nvidia.com/gpu.present=true`. |
 | `runtimeClassName` | Scheduling | string | empty | RuntimeClass of the vLLM pod, for example `nvidia`. |
-| `vllmImage` | Versions | string | `vllm/vllm-openai:v0.30.0` | vLLM image. |
-| `openclawImage` | Versions | string | `ghcr.io/openclaw/openclaw:2026.9.6` | OpenClaw image. |
-| `proxyImage` | Versions | string | `nginxinc/nginx-unprivileged:1.27-alpine` | Sidecar image for nodeport and ingress mode. |
-| `losslessClawVersion` | Versions | string | `1.1.0` | npm version of `@martian-engineering/lossless-claw`. |
+| `vllmImage` | Versions | string | `vllm/vllm-openai:v0.34.0` | vLLM image. |
+| `openclawImage` | Versions | string | `ghcr.io/openclaw/openclaw:2026.11.5` | OpenClaw image. |
+| `proxyImage` | Versions | string | `nginxinc/nginx-unprivileged:1.31-alpine` | Sidecar image for nodeport and ingress mode. |
+| `losslessClawVersion` | Versions | string | `1.2.0` | npm version of `@martian-engineering/lossless-claw`. |
 
 </details>
 

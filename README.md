@@ -1,117 +1,107 @@
-# vCluster Certified Stacks and Community Stacks
+# vCluster Stacks
+
+Stacks deploy Apps and Argo CD Applications as one unit, with dependency ordering,
+health gates, shared parameters, and values passed between tasks. This repository
+contains reusable integrations for vCluster Platform's native Stacks API,
+introduced in Platform 4.12.
 
 <p align="center">
-  <img src="assets/stack-task-orchestration.svg" alt="Example Stack task graph with parallel tasks, health-gated dependencies, and output sharing" width="80%" />
+  <img src="assets/stack-task-orchestration.svg" alt="Stack tasks with parallel deployment, health-gated dependencies, and output sharing" width="80%" />
 </p>
-
-A Stack coordinates Apps or Argo CD Applications as one unit, including dependency ordering, health gates, shared parameters, and values passed between tasks.
-
-Certified Stacks are tested [vCluster Platform StackTemplates](https://www.vcluster.com/docs/platform/next/understand/what-are-stacks) and supporting resources for multi-application integrations.
-vCluster Platform bundles the Certified resources from this repository. Each Platform release pins its own copy, while this repository contains the source manifests, generated artifacts, examples, tests, and implementation guidance used to build them.
-
-Community Stacks are stacks created by customers, partners, community members and vCluster, which have been approved and merged into this repository. Unlike Certified stacks, they are not bundled with the Platform.
-
-> [!IMPORTANT]
-> This branch contains Certified Stacks built on the native Stacks API introduced with vCluster Platform 4.12. The earlier Terraform-based reference implementations remain available on the [`certified-stacks-legacy`](https://github.com/loft-sh/vcluster-stacks/tree/certified-stacks-legacy) branch.
 
 ## Available integrations
 
-The Certified Stacks catalog currently contains these integrations:
+The existing integrations under **`certified-stacks/`** are bundled with Platform
+releases as a pinned set of templates and supporting resources. The files on this
+repository's `main` branch can differ from your installed Platform release. The
+contribution guide below focuses on Community Stacks and does not define
+certification requirements.
 
 | Integration | Deployment models | Components |
 | --- | --- | --- |
-| [NVIDIA Run:ai](certified-stacks/run-ai/) | Dedicated control plane and central control plane | vCluster, NVIDIA GPU components, and NVIDIA Run:ai |
-| [NVIDIA Dynamo](certified-stacks/nvidia-dynamo/) | One runtime per tenant cluster or control plane cluster | NVIDIA Dynamo operator, NATS, and etcd |
-| [Saturn Cloud Enterprise](certified-stacks/saturn) | One installation per tenant cluster or control plane cluster | Saturn Cloud Helm operator and the Saturn Cloud Enterprise components it installs |
-| [NVIDIA NVKE management plane](certified-stacks/nvidia-nvke-mgmt/) | One installation per tenant cluster, from your own NVKR release | Release verification, cert-manager, nktp, PostgreSQL, SPIRE, Temporal, and the NVKE controller |
+| [NVIDIA Run:ai](certified-stacks/run-ai/) | Dedicated or central control plane | Run:ai and supporting GPU infrastructure |
+| [NVIDIA Dynamo](certified-stacks/nvidia-dynamo/) | One runtime per cluster or control plane cluster | Dynamo operator, NATS, and etcd |
+| [Saturn Cloud Enterprise](certified-stacks/saturn/) | One installation per cluster or control plane cluster | Saturn Cloud Helm operator and Enterprise components |
+| [NVIDIA NVKE management plane](certified-stacks/nvidia-nvke-mgmt/) | One installation per cluster, from an NVKR release | Release verification and NVKE management services |
 
-For Run:ai, see [NVIDIA Run:ai integration guide](https://www.vcluster.com/docs/platform/next/integrations/certified-stacks/runai) to choose a deployment model and understand its prerequisites.
+**Community Stacks** are contributions from community members, partners, and
+vCluster Labs. They are installed manually and do not carry formal vCluster
+Product & Engineering support. Acceptance into this repository does not make a
+Stack Certified or automatically add it to your Platform installation.
 
-## Use a Certified Stack
+| Integration | Purpose |
+| --- | --- |
+| [OpenClaw](community-stacks/openclaw/) | Agent gateway with a local or external model backend |
+| [NVIDIA GPU Operator](community-stacks/nvidia-gpu-operator/) | GPU Operator and NVSentinel with readiness gates and a GPU smoke test |
+| [Metered inference](community-stacks/metered-inference/) | Inference gateway, model serving, token metering, and showback |
 
-If you want to install an existing Certified Stack, use the resources bundled with vCluster Platform instead of applying this repository's development sources. Platform exposes the templates through its catalog and keeps the bundled resources aligned with the installed Platform release.
+Check each integration's README for requirements, tested configurations,
+limitations, and installation instructions. Report repository problems through
+[GitHub issues](https://github.com/loft-sh/vcluster-stacks/issues), following any
+integration-specific reporting instructions. Do not include sensitive values.
 
-- [Browse Certified Stacks](https://www.vcluster.com/docs/platform/next/integrations/certified-stacks)
-- [Install and manage a Certified Stack](https://www.vcluster.com/docs/platform/next/administer/templates/certified-stacks)
-- [Troubleshoot Stacks](https://www.vcluster.com/docs/platform/next/troubleshoot/stacks)
+The earlier Terraform implementations are on the
+[`certified-stacks-legacy`](https://github.com/loft-sh/vcluster-stacks/tree/certified-stacks-legacy)
+branch.
 
-Copy a bundled StackTemplate when you need to customize it. Give the copy a different name and remove the `vcluster.com/certified` annotation so its ownership and update behavior remain clear.
+<a id="use-a-certified-stack"></a>
+<a id="use-a-community-stack"></a>
 
-## Use a Community Stack
+## Use a stack
 
-- See the README included in a Community stack (if present).
-- Create a new Stack Template, then copy-and-paste the stacktemplate.yaml.
-- Or apply the Stack's `apps/` (Apps or ArgoCDApplicationTemplates), its `stacktemplate.yaml` and any supporting resources, such as NodeProfiles or a tenant cluster template, to the Platform management API as its README describes. See, for example, the [OpenClaw install steps](community-stacks/openclaw/README.md#install) or the [NVIDIA GPU Operator install steps](community-stacks/nvidia-gpu-operator/README.md#install).
+For Certified Stacks, start with the templates bundled with your Platform release.
+Use the [Platform Stacks documentation](https://www.vcluster.com/docs/platform/tenants/templates/what-are-stacks)
+and the integration's README to understand prerequisites and deployment models.
+Bundled resources can change during a Platform upgrade. To customize a Certified
+StackTemplate, copy it under a new name and remove its `vcluster.com/certified`
+annotation. Review referenced Apps too: copying a StackTemplate does not copy its
+dependencies.
 
-## Build a Custom Stack
+For Community Stacks, follow the integration's installation instructions. Connect
+`kubectl` to the Platform management API, apply its Apps or
+ArgoCDApplicationTemplates and supporting resources in the documented order, then
+create the StackTemplate and a configured StackInstance. Applying only the
+StackTemplate is insufficient when it references resources you have not installed.
 
-A native Stack has three main parts:
+Use a non-production environment to evaluate a Stack before using it with live
+workloads. Check destination permissions, shared components, and removal behavior.
 
-- An **App** or **ArgoCDApplicationTemplate** defines each deployable application.
-- A cluster-scoped **StackTemplate** defines the task graph, parameters, dependencies, health gates, and outputs.
-- A project-scoped **StackInstance** applies the template to a tenant cluster or control plane cluster.
+<a id="build-a-custom-stack"></a>
 
-Start with the [starter Stack](examples/starter-stack.yaml) to deploy a two-task example. Before you apply it, set the project namespace, owner, and tenant cluster name. The broader [Create a Stack template](https://www.vcluster.com/docs/platform/next/administer/templates/create-stack-templates) guide documents the shipped task schema, validation rules, and output handling. Use the [StackTemplate](https://www.vcluster.com/docs/platform/next/api/resources/stacktemplate) and [StackInstance](https://www.vcluster.com/docs/platform/next/api/resources/stackinstance) API references for individual fields.
+## Build a stack
 
-### Test locally
+A `StackTemplate` defines the tasks and their dependencies. A project-scoped
+`StackInstance` selects a destination and supplies parameter values. Tasks can use
+inline App or Argo CD Application templates, or reference reusable templates.
 
-Test against a non-production vCluster Platform 4.12 or later installation. Connect `kubectl` to the Platform management API, then apply the resources in dependency order:
+Start with the working [starter folder](templates/stack/). It uses two ConfigMaps
+to demonstrate parameters, health-gated dependencies, and output handoff. The
+single-file [starter example](examples/starter-stack.yaml) contains the same
+resources and is checked against that folder.
 
-```bash
-vcluster platform connect management
-kubectl apply -f <apps-directory>
-kubectl apply -f <stack-template>
-kubectl apply -f <stack-instance>
-```
+For the API and lifecycle rules, see:
 
-Watch the StackInstance and its child resources until every task is healthy:
+- [Create a Stack template](https://www.vcluster.com/docs/platform/tenants/templates/create-stack-templates)
+- [StackTemplate reference](https://www.vcluster.com/docs/platform/api/resources/stacktemplate)
+- [StackInstance reference](https://www.vcluster.com/docs/platform/api/resources/stackinstance)
+- [Troubleshoot Stacks](https://www.vcluster.com/docs/platform/tenants/troubleshoot/stacks)
 
-```bash
-kubectl get stackinstance <name> -n <project-namespace> \
-  -o jsonpath='{.status.phase}{"\n"}{range .status.tasks[*]}{.name}{"\t"}{.phase}{"\t"}{.message}{"\n"}{end}'
-```
+<a id="contribute-a-certified-stack"></a>
 
-Before proposing a Stack for this catalog, test more than the initial installation:
+## Contribute a stack
 
-- Validate required and optional parameters, including invalid input.
-- Exercise each supported destination and deployment model.
-- Confirm dependencies block and resume as expected when a child is unhealthy.
-- Verify task outputs and published outputs, including sensitive values.
-- Update parameters and referenced templates, then verify reconciliation.
-- Remove a task under both `Retain` and `Prune` policies when both behaviors apply.
-- Delete the StackInstance and document resources that intentionally remain.
-- Test failure recovery and provide troubleshooting steps for integration-specific failures.
+Read [CONTRIBUTING.md](CONTRIBUTING.md) for the contribution standard, validation
+commands, test evidence, and review process. Copy the [starter folder](templates/stack/)
+and adapt the [README outline](templates/README-template.md) to your integration.
+New integrations normally go under `community-stacks/<integration>/`.
 
-Do not commit credentials, tokens, private keys, or rendered Secrets. Use placeholders in examples and document how users provide sensitive values.
+Choose an example that matches your integration's needs:
 
-## Contribute a Stack
-
-We welcome Community Stack contributions! 
-
-As a reminder, using the native API does not by itself make a Stack Certified. Certification means the integration has been reviewed, tested, and accepted into this catalog for automatic bundling with vCluster Platform. If you have interest in partnering with vCluster for a Certified Stack, please reach out.
-
-Keep each integration in its own top-level directory. A contribution should include:
-
-- A README for every supported Stack or deployment model, covering architecture, prerequisites, parameters, installation, verification, upgrades, removal, and known limitations.
-- Every App or ArgoCDApplicationTemplate referenced by the StackTemplate.
-- The StackTemplate and at least one example StackInstance or tenant cluster configuration.
-- Automated checks for generated files and integration-specific invariants.
-- Reproducible generation instructions when committed manifests are rendered from source files.
-- Names that cannot collide with other cluster-scoped Apps or StackTemplates in the catalog.
-
-Use the [NVIDIA Run:ai implementation](certified-stacks/run-ai/) as the current full example. Its [`source/`](certified-stacks/run-ai/source/) directory is authoritative; the `dedicated-control-plane/` and `central-control-plane/` directories are generated and must not be edited directly. See the [Run:ai contributor guide](certified-stacks/run-ai/CONTRIBUTING.md) for its source-sharing and variant rules.
-
-For Run:ai changes, render and verify the generated manifests from the repository root:
-
-```bash
-./certified-stacks/run-ai/render.sh
-./certified-stacks/run-ai/render.sh --check
-```
-
-The checks require Bash 4 or later, Python 3 with PyYAML, `rg`, and Helm. Review all generated changes before opening a pull request.
-
-When you open a pull request, describe the integration and supported deployment models, identify the vCluster Platform version used for testing, and include the results of installation, update, failure-recovery, and removal tests. Call out resources that survive removal or require manual cleanup.
+- [NVIDIA Dynamo](certified-stacks/nvidia-dynamo/) shows a small Stack with an inline App.
+- [NVIDIA GPU Operator](community-stacks/nvidia-gpu-operator/) combines App and Argo CD tasks.
+- [Metered inference](community-stacks/metered-inference/) coordinates several related Stacks.
+- [Run:ai](certified-stacks/run-ai/CONTRIBUTING.md) documents shared source and generated deployment variants.
 
 ## License
 
-This repository is licensed under the [Apache License 2.0](LICENSE).
+[Apache License 2.0](LICENSE).

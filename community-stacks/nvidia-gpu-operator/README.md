@@ -237,8 +237,8 @@ the Stack parameters through `deploy.stacks`.
 | `minGPUs` | `1` | GPUs the scheduler must advertise before `gpuready` passes |
 | `driverPreinstalled` | `false` | `true` when the node image has the NVIDIA driver. GPU Operator skips the driver, and NVSentinel labels in preinstalled-driver mode. |
 | `waitForClusterPolicy` | `false` | `true` also waits for every GPU Operator operand |
-| `gpuOperatorVersion` | `v26.3.3` | GPU Operator chart version |
-| `nvsentinelVersion` | `v1.13.0` | NVSentinel chart and image version |
+| `gpuOperatorVersion` | `v26.7.2` | GPU Operator chart version |
+| `nvsentinelVersion` | `v1.32.0` | NVSentinel chart and image version |
 
 The StackTemplate declares the Stack parameters: `argoProject`, `cpuNodePool`, `minGPUs`,
 `driverPreinstalled`, `waitForClusterPolicy`, `gpuOperatorVersion` and `nvsentinelVersion`. The
