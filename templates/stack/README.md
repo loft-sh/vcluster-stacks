@@ -16,7 +16,7 @@ credentials, GPU, or application image.
 ## Quick start
 
 Run from this folder. Edit `example/stackinstance.yaml` first: replace
-`p-my-project`, `admin`, and `development` with your project namespace, authorized
+`p-default`, `admin`, and `development` with your project namespace, authorized
 owner, and existing cluster name. The destination cluster must be in that project.
 The example contains no secret values.
 

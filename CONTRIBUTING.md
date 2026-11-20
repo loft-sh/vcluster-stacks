@@ -43,6 +43,9 @@ output and check it against its source.
 The validator discovers integrations automatically under `certified-stacks/` and
 `community-stacks/`. Do not add a stack to a hardcoded CI list. Every integration
 folder must meet the file and validation-entry-point requirements above.
+Use `p-default` for the project namespace in admission-test examples, as CI starts
+with Platform's default project. Tell readers to set the namespace, owner, and
+destination for their installation. Live tests still need a real destination.
 
 ## Name and configure resources
 

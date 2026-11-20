@@ -67,7 +67,7 @@ apiVersion: management.loft.sh/v1
 kind: StackInstance
 metadata:
   name: starter-stack
-  namespace: p-my-project
+  namespace: p-default
 spec:
   displayName: Starter Stack
   # App tasks deploy as this user or team.
