@@ -49,7 +49,7 @@ branch.
 ## Use a stack
 
 For Certified Stacks, start with the templates bundled with your Platform release.
-Use the [Platform Stacks documentation](https://www.vcluster.com/docs/platform/understand/what-are-stacks)
+Use the [Platform Stacks documentation](https://www.vcluster.com/docs/platform/tenants/templates/what-are-stacks)
 and the integration's README to understand prerequisites and deployment models.
 Bundled resources can change during a Platform upgrade. To customize a Certified
 StackTemplate, copy it under a new name and remove its `vcluster.com/certified`
@@ -80,10 +80,10 @@ resources and is checked against that folder.
 
 For the API and lifecycle rules, see:
 
-- [Create a Stack template](https://www.vcluster.com/docs/platform/administer/templates/create-stack-templates)
+- [Create a Stack template](https://www.vcluster.com/docs/platform/tenants/templates/create-stack-templates)
 - [StackTemplate reference](https://www.vcluster.com/docs/platform/api/resources/stacktemplate)
 - [StackInstance reference](https://www.vcluster.com/docs/platform/api/resources/stackinstance)
-- [Troubleshoot Stacks](https://www.vcluster.com/docs/platform/troubleshoot/stacks)
+- [Troubleshoot Stacks](https://www.vcluster.com/docs/platform/tenants/troubleshoot/stacks)
 
 <a id="contribute-a-certified-stack"></a>
 
