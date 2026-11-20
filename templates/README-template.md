@@ -49,7 +49,8 @@ the graph during an update.
 
 ## Tested environment and limitations
 
-Briefly name the versions, infrastructure, and configuration you tested. Identify
+Briefly name the versions, infrastructure, and configuration you tested, and the
+minimum Platform version if known. Identify
 unverified paths and known limitations. A paragraph is sufficient; a version
 matrix and a duplicate copy of PR test results are not required.
 

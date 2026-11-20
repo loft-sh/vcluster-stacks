@@ -44,7 +44,8 @@ cluster context each command uses, and the expected result. An App being install
 or a Stack reporting `Healthy` may not prove the application works: include a
 useful check, such as querying an endpoint or confirming metrics reach storage.
 
-Name the versions and environment you used. List known requirements such as GPUs,
+Name the versions and environment you used, and the minimum Platform version
+when you know it. List known requirements such as GPUs,
 Argo CD, storage, Platform features, or vendor credentials. Keep parameters,
 defaults, and examples consistent with the manifests. You do not need to establish
 an exhaustive minimum-version or platform-support matrix; distinguish the tested
@@ -147,8 +148,8 @@ explain what access is missing so a reviewer can help.
 
 ## Review
 
-Maintainers review usability, correctness, operational effects, and the evidence
-for the documented path. The [review skill](.claude/skills/stack-review/SKILL.md)
+Maintainers listed in [CODEOWNERS](.github/CODEOWNERS) review usability,
+correctness, operational effects, and the evidence for the documented path. The [review skill](.claude/skills/stack-review/SKILL.md)
 assists them; it does not approve or merge contributions. Missing optional sections,
 custom automation, or a broad test matrix alone are not reasons to reject a simple
 Community Stack.
@@ -157,3 +158,11 @@ Paid AI review is a maintainer tool, not a contributor prerequisite. Fork PRs ne
 a maintainer's one-shot `stack-review-approved` label for the current head. Authors
 do not need an API key or to arrange AI review. See [review setup](.github/REVIEW.md)
 for maintainer configuration and request limits.
+
+## After merge
+
+Contributors and users report problems through GitHub issues. Maintainers may
+update, mark as unmaintained, or remove a Community Stack that becomes broken,
+insecure, or unmaintained, for example when a pinned image has a serious
+vulnerability or no one can verify a fix. A merged stack does not gain a support
+commitment or a guaranteed response time.

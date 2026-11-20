@@ -1,0 +1,3 @@
+# Default reviewers for every change. Add owners for specific paths below this
+# line as stacks gain dedicated maintainers; the last matching pattern wins.
+* @Stillstellung
