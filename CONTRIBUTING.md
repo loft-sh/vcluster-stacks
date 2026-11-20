@@ -49,7 +49,7 @@ destination for their installation. Live tests still need a real destination.
 
 ## Name and configure resources
 
-- Prefix Platform-global App, ArgoCDApplicationTemplate, and StackTemplate names
+- Prefix Platform-global App, ArgoCDApplicationTemplate, StackTemplate, and VirtualClusterTemplate names
   with the integration name. Deliberately shared definitions must agree. Renaming
   a task or template can affect existing instances and output references.
 - Declare user-facing parameters with useful labels, descriptions, types,
@@ -161,7 +161,7 @@ python3 hack/validate_stacks.py --server
 ```
 
 Server dry runs do not deploy Stacks or prove workloads work. CI executes
-contribution scripts without repository secrets on a disposable runner. Do not
+contribution scripts without repository secrets on a fresh GitHub-hosted VM. Do not
 add steps that need production access or customer credentials.
 
 ## Record test evidence
@@ -189,9 +189,13 @@ documentation, operational behavior, and test evidence. It does not merge, certi
 or deploy contributions.
 
 Automatic review uses the base branch's guide and skill and reads PR files as
-text. It runs on PR creation and updates, including fork PRs, after the workflow
-is merged and its credential is configured. Missing credentials are reported in
-the job summary, not as a successful review. See [review setup](.github/REVIEW.md).
+text. Once enabled, it runs automatically for same-repository PRs authored by
+members, owners, or collaborators with write access. Fork and other external PRs
+need a maintainer to apply `stack-review-approved` for each new head commit. The
+label is consumed before a paid request; keeping a label on a PR never authorizes
+later pushes. Reviews are limited to one attempt per commit and five per PR.
+Missing credentials are reported in the job summary, not as a successful review.
+See [review setup](.github/REVIEW.md).
 
 Report bugs through [GitHub issues](https://github.com/loft-sh/vcluster-stacks/issues)
 with redacted configuration and reproduction steps, or use an integration's

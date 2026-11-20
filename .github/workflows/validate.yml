@@ -32,10 +32,16 @@ jobs:
     permissions:
       contents: read
     timeout-minutes: 5
+    outputs:
+      platform: ${{ steps.changes.outputs.platform }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          fetch-depth: 0
+      - name: Select Platform validation
+        id: changes
+        run: python3 hack/ci_changes.py
       - name: Create validation environment
         run: python3 -m venv .venv
       - name: Install validation dependencies
@@ -46,7 +52,10 @@ jobs:
         run: .venv/bin/python hack/validate_stacks.py
   validate:
     name: Render and validate
-    runs-on: large-8_32
+    needs: contribution-standard
+    if: needs.contribution-standard.outputs.platform == 'true'
+    # Fork scripts run only on a fresh GitHub-hosted VM, never a persistent runner.
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
       # renovate: datasource=github-releases depName=loft-sh/vcluster

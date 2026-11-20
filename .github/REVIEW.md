@@ -1,43 +1,79 @@
 # Automatic stack review setup
 
-The [review workflow](workflows/stack-review.yml) reads the contribution guide,
-README outline, and review skill from the PR's base commit. It submits PR text to
-the Anthropic Messages API and maintains one advisory PR comment. It cannot run
-commands, use model tools, deploy, approve, or merge a PR.
+The [review workflow](workflows/stack-review.yml) uses the guide and skill from the
+base commit and reads PR files as text through the API. Only base-commit code runs.
+The model has no executable tools. Its comment is labeled as AI-generated, never
+maintainer approval or certification. All model text and context limits are shown
+in literal code blocks, so links, images, HTML, and mentions cannot become active.
+A model can still produce misleading prose; maintainers must assess its findings.
 
 ## Maintainer setup
 
-1. Make an Anthropic API credential available to this repository as the Actions
-   secret `ANTHROPIC_API_KEY`. Use the existing organization credential only if its
-   owner authorizes this consumer. Register the consumer with the organization's
-   credential inventory and rotation process; never commit the value.
-2. Optionally set the Actions variable `STACK_REVIEW_MODEL` to an available Claude
-   model ID. The default is `claude-sonnet-4-6`.
-3. Merge the workflow, guide, skill, and runner together. Open or update a test PR
-   and confirm the comment identifies its head commit. The trusted-base workflow
-   cannot review the PR that first introduces it before merge.
+1. Make an authorized Anthropic credential available as `ANTHROPIC_API_KEY` in
+   Actions secrets. Register this consumer and its rotation owner through the
+   organization's credential process. Never commit the value.
+2. Set the Actions variable `STACK_REVIEW_ENABLED` to `true` to opt in. Setting it
+   to any other value disables paid requests. Check the provider-side budget for
+   the credential: per-PR limits do not impose a repository-wide monthly spend cap.
+3. Optionally set `STACK_REVIEW_MODEL`. The default is `claude-sonnet-5-5`.
+4. Create the `stack-review-approved` repository label. On a fork PR, add it only
+   after inspecting the current head. The runner verifies the labeler's current
+   write/maintain/admin permission and consumes the label before any paid request.
+   Failed permission checks deny the request.
+5. Merge the workflow, guide, skill, and runner together. Test authorization,
+   comment rendering, missing-credential behavior, and budget receipts before
+   making this advisory job a required merge check. It cannot review the PR that
+   first introduces it before merge. Ensure the repository's Actions event policy
+   permits this trusted-base workflow if applicable.
 
-The workflow triggers on PR creation, pushes, reopening, and readiness, including
-fork PRs and drafts. Drafts are included to provide feedback before human review.
-No credential is sent to a fork checkout: only base-commit code runs, and the model
-receives no credential or executable tools. Normal manifest CI continues through
-`pull_request` with a read-only token and no repository secrets.
+## Authorization and cost bounds
 
-A missing API key produces an explicit warning and job summary. API failures fail
-the review job. Neither is evidence that a contribution passed review. Keep this
-advisory job outside required merge checks until its credential, rotation owner,
-and a test run have been verified. Deterministic validation remains separate.
+Automatic events are PR creation, pushes, reopening, and readiness. They are
+eligible only for same-repository PRs whose author has MEMBER, OWNER, or
+COLLABORATOR association and current write access. Drafts are eligible.
 
-## Review limits
+Every fork, including one owned by a member, needs a fresh maintainer label event.
+A label authorizes only the head present in that event. A changed head, removed
+label, unrelated label, or labeler without write access does not authorize a
+request. External pushes never inherit an earlier approval.
 
-The runner sends changed-file diffs and, where space permits, complete changed
-text files. Context is limited to roughly 200,000 characters; full files above
-25,000 bytes are omitted. PRs over 200 changed files require manual review.
-Omitted context is listed in the comment. Unchanged
-dependencies and live environments require maintainer verification. The model
-can make mistakes and cannot establish that an installation works.
+The bot reserves an attempt in its own sticky comment before calling the model:
 
-Each run makes one model request with at most 4,096 output tokens. It discards a
-review if the PR head changes while the request runs. New pushes cancel the
-previous workflow. To disable automatic review, disable this workflow in Actions;
-local review can still use the skill.
+- At most one attempt for a given commit, including failures and reruns.
+- At most five attempts per PR. Later changes need manual review.
+- One model request per attempt, with no automatic retry, at most 200,000
+  characters of PR context, and at most 4,096 output tokens.
+- Per-PR serialization with no cancellation of a running request. A new push
+  cannot undo billing for an already submitted request.
+
+The hidden receipt is at the top of the bot's own comment. A missing/corrupt
+receipt fails closed; do not delete it to retry requests. If a run fails after
+reservation, the attempt remains spent. Disabling the workflow or the enable
+variable stops future requests. An administrator should also set a provider-side
+budget appropriate for all consumers of the credential.
+
+Do not rely on GitHub's first-contributor approval setting as the paid-review
+authorization boundary. `pull_request_target` uses the base repository's trust
+and secrets; see [GitHub's security guidance](https://docs.github.com/en/actions/reference/security/securely-using-pull_request_target).
+The script's explicit permission, event, head, and budget checks are required
+regardless of that setting. Repository/organization settings need maintainer
+verification; they were not readable with the implementation account.
+
+## CI and review limits
+
+Offline contribution checks, including README defaults, run for every PR on
+`ubuntu-latest`. Ordinary Markdown-only changes skip the expensive render and
+Platform job. Manifest, script, workflow, generator-source, and Run:ai generated
+README changes still run it; dispatches and unknown history run the full check.
+The Platform job also uses `ubuntu-latest`, a fresh GitHub-hosted VM, so fork code
+never runs on an unverified persistent custom runner. No repository secrets are
+passed to these `pull_request` jobs.
+
+The model sees changed-file diffs and, where space permits, complete changed text
+files. Full files over 25,000 bytes are omitted; PRs over 200 files require manual
+review. Omitted context is listed literally. Unchanged dependencies and live
+behavior need maintainer verification. A response reaching the output-token limit
+is posted as incomplete and still consumes one attempt. Other API failures fail
+the advisory job; a missing key produces an explicit warning and job summary.
+Neither is evidence that the contribution passed review. Findings for an obsolete
+head are discarded, with the reservation retained.

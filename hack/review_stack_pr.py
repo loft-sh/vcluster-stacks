@@ -8,12 +8,17 @@ from pathlib import Path
 import re
 import sys
 from urllib.error import HTTPError, URLError
+from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 ROOT = Path(__file__).resolve().parents[1]
 MARKER = "<!-- stack-contribution-review -->"
 CONTEXT_LIMIT = 200_000
 FILE_LIMIT = 25_000
+APPROVAL_LABEL = "stack-review-approved"
+MAX_REQUESTS_PER_PR = 5
+STATE_PREFIX = "<!-- stack-review-attempts:"
+TRUSTED_ASSOCIATIONS = {"MEMBER", "OWNER", "COLLABORATOR"}
 
 
 def request_json(url, token, data=None, method=None, anthropic=False):
@@ -25,6 +30,8 @@ def request_json(url, token, data=None, method=None, anthropic=False):
     request = Request(url, data=json.dumps(data).encode() if data is not None else None,
                       headers=headers, method=method)
     with urlopen(request, timeout=120) as response:
+        if response.status == 204:
+            return None
         return json.load(response)
 
 
@@ -40,6 +47,73 @@ def pages(path):
         if len(items) < 100:
             return
     raise ValueError("GitHub pagination limit reached; manual review is required")
+
+
+def has_write_access(login):
+    permission = github(f"collaborators/{quote(login, safe='')}/permission")
+    return permission.get("permission") in {"admin", "maintain", "write"}
+
+
+def authorize(event, pull, number):
+    """An approval is an event for one head, never a standing label on future pushes."""
+    if pull.get("state") != "open" or event["pull_request"]["head"]["sha"] != pull["head"]["sha"]:
+        return False
+    action = event.get("action")
+    if action == "labeled":
+        if event.get("label", {}).get("name") != APPROVAL_LABEL:
+            return False
+        if not has_write_access(event["sender"]["login"]):
+            return False
+        if APPROVAL_LABEL not in {label["name"] for label in pull.get("labels", [])}:
+            return False
+        # Consume before any paid request. A new push needs a fresh maintainer action.
+        github(f"issues/{number}/labels/{APPROVAL_LABEL}", method="DELETE")
+        return True
+    return (action in {"opened", "synchronize", "reopened", "ready_for_review"}
+            and pull["head"]["repo"]["full_name"] == os.environ["GITHUB_REPOSITORY"]
+            and pull.get("author_association") in TRUSTED_ASSOCIATIONS
+            and has_write_access(pull["user"]["login"]))
+
+
+def plain_text(text):
+    """A fence longer than any supplied backtick run keeps all content inert."""
+    fence = "`" * max(3, 1 + max((len(s) for s in re.findall(r"`+", text)), default=0))
+    return f"{fence}text\n{text.replace('@', '@' + chr(0x200b))}\n{fence}"
+
+
+def comment_body(attempts, text):
+    return f"{MARKER}\n{STATE_PREFIX}{json.dumps(attempts)} -->\n{text}"
+
+
+def save_comment(number, comment_id, body):
+    if len(body) > 60_000:
+        raise ValueError("Review comment exceeds its size budget; manual review is required")
+    if comment_id:
+        return github(f"issues/comments/{comment_id}", {"body": body}, "PATCH")
+    return github(f"issues/{number}/comments", {"body": body}, "POST")
+
+
+def reserve_request(number, sha):
+    comments = list(pages(f"issues/{number}/comments"))
+    own = next((c for c in comments if c.get("user", {}).get("login") == "github-actions[bot]"
+                and c["body"].startswith(MARKER + "\n")), None)
+    attempts = []
+    if own:
+        lines = own["body"].splitlines()
+        line = lines[1] if len(lines) > 1 else ""
+        if not line.startswith(STATE_PREFIX) or not line.endswith(" -->"):
+            raise ValueError("Missing review budget receipt; manual review is required")
+        attempts = json.loads(line[len(STATE_PREFIX):-4])
+        if not isinstance(attempts, list) or not all(isinstance(s, str) and re.fullmatch(r"[0-9a-f]{40}", s) for s in attempts):
+            raise ValueError("Invalid review budget receipt; manual review is required")
+    if sha in attempts or len(attempts) >= MAX_REQUESTS_PER_PR:
+        print("No paid request: commit already attempted or five-request PR budget exhausted")
+        return None
+    attempts.append(sha)
+    text = (f"### AI-generated stack review\n\nRequest reserved for `{sha}`. "
+            "If no findings follow, the request failed or the head changed; manual review is required.")
+    saved = save_comment(number, own["id"] if own else None, comment_body(attempts, text))
+    return {"id": saved["id"], "attempts": attempts}
 
 
 def collect_context(number, pull):
@@ -98,43 +172,38 @@ def generate_review(context):
         "Use the repository terminology: cluster, control plane cluster, tenant isolation, vCluster Platform."
     )
     response = request_json("https://api.anthropic.com/v1/messages", os.environ["ANTHROPIC_API_KEY"], {
-        "model": os.environ.get("STACK_REVIEW_MODEL") or "claude-sonnet-4-6",
+        "model": os.environ.get("STACK_REVIEW_MODEL") or "claude-sonnet-5-5",
         "max_tokens": 4096,
         "system": system,
         "messages": [{"role": "user", "content": json.dumps(context)}],
     }, anthropic=True)
-    if response.get("stop_reason") != "end_turn":
+    if response.get("stop_reason") == "max_tokens":
+        context.setdefault("limits", []).append("Model output reached 4,096 tokens; this is an incomplete review")
+    elif response.get("stop_reason") != "end_turn":
         raise ValueError("Model review did not complete; manual review is required")
     text = "\n".join(part["text"] for part in response.get("content", []) if part.get("type") == "text").strip()
     if not text:
         raise ValueError("Model returned no review")
-    # A model response must not notify arbitrary users or spoof another review marker.
-    return text.replace("@", "@\u200b").replace(MARKER, "")[:50_000]
+    return text[:25_000]
 
 
-def publish_review(number, sha, review, limits):
+def publish_review(number, sha, review, limits, reservation):
     if github(f"pulls/{number}")["head"]["sha"] != sha:
         print("PR head changed; discarded stale review")
         return
-    body = (f"{MARKER}\n### Stack contribution review\n\n"
-            f"Reviewed commit `{sha}` using base-branch guidance. Advisory review; no tests executed.\n\n{review}")
+    text = (f"### AI-generated stack review\n\n"
+            f"Commit `{sha}`. Untrusted AI suggestions, not maintainer approval or certification. "
+            f"No tests executed.\n\n{plain_text(review)}")
     if limits:
-        body += "\n\n<details><summary>Review context limits</summary>\n\n"
-        body += "\n".join(f"- {item}" for item in limits) + "\n\n</details>"
-    body = body.replace("@", "@\u200b")
-    if len(body) > 60_000:
-        raise ValueError("Review comment exceeds its size budget; manual review is required")
-    comments = list(pages(f"issues/{number}/comments"))
-    existing = next((c for c in comments if c.get("user", {}).get("login") == "github-actions[bot]"
-                     and c["body"].startswith(MARKER)), None)
-    if existing:
-        github(f"issues/comments/{existing['id']}", {"body": body}, "PATCH")
-    else:
-        github(f"issues/{number}/comments", {"body": body}, "POST")
+        text += "\n\nReview context limits:\n\n" + plain_text("\n".join(limits))
+    save_comment(number, reservation["id"], comment_body(reservation["attempts"], text))
     print(f"Published stack review for {sha}")
 
 
 def main():
+    if os.environ.get("STACK_REVIEW_ENABLED") != "true":
+        print("Paid stack review is disabled; set STACK_REVIEW_ENABLED=true to enable")
+        return 0
     if not os.environ.get("ANTHROPIC_API_KEY"):
         message = "Automatic stack review was not run: configure ANTHROPIC_API_KEY. See .github/REVIEW.md."
         print(f"::warning::{message}")
@@ -146,10 +215,18 @@ def main():
         event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text())
         number = int(event["pull_request"]["number"])
         pull = github(f"pulls/{number}")
+        if not authorize(event, pull, number):
+            print("No paid request: this event is not authorized for the current head")
+            return 0
         sha = pull["head"]["sha"]
         context = collect_context(number, pull)
+        if github(f"pulls/{number}")["head"]["sha"] != sha:
+            return 0
+        reservation = reserve_request(number, sha)
+        if reservation is None:
+            return 0
         review = generate_review(context)
-        publish_review(number, sha, review, context["limits"])
+        publish_review(number, sha, review, context["limits"], reservation)
     except (ValueError, KeyError, OSError, HTTPError, URLError) as exc:
         # Never print HTTP response bodies or credentials, including vendor error payloads.
         print(f"::error::Stack review failed ({type(exc).__name__}); inspect configuration and request limits.")
