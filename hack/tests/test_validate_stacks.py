@@ -1,4 +1,5 @@
 import copy
+import io
 from pathlib import Path
 import sys
 import tempfile
@@ -42,9 +43,9 @@ class StackValidationTests(unittest.TestCase):
         self.assertEqual(len(records), 2)
         self.assertEqual(checks, [directory / "test-manifests.sh"])
 
-    def test_missing_checks_readme_template_and_example_fail(self):
+    def test_missing_readme_template_and_example_fail(self):
         directory = self.integration()
-        for filename in ("README.md", "test-manifests.sh", "stacktemplate.yaml", "example.yaml"):
+        for filename in ("README.md", "stacktemplate.yaml", "example.yaml"):
             with self.subTest(filename=filename):
                 path = directory / filename
                 original = path.read_text()
@@ -53,6 +54,31 @@ class StackValidationTests(unittest.TestCase):
                     validator.validate(self.root)
                 path.write_text(original)
                 path.chmod(0o755)
+
+    def test_simple_community_stack_needs_no_custom_check_script(self):
+        directory = self.integration()
+        (directory / "test-manifests.sh").unlink()
+        records, checks = validator.validate(self.root)
+        self.assertEqual(len(records), 2)
+        self.assertEqual(checks, [])
+        # Optional custom checks must not bypass shared correctness checks.
+        (directory / "stacktemplate.yaml").write_text("kind: App\nkind: StackTemplate\n")
+        with self.assertRaisesRegex(ValueError, "duplicate YAML key"):
+            validator.validate(self.root)
+
+    def test_provided_check_script_must_be_executable(self):
+        directory = self.integration()
+        (directory / "test-manifests.sh").chmod(0o644)
+        with self.assertRaisesRegex(ValueError, "provided check entry point must be an executable"):
+            validator.validate(self.root)
+
+    def test_existing_check_failure_is_not_silently_skipped(self):
+        directory = self.integration()
+        (directory / "test-manifests.sh").write_text("#!/usr/bin/env bash\nexit 7\n")
+        with patch.object(validator, "ROOT", self.root), patch.object(sys, "argv", ["validate_stacks.py", "--run-checks"]), \
+                patch("sys.stdout", new_callable=io.StringIO), patch("sys.stderr", new_callable=io.StringIO) as error:
+            self.assertEqual(validator.main(), 1)
+            self.assertIn("exit status 7", error.getvalue())
 
     def test_generator_inputs_are_excluded_but_generated_files_are_checked(self):
         directory = self.integration()

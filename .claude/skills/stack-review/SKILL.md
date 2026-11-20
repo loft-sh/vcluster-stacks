@@ -10,6 +10,11 @@ Use [CONTRIBUTING.md](../../../CONTRIBUTING.md) as the standard and
 Review changed behavior proportionally; do not demand every outline heading or
 retrofit an untouched integration.
 
+The goal is a usable Community Stack, not a certification process. A simple
+contribution can be manifests, an example, and a short README. Do not require a
+custom test script, every outline heading, a broad compatibility matrix, or a
+full upgrade/recovery suite. Certification requirements are outside this skill.
+
 ## Establish the scope
 
 Identify affected integrations, authoritative source/generated files, deployment
@@ -24,7 +29,9 @@ in a disposable environment without production access.
 
 ## Check the integration
 
-- Confirm required files and a validation entry point. Inspect references,
+- Confirm manifests, an example, and usable instructions. Custom checks are
+  optional; assess whether generation or conditional logic needs focused checks,
+  and preserve existing checks relevant to the change. Inspect references,
   dependencies, optional/no-op branches, outputs, and generated consistency.
   Dependencies supplied by Platform or installed separately need documented
   sources and required versions.
@@ -40,12 +47,16 @@ in a disposable environment without production access.
   disruptive actions. Secret outputs use `fromSecret`; reports must not reveal
   values. Shared nodes do not isolate untrusted arbitrary workloads at the kernel
   or physical-node boundary.
-- Check upgrades, recovery, removal order, and retained data. Referenced
+- Check removal instructions and retained data. Review upgrades and recovery
+  when relevant to the stack or changed behavior. Referenced
   StackTemplate changes can affect existing instances. Retain/Prune governs
   removed tasks; it is not the switch for StackInstance deletion.
-- Inspect static/admission results and live-test evidence separately. Look for
-  exact versions, infrastructure, configuration, commands, results, and gaps.
-  Missing evidence is unverified, not proof of a bug or a passing test.
+- Inspect static/admission results and live evidence separately. For a new stack,
+  look for one successful installation and functional check, supplied by the
+  contributor or a reviewer. Ask for help verifying that path before merge if
+  needed. Other configurations can remain explicitly unverified; do not demand
+  exhaustive testing or duplicate README/PR reports. Missing evidence is
+  unverified, not proof of a bug or a passing test.
 
 ## Report findings
 
@@ -54,7 +65,8 @@ impact, and a concrete correction. Distinguish:
 
 - **Incorrect:** evidence shows the claim or implementation is wrong.
 - **Unverified:** relevant evidence is missing, truncated, or unavailable; name
-  what a maintainer should verify.
+  what a maintainer should verify. Distinguish the documented installation path
+  from optional alternatives; an untested alternative is not automatically a blocker.
 - **Optional:** an improvement that is not a contribution requirement.
 
 Prioritize broken installation, conflicting ownership, exposed credentials,

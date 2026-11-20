@@ -1,32 +1,21 @@
-## What changed
+## What does this stack or change do?
 
-<!-- Explain the integration or change and why it is needed. Link an issue if applicable. -->
+<!-- Explain its purpose and link a related issue if applicable. -->
 
-## Compatibility and dependencies
+## What did you try?
 
-<!-- Required Platform/vCluster/Kubernetes versions, node models/destinations, hardware,
-     features, Argo CD, and external/bundled dependencies. State shared ownership or conflicts. -->
+<!-- For a new stack: one installation and useful functional check should be verified
+     before merge, by you or a reviewer. State versions/environment, steps or commands,
+     results, and what remains unverified. A short paragraph is enough.
+     Drafts are welcome if you need testing help; say what hardware or access is needed.
+     For existing stacks, focus on checks relevant to the change. No full test matrix required. -->
 
-## Validation and live-test evidence
+## Anything users or reviewers should know?
 
-<!-- List exact commands and results. Distinguish static checks, admission dry runs, and live tests.
-     For live tests include date, commit, exact versions, infrastructure, and configuration.
-     Say what was NOT tested, including hardware-dependent branches. -->
+<!-- Dependencies, privileges, shared components or conflicts, retained data, removal
+     behavior, and any update impact, where applicable. Link README details instead of
+     repeating them. Never include real credentials or sensitive test output. -->
 
-| Check / configuration | Environment and versions | Result or untested reason |
-| --- | --- | --- |
-| | | |
-
-## Lifecycle and operational effects
-
-<!-- Parameter/dependency updates, recovery, disruptive actions, removal order, retained data,
-     and manual cleanup. State “No change” when applicable. Never include secret values. -->
-
-## Contributor checklist
-
-- [ ] Read CONTRIBUTING.md; README and examples describe the changed behavior.
-- [ ] Ran repository validation and the affected integration's test entry point.
-- [ ] Checked generated output when applicable.
-- [ ] Reported live-test evidence and gaps accurately.
-- [ ] Documented compatibility, dependencies, shared ownership, and lifecycle effects.
-- [ ] Included no real credentials, kubeconfigs, or sensitive test output.
+- [ ] README and example explain installation, a functional check, removal, and limitations.
+- [ ] Ran shared validation and any existing checks relevant to the change, or explained what I could not run.
+- [ ] Disclosed known operational effects and test gaps; included no real credentials.

@@ -11,10 +11,11 @@ introduced in Platform 4.12.
 
 ## Available integrations
 
-**Certified Stacks** are reviewed and tested integrations accepted by vCluster
-Labs. Platform releases bundle a pinned set of their templates and supporting
-resources. The files on this repository's `main` branch can differ from your
-installed Platform release.
+The existing integrations under **`certified-stacks/`** are bundled with Platform
+releases as a pinned set of templates and supporting resources. The files on this
+repository's `main` branch can differ from your installed Platform release. The
+contribution guide below focuses on Community Stacks and does not define
+certification requirements.
 
 | Integration | Deployment models | Components |
 | --- | --- | --- |

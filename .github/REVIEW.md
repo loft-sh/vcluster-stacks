@@ -69,6 +69,20 @@ The Platform job also uses `ubuntu-latest`, a fresh GitHub-hosted VM, so fork co
 never runs on an unverified persistent custom runner. No repository secrets are
 passed to these `pull_request` jobs.
 
+Review a Community contribution against the short checklist in CONTRIBUTING.md.
+Custom test scripts are optional; existing scripts still run, and generated or
+conditional behavior may need focused checks. One installation and functional
+check should be verified before a new stack merges, by the contributor or a
+reviewer. Do not invent certification criteria or demand a full test matrix.
+
+When an external task template is intentionally supplied by Platform or installed
+separately, help register its README installation instructions for validation.
+`hack/external-template-references.yaml` is a list of entries with `path` (the
+repository-relative StackTemplate file), `kind`, `name`, and `instructions` (the
+README link and relevant version/installation requirements). The shared validator
+still rejects undeclared missing references. Contributors can ask for this help
+in the PR rather than learning the repository's validation configuration first.
+
 The model sees changed-file diffs and, where space permits, complete changed text
 files. Full files over 25,000 bytes are omitted; PRs over 200 files require manual
 review. Omitted context is listed literally. Unchanged dependencies and live

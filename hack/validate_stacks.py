@@ -57,9 +57,11 @@ def manifest_paths(directory):
 def check_entrypoint(directory):
     for name in ("test-manifests.sh", "test-certified-manifests.sh"):
         path = directory / name
-        if path.is_file() and os.access(path, os.X_OK):
+        if path.exists():
+            if not path.is_file() or not os.access(path, os.X_OK):
+                raise ValueError(f"{path}: a provided check entry point must be an executable file")
             return path
-    raise ValueError(f"{directory}: add an executable test-manifests.sh (or test-certified-manifests.sh)")
+    return None
 
 
 def platform_document(doc):
@@ -110,7 +112,9 @@ def validate(root):
         try:
             if not (directory / "README.md").is_file():
                 raise ValueError(f"{directory}: missing README.md")
-            checks.append(check_entrypoint(directory))
+            entrypoint = check_entrypoint(directory)
+            if entrypoint is not None:
+                checks.append(entrypoint)
             local = []
             for path in manifest_paths(directory):
                 for doc in load_documents(path):
@@ -152,7 +156,7 @@ def validate(root):
                     relative = str(path.relative_to(root))
                     if not any(e.get("path") == relative and e.get("kind") == kind and e.get("name") == name
                                and e.get("instructions") for e in external):
-                        errors.append(f"{path}: missing {kind} {name}; include it or declare its installation instructions in hack/external-template-references.yaml")
+                        errors.append(f"{path}: missing {kind} {name}; include it, or document its installation in README.md and ask a maintainer to register the external reference")
 
     combined = root / "examples/starter-stack.yaml"
     if starter.is_dir() and combined.is_file():
@@ -182,7 +186,7 @@ def main():
     args = parser.parse_args()
     try:
         records, checks = validate(ROOT)
-        print(f"Validated {len(checks)} integration/starter folders and {len(records)} Platform documents", flush=True)
+        print(f"Validated {len(records)} Platform documents; found {len(checks)} custom check entry points", flush=True)
         if args.run_checks:
             for path in checks:
                 print(f"Run {path.relative_to(ROOT)}", flush=True)

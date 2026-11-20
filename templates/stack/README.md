@@ -123,9 +123,9 @@ python3 hack/validate_stacks.py
 ```
 
 These static checks do not deploy the example. The live smoke test is the quick
-start, the parameter update, and removal above. Record your date, stack commit,
-exact Platform/vCluster/Kubernetes versions, node model, results, and untested paths
-when contributing a derivative. The new folder has not yet been tested on a live
+start, the parameter update, and removal above. For a contribution, briefly name
+your tested versions and environment in the README and put change-specific
+results and gaps in the PR. The new folder has not yet been tested on a live
 cluster; do not interpret the minimum version as a live-test result.
 
 ## Build your own integration
@@ -135,6 +135,10 @@ the `starter-*` ConfigMaps, and the destination namespace consistently, includin
 output sources, example references, and checks. Replace tasks with your workload,
 add functional verification, and adapt the [README outline](../README-template.md)
 and [contribution requirements](../../CONTRIBUTING.md).
+
+The starter's `test-manifests.sh` illustrates a check specific to its two-task
+handoff. Replace or remove it when that behavior no longer applies. A simple
+Community Stack can rely on shared validation without providing its own script.
 
 Report example issues through the repository's GitHub issues. Licensed under
 [Apache License 2.0](../../LICENSE).

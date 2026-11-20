@@ -1,124 +1,91 @@
-# Contribute to vCluster Stacks
+# Contribute a Community Stack
 
-Contribute a reusable integration or improve an existing one through a pull
-request. These requirements cover the repository and installation workflow
-available today. They do not require a catalog UI or a catalog metadata format.
+Share a stack that someone else can install, use, and remove with clear
+expectations. This guide covers Community Stack contributions using today's
+repository workflow. It does not define certification requirements.
 
-## Start a contribution
+## What a contribution needs
 
-1. Check existing integrations and issues for related work. Discuss large changes,
-   certification requests, and changes to shared infrastructure with maintainers.
-2. Fork the repository, create a branch, and put a new integration under
-   `community-stacks/<integration>/` using a lowercase, hyphen-separated name.
-3. Copy [templates/stack/](templates/stack/) for a small working example. Adapt the
-   [README outline](templates/README-template.md); omit inapplicable sections.
-4. Add checks, test in a non-production environment, and open a PR using the
-   repository's PR template. Say what you have not tested.
+- A `StackTemplate` and an example `StackInstance` or cluster template.
+- The referenced Apps and ArgoCDApplicationTemplates, or instructions for obtaining
+  dependencies supplied by Platform or installed separately.
+- A short README explaining the purpose, prerequisites, inputs, installation,
+  a functional check, removal, and known limitations.
+- An honest account of what works in the configuration you tested and what
+  remains unverified.
+- No real credentials, conflicting resource definitions, or undisclosed privileged
+  or destructive behavior.
 
-New contributions normally start as Community Stacks. Maintainers decide whether
-an integration is Certified; a directory, annotation, or passing check does not
-grant certification. Community contributions do not carry formal vCluster
-Product & Engineering support. Do not promise support coverage that has not been agreed.
+A simple stack can meet these requirements with a few manifests and a short
+README. You do not need a custom test script, a compatibility matrix, a diagram,
+or a particular number of README sections.
 
-## Include a complete integration
+## Get started
 
-Each integration needs:
+1. Check existing integrations and issues for related work. Discuss changes to
+   shared infrastructure with maintainers before doing substantial work.
+2. Fork the repository and create a branch. Put a new stack under
+   `community-stacks/<integration>/` with a lowercase, hyphen-separated name.
+3. Copy the working [starter](templates/stack/) or use an existing integration
+   with a similar shape. Adapt the [README outline](templates/README-template.md)
+   to your stack; combine or omit sections that do not apply.
+4. Run shared validation and any relevant checks, then open a PR. A draft is
+   welcome when you need help with testing or a dependency.
 
-- A `README.md` covering its outcome, requirements, installation, verification,
-  update and removal behavior, limitations, and testing.
-- At least one deployable `StackTemplate` and an example `StackInstance` or
-  cluster template showing how to use it.
-- Referenced Apps and ArgoCDApplicationTemplates, or explicit instructions for
-  obtaining dependencies bundled with Platform or installed separately.
-- An executable root `test-manifests.sh` or `test-certified-manifests.sh` that
-  exits nonzero on failure. Keep integration-specific checks behind this entry
-  point, including generated-file checks. Document its prerequisites.
+Community contributions do not carry formal vCluster Product & Engineering
+support. Use the repository's [GitHub issues](https://github.com/loft-sh/vcluster-stacks/issues)
+for problems, or identify an integration-specific reporting route. Do not promise
+support coverage that has not been agreed.
 
-Inline tasks do not need an `apps/` directory. Several related templates or
-variants can share an integration folder. Explain their destinations, installation
-order, ownership, and removal order. Put generator inputs in `source/`; validation
-scans deployable YAML outside `source/`, not generator inputs. Commit generated
-output and check it against its source.
+## Make the stack usable
 
-The validator discovers integrations automatically under `certified-stacks/` and
-`community-stacks/`. Do not add a stack to a hardcoded CI list. Every integration
-folder must meet the file and validation-entry-point requirements above.
-Use `p-default` for the project namespace in admission-test examples, as CI starts
-with Platform's default project. Tell readers to set the namespace, owner, and
-destination for their installation. Live tests still need a real destination.
+Show one installation path with the values a reader must replace, the API or
+cluster context each command uses, and the expected result. An App being installed
+or a Stack reporting `Healthy` may not prove the application works: include a
+useful check, such as querying an endpoint or confirming metrics reach storage.
 
-## Name and configure resources
+Name the versions and environment you used. List known requirements such as GPUs,
+Argo CD, storage, Platform features, or vendor credentials. Keep parameters,
+defaults, and examples consistent with the manifests. You do not need to establish
+an exhaustive minimum-version or platform-support matrix; distinguish the tested
+configuration from alternatives that are unverified.
 
-- Prefix Platform-global App, ArgoCDApplicationTemplate, StackTemplate, and VirtualClusterTemplate names
-  with the integration name. Deliberately shared definitions must agree. Renaming
-  a task or template can affect existing instances and output references.
-- Declare user-facing parameters with useful labels, descriptions, types,
-  defaults, and validation. Keep README tables and examples consistent with the
-  manifests. Distinguish user inputs from internal values supplied by Platform.
-- State minimum requirements separately from tested versions. Include Platform,
-  vCluster, Kubernetes, infrastructure, required features, and Argo CD prerequisites
-  where relevant. Do not infer universal compatibility from one test.
-- Pin chart and image defaults to specific versions or digests. Explain deliberate
-  exceptions, such as the Platform-provided image. Add Renovate annotations when
-  its existing managers can track the dependency.
-- Use the Platform API schema for task/output rules. Keep dependencies acyclic and
-  test configuration-dependent references for every supported branch, including
-  no-op templates. Document dependencies supplied outside the integration.
-- Set timeouts for the workload. Distinguish the task deadline from the child
-  App's deployment timeout. Readiness must represent what a dependent task needs,
-  such as allocatable GPUs rather than merely an installed operator.
+Give resources collision-resistant names, normally prefixed with the integration
+name. This applies to Apps, ArgoCDApplicationTemplates, StackTemplates, and
+VirtualClusterTemplates. If the stack installs shared components such as GPU
+Operator, cert-manager, or monitoring, explain what it owns and how it handles an
+existing installation. Disclose known conflicts with other stacks.
 
-## Describe ownership and operational effects
+Pin chart and image defaults to specific versions or digests, or explain why a
+value follows the installed Platform. Renovate annotations are helpful when an
+existing manager supports the dependency; maintainers can help add them.
 
-For components such as GPU Operator, cert-manager, monitoring, or gateways, say
-whether the Stack installs them or requires an existing installation. Identify
-namespaces, cluster-scoped resources, and supported coexistence with other Stacks.
-Unique Platform template names do not prevent two installs from trying to own the
-same destination resources.
+Provide removal commands and identify resources or data that remain, including
+manual or destructive cleanup. If you have not verified removal, say so. When a
+change affects existing installations, explain the update path and known restart,
+migration, or recovery requirements. A first contribution does not need a full
+upgrade and failure-recovery test suite.
 
-Document who administers each StackInstance, what access it needs, and whether it
-is installed once per Platform, cluster, or instance. Make example owners, project
-namespaces, and destinations clearly customizable.
-
-Disclose privileged workloads, RBAC, endpoints, credentials, scheduled hardware
-checks, cordoning, and other disruptive actions. Explain defaults and how to
-turn off optional behavior. Describe the node model's actual tenant isolation
-boundary. Shared nodes are for trusted workloads; they share physical nodes and
-the kernel. Use private nodes for untrusted tenants with Kubernetes access or
-arbitrary workload execution.
+## Disclose operational effects
 
 Do not commit credentials, private keys, real rendered Secrets, or kubeconfigs.
-Document how users supply sensitive inputs and who can read them. Use `fromSecret`
-for Secret outputs, identify sensitive published outputs, and never include their
-values in test reports or PR descriptions.
+Explain how users supply sensitive inputs and who can read them. Use `fromSecret`
+for Secret outputs and identify sensitive published outputs without revealing
+values in the README or PR.
 
-## Document the lifecycle
+Explain privileged workloads, broad RBAC, exposed endpoints, hardware tests,
+cordoning, or other disruptive actions when present. State their defaults and how
+to turn off optional behavior. Shared nodes share the kernel and physical nodes;
+use private nodes for untrusted tenants with Kubernetes access or arbitrary
+workload execution. Describe the actual tenant isolation boundary you rely on.
 
-Give installation commands and a functional check with expected results. A
-StackInstance reporting `Healthy` does not alone prove a working model endpoint,
-metrics pipeline, scheduler, or application login.
+For stacks with several templates or deployment variants, explain which resources
+are installed once per Platform, cluster, or instance, who administers them, and
+the installation/removal order. Inline tasks do not require an `apps/` directory.
 
-Explain parameter and dependency changes, their effect on existing instances,
-and required restarts or migrations. A referenced StackTemplate is resolved during
-reconciliation; changing it can affect existing instances. It is not a pinned
-Stack revision.
+## Validate and tell us what you tested
 
-Distinguish these operations:
-
-- **Remove a task from the graph.** `prunePolicy` defaults to `Retain`, preserving
-  removed children. `Prune` deletes removed children in dependency order.
-- **Delete the StackInstance.** This starts child teardown; `prunePolicy` is not
-  the switch for instance deletion. Apps, Helm, Argo CD, hooks, and external
-  services determine what resources or data remain.
-
-Document retained namespaces, PVCs/PVs, CRDs, registrations, and data. State what
-manual cleanup does and whether it is destructive. For shared foundations, name
-the dependents that must be removed first. Include likely failure recovery and
-credential/certificate or endpoint changes where applicable.
-
-## Run validation
-
-Use Python 3.10 or later and PyYAML. A virtual environment keeps dependencies local:
+Run the shared offline checks from the repository root with Python 3.10 or later:
 
 ```bash
 python3 -m venv .venv
@@ -127,78 +94,51 @@ python3 -m pip install -r hack/requirements.txt
 python3 hack/validate_stacks.py
 ```
 
-The offline validator checks required files, YAML, conflicting global definitions,
-local template references, and the starter example. It excludes `source/` inputs
-and supporting Kubernetes objects from Platform API validation. It does not
-replace Platform admission or resolve arbitrary Go templates. Integration checks
-must cover dynamic references, render branches, README defaults, and their own
-invariants.
+These checks cover required files, YAML, conflicting global definitions, local
+references, and literal README defaults. CI discovers new integration folders
+and performs strict Platform admission dry runs. It runs on a fresh GitHub-hosted
+VM without repository secrets; it does not deploy your application.
 
-If a static task reference is supplied outside the repository, declare it in
-`hack/external-template-references.yaml` as a list entry with `path` (the
-repository-relative StackTemplate file), `kind`, `name`, and `instructions`
-(a README link and installation/version requirements). The validator checks local
-references against the repository and accepts only explicitly declared external
-ones. Dynamic references need integration-specific render checks.
+Use `p-default` for project-scoped examples so admission checks can use the test
+Platform's default project. Tell readers to customize the namespace, owner, and
+destination. If validation flags a dependency supplied outside this repository,
+document how to obtain it in your README and ask a maintainer to help register
+that external reference for CI.
 
-Run each integration's test entry point (some fetch upstream charts):
+Run an existing integration's check script when changing behavior it covers. For
+a new stack, add focused checks when they protect behavior the shared validator
+cannot check, such as generated files or conditional template references.
+Maintainers can help wire them into CI. Do not add a script that merely repeats
+shared validation to satisfy a folder convention.
 
-```bash
-python3 hack/validate_stacks.py --run-checks
-```
+If you provide `test-manifests.sh` or `test-certified-manifests.sh` at the integration
+root, make it executable, document prerequisites, and exit nonzero on failure.
+CI discovers and runs these scripts when present. Keep generator inputs in
+`source/`, commit deployable output, and provide generation and consistency-check
+commands. Existing generated integrations retain their checks.
 
-Existing checks use Bash 4 or later, Helm, `rg`, and sometimes `jq`; consult the
-integration README. Run:ai's entry point runs `render.sh --check` and its manifest
-tests. Edit authoritative `source/` files and run `render.sh` for generated changes.
+For a new stack, one successful installation and functional check should be
+verified before merge. You or a reviewer can provide that evidence. In the PR,
+state the Platform/vCluster/Kubernetes versions, relevant infrastructure and
+options, commands or steps tried, results, and gaps. Try basic cleanup where
+practical. Other configurations can remain explicitly unverified; do not claim
+support beyond the evidence.
 
-CI starts an ephemeral Platform and validates deployable Platform documents with
-strict server-side dry runs. To run that part against your own **test**
-installation, confirm your context and connect to its management API:
+In the README, keep a brief tested-environment statement so users know what to
+expect. Put change-specific test details in the PR rather than maintaining the
+same report twice. Distinguish static checks and admission dry runs from live
+results. You do not need GPUs or vendor accounts for every possible configuration;
+explain what access is missing so a reviewer can help.
 
-```bash
-vcluster platform connect management
-python3 hack/validate_stacks.py --server
-```
+## Review
 
-Server dry runs do not deploy Stacks or prove workloads work. CI executes
-contribution scripts without repository secrets on a fresh GitHub-hosted VM. Do not
-add steps that need production access or customer credentials.
+Maintainers review usability, correctness, operational effects, and the evidence
+for the documented path. The [review skill](.claude/skills/stack-review/SKILL.md)
+assists them; it does not approve or merge contributions. Missing optional sections,
+custom automation, or a broad test matrix alone are not reasons to reject a simple
+Community Stack.
 
-## Record test evidence
-
-For each relevant configuration, record the date, stack commit, Platform,
-vCluster and Kubernetes versions, infrastructure/node model, commands, result,
-and gaps. Put a tested-configuration summary in the README and results for the
-change in the PR. Distinguish static checks, Platform admission, and live tests.
-
-Test installation, functional readiness, parameter/dependency updates, failure
-recovery, and removal as appropriate. Cover supported destinations and optional
-branches; explain omitted hardware-dependent cases. An old test does not prove a
-changed configuration works.
-
-Certified integrations need a repeatable smoke-test procedure and success criteria
-agreed with maintainers and, when applicable, the partner. Automate it where
-practical. A generic CI runner need not provide GPUs or every vendor service;
-identify the environment and operator needed for those tests.
-
-## Review and maintenance
-
-Maintainers review the integration and its evidence after automated checks. The
-[stack-review skill](.claude/skills/stack-review/SKILL.md) assists with manifests,
-documentation, operational behavior, and test evidence. It does not merge, certify,
-or deploy contributions.
-
-Automatic review uses the base branch's guide and skill and reads PR files as
-text. Once enabled, it runs automatically for same-repository PRs authored by
-members, owners, or collaborators with write access. Fork and other external PRs
-need a maintainer to apply `stack-review-approved` for each new head commit. The
-label is consumed before a paid request; keeping a label on a PR never authorizes
-later pushes. Reviews are limited to one attempt per commit and five per PR.
-Missing credentials are reported in the job summary, not as a successful review.
-See [review setup](.github/REVIEW.md).
-
-Report bugs through [GitHub issues](https://github.com/loft-sh/vcluster-stacks/issues)
-with redacted configuration and reproduction steps, or use an integration's
-specific reporting route. Existing-stack documentation can adopt this outline
-incrementally; prioritize incorrect defaults, compatibility, verification, and
-cleanup instructions when editing a stack.
+Paid AI review is a maintainer tool, not a contributor prerequisite. Fork PRs need
+a maintainer's one-shot `stack-review-approved` label for the current head. Authors
+do not need an API key or to arrange AI review. See [review setup](.github/REVIEW.md)
+for maintainer configuration and request limits.
