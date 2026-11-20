@@ -15,26 +15,8 @@ on:
         type: string
   push:
     branches: [main]
-    paths:
-      - 'certified-stacks/run-ai/**'
-      - 'certified-stacks/nvidia-dynamo/**'
-      - 'certified-stacks/saturn/**'
-      - 'certified-stacks/nvidia-nvke-mgmt/**'
-      - 'community-stacks/openclaw/**'
-      - 'community-stacks/metered-inference/**'
-      - 'community-stacks/nvidia-gpu-operator/**'
-      - '.github/workflows/validate.yml'
   pull_request:
     branches: [main]
-    paths:
-      - 'certified-stacks/run-ai/**'
-      - 'certified-stacks/nvidia-dynamo/**'
-      - 'certified-stacks/saturn/**'
-      - 'certified-stacks/nvidia-nvke-mgmt/**'
-      - 'community-stacks/openclaw/**'
-      - 'community-stacks/metered-inference/**'
-      - 'community-stacks/nvidia-gpu-operator/**'
-      - '.github/workflows/validate.yml'
 
 permissions:
   contents: read
@@ -44,6 +26,24 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  contribution-standard:
+    name: Contribution standard
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Create validation environment
+        run: python3 -m venv .venv
+      - name: Install validation dependencies
+        run: .venv/bin/python -m pip install -r hack/requirements.txt
+      - name: Test validation and review tooling
+        run: .venv/bin/python -m unittest discover -s hack/tests -v
+      - name: Validate contribution structure and resources
+        run: .venv/bin/python hack/validate_stacks.py
   validate:
     name: Render and validate
     runs-on: large-8_32
@@ -75,20 +75,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes ripgrep python3-yaml
-      - name: Render Run:ai manifests
-        run: ./certified-stacks/run-ai/render.sh --check
-      - name: Check NVIDIA Dynamo manifests
-        run: ./certified-stacks/nvidia-dynamo/test-certified-manifests.sh
-      - name: Check Saturn Cloud Enterprise manifests
-        run: ./certified-stacks/saturn/test-certified-manifests.sh
-      - name: Check NVIDIA NVKE management plane manifests
-        run: ./certified-stacks/nvidia-nvke-mgmt/test-certified-manifests.sh
-      - name: Check OpenClaw manifests
-        run: ./community-stacks/openclaw/test-manifests.sh
-      - name: Check metered inference manifests
-        run: ./community-stacks/metered-inference/test-manifests.sh
-      - name: Check NVIDIA GPU Operator manifests
-        run: ./community-stacks/nvidia-gpu-operator/test-manifests.sh
+      - name: Run discovered integration checks
+        run: python3 hack/validate_stacks.py --run-checks
       - name: Start vCluster Platform
         env:
           # Fail inside the job's timeout so the diagnostics step below can run. Default is 10m.
@@ -134,48 +122,5 @@ jobs:
             kubectl logs -n "$namespace" "$pod" --all-containers --previous --tail=200 || true
             echo "::endgroup::"
           done < <(kubectl get pods -A -l app=loft -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name}{"\n"}{end}')
-      - name: Validate manifests
-        run: |
-          directories=(
-            certified-stacks/run-ai/dedicated-control-plane
-            certified-stacks/run-ai/central-control-plane
-            certified-stacks/nvidia-dynamo
-            certified-stacks/saturn
-            certified-stacks/nvidia-nvke-mgmt
-            community-stacks/openclaw
-            community-stacks/metered-inference
-            community-stacks/nvidia-gpu-operator
-          )
-          # NUL-separated *.yaml/*.yml files under $1 whose top-level documents are Platform
-          # objects (apiVersion <group>.loft.sh/...). Supporting plain Kubernetes manifests, such
-          # as a test model endpoint, are skipped: the management API does not serve core kinds.
-          platform_manifests() {
-            find "$1" -type f \( -name '*.yaml' -o -name '*.yml' \) -print0 | sort -z |
-              while IFS= read -r -d '' manifest; do
-                if grep -qE '^apiVersion: [a-z]+\.loft\.sh/' "$manifest"; then
-                  printf '%s\0' "$manifest"
-                else
-                  echo "Skip $manifest: no loft.sh object" >&2
-                fi
-              done
-          }
-          # The Platform seeds its bundled copy of these stacks asynchronously after the pod
-          # starts, with field manager "loft". A dry run that reaches a seeded object before
-          # seeding finishes would otherwise fail on field ownership, so take ownership of
-          # every field. The apply is a dry run and persists nothing; --validate=strict still
-          # rejects unknown or malformed fields.
-          for directory in "${directories[@]}"; do
-            while IFS= read -r -d '' manifest; do
-              echo "::group::Validate $manifest"
-              status=0
-              kubectl apply \
-                --server-side \
-                --dry-run=server \
-                --validate=strict \
-                --force-conflicts \
-                --request-timeout=30s \
-                --filename "$manifest" || status=$?
-              echo "::endgroup::"
-              [ "$status" -eq 0 ] || exit "$status"
-            done < <(platform_manifests "$directory")
-          done
+      - name: Validate discovered Platform documents
+        run: python3 hack/validate_stacks.py --server

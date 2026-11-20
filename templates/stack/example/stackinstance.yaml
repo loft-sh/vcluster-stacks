@@ -1,0 +1,20 @@
+# Apply template to an existing cluster.
+apiVersion: management.loft.sh/v1
+kind: StackInstance
+metadata:
+  name: starter-stack
+  namespace: p-my-project
+spec:
+  displayName: Starter Stack
+  # App tasks deploy as this user or team.
+  owner:
+    user: admin
+  destination:
+    virtualCluster:
+      name: development
+  templateRef:
+    name: starter-stack
+  parameters:
+    greeting: Hello from my first Stack
+  # Delete child AppInstances when tasks are removed.
+  prunePolicy: Prune

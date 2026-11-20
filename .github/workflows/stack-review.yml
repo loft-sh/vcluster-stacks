@@ -1,0 +1,33 @@
+name: Stack contribution review
+
+on:
+  # Trusted base-branch workflow and checkout only. PR data is read through the API
+  # as text; no head checkout, contribution scripts, artifacts, or model tools.
+  pull_request_target: # zizmor: ignore[dangerous-triggers] -- base SHA only; PR text is API data, never executed
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions: {}
+
+concurrency:
+  group: stack-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+      - name: Review contribution using trusted guidance
+        run: python3 hack/review_stack_pr.py
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          STACK_REVIEW_MODEL: ${{ vars.STACK_REVIEW_MODEL }}
