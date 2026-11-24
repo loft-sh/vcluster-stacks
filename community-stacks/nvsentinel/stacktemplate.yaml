@@ -286,12 +286,32 @@ spec:
           gpuOperatorNamespace: '{{ .Values.gpuOperatorNamespace }}'
           dcgmHost: '{{ .Values.dcgmHost }}'
           dcgmPort: '{{ .Values.dcgmPort }}'
+          # The selectors in effect: the parameter, or the pool label when it is empty. discover
+          # checks them and publishes them, and every other task takes them from its outputs. A
+          # selector that fails the check then never reaches a workload: the tasks keep the last
+          # one that passed.
           cpuNodeSelector: '{{ .Values.cpuNodeSelector | default (printf "workload.example.com/pool=%s" .Values.cpuNodePool) }}'
-          # Checked for key=value form only. Empty keeps the pool label, which needs no check.
-          gpuNodeSelector: '{{ .Values.gpuNodeSelector }}'
+          gpuNodeSelector: '{{ .Values.gpuNodeSelector | default "workload.example.com/pool=gpu-compute" }}'
+          # cordon needs cert-manager, for the MongoDB store's certificates. discover fails with
+          # that reason when it is missing.
+          requireCertManager: '{{ ne (toString .Values.cordon) "false" }}'
           # discover fails if the selector would strand a volume here. It reports, the Stack does not wait for it.
           pinnedVolumeNamespace: nvsentinel
       outputs:
+        - name: cpunodeselector
+          fromResource:
+            apiVersion: v1
+            kind: ConfigMap
+            namespace: nvsentinel-stack
+            name: nvsentinel-discovery
+            jsonPath: '{.data.cpuNodeSelector}'
+        - name: gpunodeselector
+          fromResource:
+            apiVersion: v1
+            kind: ConfigMap
+            namespace: nvsentinel-stack
+            name: nvsentinel-discovery
+            jsonPath: '{.data.gpuNodeSelector}'
         - name: mode
           fromResource:
             apiVersion: v1
@@ -360,14 +380,14 @@ spec:
         templateRef:
           name: nvsentinel-gate
         parameters:
-          cpuNodeSelector: '{{ .Values.cpuNodeSelector | default (printf "workload.example.com/pool=%s" .Values.cpuNodePool) }}'
+          cpuNodeSelector: '{{ .Outputs.discover.cpunodeselector }}'
           gateName: gpuready
           capacitySource: '{{ .Outputs.discover.capacitysource }}'
           capacityResource: '{{ .Outputs.discover.capacityresource }}'
           # Whole GPUs only. Ignored with allocatable.
           capacityDeviceType: gpu
           capacityMin: "1"
-          capacityNodeSelector: '{{ .Values.gpuNodeSelector | default "workload.example.com/pool=gpu-compute" }}'
+          capacityNodeSelector: '{{ .Outputs.discover.gpunodeselector }}'
           timeoutSeconds: "1380"
     # NVSentinel started against a DCGM host engine that is not serving reports
     # GpuDcgmConnectivityFailure. This gate waits for the DCGM DaemonSet to finish rolling out. It
@@ -383,7 +403,7 @@ spec:
         templateRef:
           name: nvsentinel-gate
         parameters:
-          cpuNodeSelector: '{{ .Values.cpuNodeSelector | default (printf "workload.example.com/pool=%s" .Values.cpuNodePool) }}'
+          cpuNodeSelector: '{{ .Outputs.discover.cpunodeselector }}'
           gateName: dcgmready
           waitEnabled: '{{ .Outputs.discover.dcgmwait }}'
           waitResource: 'daemonset/{{ .Outputs.discover.dcgmdaemonset }}'
@@ -395,7 +415,7 @@ spec:
           capacityResource: '{{ .Outputs.discover.capacityresource }}'
           capacityDeviceType: gpu
           capacityMin: "1"
-          capacityNodeSelector: '{{ .Values.gpuNodeSelector | default "workload.example.com/pool=gpu-compute" }}'
+          capacityNodeSelector: '{{ .Outputs.discover.gpunodeselector }}'
           timeoutSeconds: "780"
     # Always runs, and renders nothing unless Slinky drain is effectively on. The same expression
     # decides customDrain in the nvsentinel task, so the drain template it mounts always exists.
@@ -412,7 +432,7 @@ spec:
           version: '{{ .Values.version }}'
           slinkyNamespace: '{{ .Values.slinkyNamespace }}'
           cpuNodePool: '{{ .Values.cpuNodePool }}'
-          cpuNodeSelector: '{{ .Values.cpuNodeSelector }}'
+          cpuNodeSelector: '{{ .Outputs.discover.cpunodeselector }}'
     - name: nvsentinel
       dependsOn:
         - discover
@@ -426,8 +446,8 @@ spec:
           name: nvsentinel-nvsentinel
         parameters:
           cpuNodePool: '{{ .Values.cpuNodePool }}'
-          cpuNodeSelector: '{{ .Values.cpuNodeSelector }}'
-          gpuNodeSelector: '{{ .Values.gpuNodeSelector }}'
+          cpuNodeSelector: '{{ .Outputs.discover.cpunodeselector }}'
+          gpuNodeSelector: '{{ .Outputs.discover.gpunodeselector }}'
           version: '{{ .Values.version }}'
           project: '{{ .Values.argoProject }}'
           driverPreinstalled: '{{ .Values.driverPreinstalled | toString }}'

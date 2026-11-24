@@ -19,8 +19,11 @@
 # gpuOperatorNamespace. With an override the Stack no longer knows which DaemonSet serves it, so
 # the dcgmready gate skips its rollout wait (dcgmWait=false).
 #
-# The Job also checks both node selectors for key=value form, and that a changed CPU node selector
-# still reaches every volume in pinnedVolumeNamespace, where NVSentinel's MongoDB store lives.
+# The Job also checks what would otherwise fail later with no clear reason: both node selectors
+# for key=value form, that a changed CPU node selector still reaches every volume in
+# pinnedVolumeNamespace, where NVSentinel's MongoDB store lives, that cert-manager is installed
+# when requireCertManager is set, and that the GPU Operator's ClusterPolicy has DCGM enabled. It
+# publishes the selectors it checked, and the other tasks take them from its outputs.
 #
 # Same Job pattern as the readiness gate: `wait: true` holds the task until the Job completes, the
 # release owns the ConfigMap, and the Job adds only keys the release does not declare, so a Helm
@@ -59,10 +62,12 @@ spec:
 
       # Objects of a cluster-scoped kind. A kind whose CRD is not installed counts as 0; any other
       # error, such as missing RBAC, fails the Job instead of being mistaken for "none".
+      # stderr is kept apart: a warning on a successful list must not be counted as an object.
       count() {
-        if out=$(kubectl get "$1" -o name 2>&1); then
+        if out=$(kubectl get "$1" -o name 2>/tmp/count.err); then
           printf '%s\n' "$out" | grep -c . || true
         else
+          out=$(cat /tmp/count.err)
           case "$out" in
             *"doesn't have a resource type"*|*"could not find the requested resource"*) echo 0 ;;
             *) fail "could not list $1: $out" ;;
@@ -79,8 +84,23 @@ spec:
             || fail "$1 node selector '$2': '${pair}' is not a key=value label. Write a label with an empty value as key="
         done
       }
+      # Both selectors are published below only once they pass. The other tasks take them from this
+      # task's outputs, so a selector that fails here never reaches a workload.
       check_selector CPU "${CPU_NODE_SELECTOR}"
       check_selector GPU "${GPU_NODE_SELECTOR:-}"
+
+      # Fault quarantine keeps its state in MongoDB, whose TLS certificates come from cert-manager.
+      # Without cert-manager the certificates are never issued and NVSentinel never becomes healthy,
+      # with nothing saying why. Fail here instead, where the reason is in the Job log.
+      if [ "${REQUIRE_CERT_MANAGER}" = true ]; then
+        if ! out=$(kubectl get customresourcedefinition certificates.cert-manager.io -o name 2>&1); then
+          case "$out" in
+            *NotFound*|*"not found"*) fail "cordon is on, which needs cert-manager for NVSentinel's MongoDB certificates, but the cluster has no certificates.cert-manager.io CRD. Install cert-manager, or set cordon to false for monitoring only." ;;
+            *) fail "could not check for cert-manager: $out" ;;
+          esac
+        fi
+        log "cert-manager is installed"
+      fi
 
       # The CPU node selector places controllers, Jobs and NVSentinel's MongoDB. MongoDB's volume can
       # be pinned to a node or zone, and a StatefulSet replaces its pod before the new one can
@@ -179,21 +199,31 @@ spec:
         dcgm_wait=false
         log "DCGM endpoint ${dcgm_host} comes from the dcgmHost parameter; dcgmready will not wait for a DaemonSet"
       else
+        # The GPU Operator's Helm chart leaves the standalone DCGM host engine off by default. Without
+        # it there is no nvidia-dcgm DaemonSet or Service, and dcgmready would only time out.
+        if [ "$mode" = device-plugin ] && [ "$cp" -gt 0 ]; then
+          dcgm_enabled=$(kubectl get clusterpolicies.nvidia.com -o jsonpath='{.items[0].spec.dcgm.enabled}') \
+            || fail "could not read spec.dcgm.enabled from the ClusterPolicy"
+          if [ "$dcgm_enabled" = false ]; then
+            fail "the GPU Operator's ClusterPolicy has dcgm.enabled=false, so there is no nvidia-dcgm Service for NVSentinel to read from. Set dcgm.enabled=true on the GPU Operator, or set dcgmHost to the DCGM host engine you run."
+          fi
+        fi
         dcgm_host="${dcgm_daemonset}.${GPU_OPERATOR_NAMESPACE}.svc"
         dcgm_wait=true
       fi
 
       kubectl -n "$CONTRACT_NAMESPACE" patch configmap "$CONTRACT_NAME" --type merge -p "$(printf \
-        '{"data":{"mode":"%s","source":"%s","dcgmHost":"%s","dcgmPort":"%s","dcgmDaemonSet":"%s","dcgmNamespace":"%s","dcgmWait":"%s","capacitySource":"%s","capacityResource":"%s","discoveredAt":"%s"}}' \
+        '{"data":{"mode":"%s","source":"%s","dcgmHost":"%s","dcgmPort":"%s","dcgmDaemonSet":"%s","dcgmNamespace":"%s","dcgmWait":"%s","capacitySource":"%s","capacityResource":"%s","cpuNodeSelector":"%s","gpuNodeSelector":"%s","discoveredAt":"%s"}}' \
         "$mode" "$source" "$dcgm_host" "$DCGM_PORT" "$dcgm_daemonset" "$GPU_OPERATOR_NAMESPACE" "$dcgm_wait" \
-        "$capacity_source" "$capacity_resource" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')")" >/dev/null \
+        "$capacity_source" "$capacity_resource" "$CPU_NODE_SELECTOR" "${GPU_NODE_SELECTOR:-}" \
+        "$(date -u '+%Y-%m-%dT%H:%M:%SZ')")" >/dev/null \
         || fail "could not record the result in configmap ${CONTRACT_NAMESPACE}/${CONTRACT_NAME}"
       log "gpuDriverMode=${mode} (${source}), DCGM at ${dcgm_host}:${DCGM_PORT}"
       {{- end -}}
 
       {{- $requested := .Values.gpuDriverMode | default "auto" -}}
       {{- /* A Job spec is immutable. Changing any setting, or the script, names a new Job, which also decides again. */ -}}
-      {{- $hash := printf "%s|%s|%s|%s|%s|%s|%s|%s" $requested (.Values.cpuNodeSelector | default "") (.Values.gpuNodeSelector | default "") (.Values.pinnedVolumeNamespace | default "") (.Values.gpuOperatorNamespace | default "gpu-operator") (.Values.dcgmHost | default "") (.Values.dcgmPort | default "5555" | toString) (include "discover.script" . | sha256sum) | sha256sum | trunc 8 -}}
+      {{- $hash := printf "%s|%s|%s|%s|%s|%s|%s|%s|%s" $requested (.Values.cpuNodeSelector | default "") (.Values.gpuNodeSelector | default "") (.Values.pinnedVolumeNamespace | default "") (.Values.gpuOperatorNamespace | default "gpu-operator") (.Values.dcgmHost | default "") (.Values.dcgmPort | default "5555" | toString) (.Values.requireCertManager | default "false" | toString) (include "discover.script" . | sha256sum) | sha256sum | trunc 8 -}}
       # The Job adds the decision to this ConfigMap. `kubectl -n nvsentinel-stack get cm nvsentinel-discovery -o yaml`
       # shows what was decided and why.
       apiVersion: v1
@@ -251,6 +281,11 @@ spec:
         - apiGroups: ["nvidia.com"]
           resources: ["clusterpolicies", "gpuclusters"]
           verbs: ["get", "list"]
+        # The cert-manager check.
+        - apiGroups: ["apiextensions.k8s.io"]
+          resources: ["customresourcedefinitions"]
+          resourceNames: ["certificates.cert-manager.io"]
+          verbs: ["get"]
         # The CPU node selector check: nodes it matches, and the volumes it must still reach.
         - apiGroups: [""]
           resources: ["nodes", "persistentvolumes", "persistentvolumeclaims"]
@@ -293,7 +328,7 @@ spec:
               {{- range splitList "," . }}
               {{- if trim . }}
               {{- $kv := splitn "=" 2 (trim .) }}
-              {{ $kv._0 }}: {{ $kv._1 | default "" | quote }}
+              {{ $kv._0 | quote }}: {{ $kv._1 | default "" | quote }}
               {{- end }}
               {{- end }}
             {{- end }}
@@ -330,6 +365,8 @@ spec:
                     value: {{ .Values.dcgmHost | default "" | quote }}
                   - name: DCGM_PORT
                     value: {{ .Values.dcgmPort | default "5555" | toString | quote }}
+                  - name: REQUIRE_CERT_MANAGER
+                    value: {{ .Values.requireCertManager | default "false" | toString | quote }}
                   - name: CPU_NODE_SELECTOR
                     value: {{ .Values.cpuNodeSelector | default "" | quote }}
                   - name: GPU_NODE_SELECTOR
@@ -372,6 +409,11 @@ spec:
       label: DCGM port
       type: string
       defaultValue: '5555'
+    - variable: requireCertManager
+      label: Require cert-manager
+      description: Fail unless the cluster has cert-manager's Certificate CRD. The Stack sets it when cordon is on.
+      type: boolean
+      defaultValue: 'false'
     - variable: cpuNodeSelector
       label: CPU node selector
       description: Optional comma-separated key=value labels for the node that runs the Job.

@@ -9,7 +9,10 @@
 #
 # Upstream ships the plugin only as kustomize manifests (plugins/slinky-drainer/config/default in
 # NVIDIA/NVSentinel), so they are copied here from the tag in `version`. Re-sync them on a version
-# bump. The image is published by the same release pipeline, so one version pins both.
+# bump, then update the tag below, which the checks compare with the `version` default. The image is
+# published by the same release pipeline, so one version pins both.
+#
+# manifests copied from: v1.32.0
 #
 # One deliberate difference from upstream, to keep on a re-sync: upstream grants the controller its
 # pod permissions cluster-wide. It only reads and deletes pods in slinkyNamespace, so here they are
@@ -327,7 +330,7 @@ spec:
             serviceAccountName: slinky-drainer
             nodeSelector:
               {{- range $k, $v := $cpuNodeSelector }}
-              {{ $k }}: {{ $v | quote }}
+              {{ $k | quote }}: {{ $v | quote }}
               {{- end }}
             securityContext:
               runAsNonRoot: true

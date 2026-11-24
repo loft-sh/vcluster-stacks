@@ -273,7 +273,7 @@ spec:
                 enabled: false
               nodeSelector:
                 {{- range $k, $v := $gpuNodeSelector }}
-                {{ $k }}: {{ $v | quote }}
+                {{ $k | quote }}: {{ $v | quote }}
                 {{- end }}
               tolerations:
               - key: nvidia.com/gpu
@@ -281,7 +281,7 @@ spec:
                 effect: NoSchedule
               systemNodeSelector:
                 {{- range $k, $v := $cpuNodeSelector }}
-                {{ $k }}: {{ $v | quote }}
+                {{ $k | quote }}: {{ $v | quote }}
                 {{- end }}
               systemNodeTolerations: []
             networkPolicy:
@@ -401,7 +401,7 @@ spec:
                 # Also places the MongoDB setup Jobs.
                 nodeSelector:
                   {{- range $k, $v := $cpuNodeSelector }}
-                  {{ $k }}: {{ $v | quote }}
+                  {{ $k | quote }}: {{ $v | quote }}
                   {{- end }}
                 persistence:
                   size: 10Gi
@@ -416,7 +416,7 @@ spec:
                     nodeSelectorTerms:
                     - matchExpressions:
                       {{- range $k, $v := $gpuLabels }}
-                      - key: {{ $k }}
+                      - key: {{ $k | quote }}
                         operator: In
                         values:
                         - {{ $v | quote }}
@@ -424,7 +424,7 @@ spec:
             nodeConditionCleanup:
               nodeSelector:
                 {{- range $k, $v := $cpuNodeSelector }}
-                {{ $k }}: {{ $v | quote }}
+                {{ $k | quote }}: {{ $v | quote }}
                 {{- end }}
               tolerations: []
       syncPolicy:

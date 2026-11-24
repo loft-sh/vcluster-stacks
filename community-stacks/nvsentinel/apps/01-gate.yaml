@@ -272,7 +272,7 @@ spec:
               {{- range splitList "," . }}
               {{- if trim . }}
               {{- $kv := splitn "=" 2 (trim .) }}
-              {{ $kv._0 }}: {{ $kv._1 | default "" | quote }}
+              {{ $kv._0 | quote }}: {{ $kv._1 | default "" | quote }}
               {{- end }}
               {{- end }}
             {{- end }}

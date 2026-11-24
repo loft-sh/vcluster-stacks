@@ -139,6 +139,10 @@ Both selectors take `key=value` pairs only, and `discover` fails on anything els
 as `foo.acme.corp/gpu-node` is rejected, because the pod node selectors built from it would match
 only an empty label value. For a label that has an empty value, write `foo.acme.corp/gpu-node=`.
 
+`discover` also publishes the selectors it checked, and every other task takes them from there.
+A selector that fails the check never reaches a workload: the tasks keep the last one that
+passed, and the Stack reports the failed `discover` task.
+
 See [Change the CPU node selector](#change-the-cpu-node-selector) before you change it on a
 running Stack.
 
@@ -148,8 +152,10 @@ running Stack.
 - An Argo CD connector in the Platform, the Argo CD integration enabled on the cluster, and an
   Argo CD project that permits the chart source `oci://ghcr.io/nvidia/nvsentinel` and the
   destination namespace `nvsentinel`.
-- The NVIDIA GPU Operator in the cluster, with DCGM enabled and at least one GPU node. See
-  [GPU driver mode](#gpu-driver-mode) for installing both at the same time.
+- The NVIDIA GPU Operator in the cluster, with at least one GPU node and its standalone DCGM
+  host engine enabled (`dcgm.enabled=true`). The GPU Operator's Helm chart leaves that off by
+  default; the NVIDIA GPU Operator Stack turns it on. Without it, set `dcgmHost` to a DCGM you
+  run yourself. See [GPU driver mode](#gpu-driver-mode) for installing both at the same time.
 - CPU and GPU workers that match the [node selectors](#node-placement).
 - cert-manager in the cluster, unless `cordon` is `false`. The Stack does not install it. See
   [Fault handling](#fault-handling).
@@ -194,8 +200,10 @@ uncordons the node, unless its [circuit breaker](#circuit-breaker) has tripped.
 
 Quarantine needs NVSentinel's MongoDB store, and the store gets its TLS certificates from
 cert-manager. So with `cordon: true`, which is the default, **cert-manager must already
-run in the cluster**. Without it the MongoDB certificates are never issued and the `nvsentinel`
-task does not become healthy. The Stack does not install cert-manager.
+run in the cluster**. Without it the MongoDB certificates are never issued and NVSentinel does
+not become healthy. The Stack does not install cert-manager. With `cordon` on, `discover` looks
+for cert-manager's `Certificate` CRD and fails with that reason when it is missing, before
+anything else installs.
 
 The MongoDB store and fault quarantine run on the CPU pool. Each MongoDB replica requests 1 CPU
 and 1.5Gi, and fault quarantine 250m. One replica fits the recommended 4 cpu / 8Gi CPU worker.
@@ -539,7 +547,8 @@ kubectl get namespace nvsentinel -L resource.kubernetes.io/admin-access
 
 - **Chart version.** Change `version`. Argo CD upgrades the release in place. Renovate tracks the
   default in this directory. The Slinky drainer's manifests are a copy of upstream's, so a version
-  bump also needs them re-synced, see [Known limitations](#known-limitations).
+  bump also needs them re-synced. The checks fail a bump until the `manifests copied from` line in
+  [apps/02-slinky-drainer.yaml](apps/02-slinky-drainer.yaml) matches the new version.
 - **Fault handling parameters.** Changing them reconfigures NVSentinel in place. Turning `cordon`
   on later adds MongoDB, and needs cert-manager. Read
   [Turn fault handling off](#turn-fault-handling-off) before turning it off.
@@ -644,14 +653,29 @@ kubectl delete apps,argocdapplicationtemplates,stacktemplates -l app.kubernetes.
 - The gates are one-shot. They hold NVSentinel's first start, and do not notice a DCGM that goes
   away later. NVSentinel reports that itself, as `GpuDcgmConnectivityFailure`.
 - With `dcgmHost` set, nothing waits for DCGM before NVSentinel starts.
+- `discover` checks that cert-manager's CRD exists, not that cert-manager works. It checks that
+  DCGM is enabled only in device-plugin mode, from the `ClusterPolicy`; in DRA mode a missing
+  DCGM shows as `dcgmready` timing out.
+- A Stack cannot declare that it depends on another one. When `discover` fails because the GPU
+  Operator or cert-manager is not there yet, fix the cluster and run the task again, as described
+  under [Troubleshooting](#troubleshooting).
 - The namespaces `nvsentinel` and `nvsentinel-stack` are fixed in the templates.
 - The gate App is a copy of the NVIDIA GPU Operator Stack's. A fix to one has to be made in both;
-  the checks fail when the two check scripts differ.
+  the checks fail when the two Apps differ in anything but their names.
 - In DRA mode, the `gpuready` count includes every ResourceSlice of the `gpu.nvidia.com` driver.
   While the driver republishes a pool, an old slice can briefly be counted alongside the new one.
 
 ## Troubleshooting
 
+- **`discover` failed, and you have fixed the cause.** The task has to run again. Whether the
+  Platform retries a failed task by itself has not been verified for this Stack. A parameter
+  change that reaches `discover` always does it, because it names a new Job: for example, set
+  `gpuDriverMode` from `auto` to the mode the cluster runs.
+- **`discover` failed with "Install cert-manager, or set cordon to false".** `cordon` is on and
+  the cluster has no cert-manager. Install it, or set `cordon: "false"` for monitoring only.
+- **`discover` failed with "has dcgm.enabled=false".** The GPU Operator runs without its
+  standalone DCGM host engine, the Helm chart's default. Set `dcgm.enabled=true` on the GPU
+  Operator, or set `dcgmHost` to a DCGM you run.
 - **`discover` failed with "there is no GPU Operator to follow".** `gpuDriverMode` is `auto` and
   the cluster has neither a `ClusterPolicy` nor a `GPUCluster`. Install the GPU Operator first, or
   set `gpuDriverMode` to the mode it will run in.
@@ -713,9 +737,11 @@ From the repository root, run the static checks (bash 4 or later, python3 with P
 ./community-stacks/nvsentinel/test-manifests.sh
 ```
 
-The checks render the graph five times: with the default parameters, with a variant that takes
-the other branch of most conditionals, with both of those in DRA mode, and with reboot
-remediation behind a `dcgmHost` override. They render StackTemplate tasks and the
+They pull the NVSentinel chart from `ghcr.io`. Pass `--offline` to skip that part.
+
+The checks render the graph six times: with the default parameters, with a variant that takes
+the other branch of most conditionals, with both of those in DRA mode, with reboot remediation
+behind a `dcgmHost` override, and with remediation and Slinky drain requested while drain is off. They render StackTemplate tasks and the
 ArgoCDApplicationTemplate with Helm's template engine. They render each App's manifests as the
 chart the Platform builds, with only the parameters the task passes. They assert:
 
@@ -730,15 +756,22 @@ chart the Platform builds, with only the parameters the task passes. They assert
 - Only `discover` reads `gpuDriverMode`. Every other mode-dependent task takes
   `.Outputs.discover.mode`. `discover`'s outputs read keys its Job writes and its release does not
   declare.
-- `discover` runs against a fake `kubectl`. It resolves `auto` from a `ClusterPolicy` or a
-  `GPUCluster`, fails with neither and with both, and publishes the DCGM Service in
-  `gpuOperatorNamespace` on `dcgmPort`, or `dcgmHost` with the rollout wait off. Its volume check
-  passes for a volume a matching node can reach and with no volumes, and fails for a stranded
-  volume. It fails on a bare key in either selector.
+- `discover` runs against a fake `kubectl`, and what it publishes is read back from its patch.
+  It resolves `auto` from a `ClusterPolicy` or a `GPUCluster`, fails with neither and with both,
+  and publishes the names of the resolved mode and the DCGM Service in `gpuOperatorNamespace` on
+  `dcgmPort`, or `dcgmHost` with the rollout wait off. A CRD that is not installed counts as no
+  objects, a warning on a successful list is not counted as an object, and any other error fails
+  the Job. Its volume check passes for a volume a matching node can reach, with no volumes, and
+  for a volume whose affinity it cannot evaluate, and fails for a stranded volume. It fails on a
+  bare key in either selector, on a missing cert-manager when `cordon` is on, and on a
+  `ClusterPolicy` with DCGM off unless `dcgmHost` is set. A failure publishes nothing.
+- Every task except `discover` takes the node selectors from `discover`'s outputs, not from the
+  parameters, so it only ever gets a selector `discover` has checked.
 - `discover` and the gates run the Platform image on the CPU node selector. Both gates count one
   GPU on the GPU node selector, from the source the mode uses. `dcgmready` waits for the mode's
   DaemonSet in `gpuOperatorNamespace`, and for nothing when `dcgmHost` is set.
-- The gate's check script is identical to the NVIDIA GPU Operator Stack's.
+- The gate App is identical to the NVIDIA GPU Operator Stack's, names aside. That Stack's checks
+  run the gate's capacity count.
 - The gate and `discover` Job names change with the selectors and with `gpuOperatorNamespace`.
 - NVSentinel's DCGM endpoint is what `discover` resolved. Its CPU components carry the CPU node
   selector, and its GPU agents and `platformConnector` affinity the GPU node selector.
@@ -757,6 +790,12 @@ chart the Platform builds, with only the parameters the task passes. They assert
   runs the `version` image on the CPU node selector and watches `slinkyNamespace`, its drain
   template is left for the node drainer to render, and `customDrain` names the ConfigMap, CRD and
   completion condition the App deploys, with a non-empty node selector.
+- The Slinky drainer's Role and RoleBinding for pods sit in `slinkyNamespace`, grant get, list,
+  watch and delete, and bind the controller's ServiceAccount. Its `manifests copied from` line
+  matches the `version` default.
+- With drain off, remediation, Janitor and the Slinky drainer stay off whatever `remediation`
+  and `slinkyDrain` say.
+- The NVSentinel chart itself renders with each variant's values.
 - The example sets `prunePolicy: Prune`.
 
 The NVIDIA GPU Operator Stack's checks cover its cluster template, which deploys this Stack. CI
@@ -764,9 +803,16 @@ also runs a server-side dry run of every manifest against vCluster Platform.
 
 ### Tested
 
-This Stack has not run on a cluster as a Stack of its own. The `discover` task's detection, the
-`gpuOperatorNamespace` and `dcgmHost` parameters, a GPU Operator installed outside the NVIDIA GPU
-Operator Stack, and removal are covered by the static checks only.
+This Stack has not run on a cluster as a Stack of its own. These are covered by the static
+checks only:
+
+- The `discover` task against a real cluster: mode detection, the cert-manager and DCGM checks,
+  and the `gpuOperatorNamespace` and `dcgmHost` parameters.
+- A GPU Operator installed outside the NVIDIA GPU Operator Stack.
+- Drain in each drain mode, Slinky drain, and `reboot` and `gpu-reset` remediation, as this Stack
+  wires them: the renamed parameters, the `slinky-drainer` task and its ordering before
+  `nvsentinel`.
+- Removal.
 
 Its NVSentinel configuration was tested while it was still part of the NVIDIA GPU Operator Stack,
 on a vCluster 0.37.6 cluster with private nodes on GCE (Kubernetes 1.36.6, vCluster Platform

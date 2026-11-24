@@ -9,6 +9,8 @@
 # ArgoCDApplicationTemplate or App. App manifests are rendered as the Helm chart the Platform
 # builds from them.
 #
+# Pass --offline to skip rendering the upstream NVSentinel chart, which needs the network.
+#
 # Needs bash >= 4, python3 with PyYAML and helm. Exits 1 on failures, 2 on a missing prerequisite.
 set -euo pipefail
 
@@ -29,7 +31,7 @@ fi
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
-python3 - "$root" "$work" <<'CHECKS'
+python3 - "$root" "$work" "$@" <<'CHECKS'
 import copy
 import json
 import re
@@ -40,6 +42,7 @@ from pathlib import Path
 import yaml
 
 root, work = Path(sys.argv[1]), Path(sys.argv[2])
+offline = "--offline" in sys.argv[3:]
 errors = []
 
 PREFIX = "nvsentinel"
@@ -64,7 +67,8 @@ DISCOVER_FACTS = {
     "dra": {"mode": "dra", "dcgmDaemonSet": "nvidia-dcgm-dra",
             "capacitySource": "resourceslices", "capacityResource": "gpu.nvidia.com"},
 }
-DISCOVER_KEYS = set(DISCOVER_FACTS["dra"]) | {"dcgmHost", "dcgmPort", "dcgmNamespace", "dcgmWait", "source", "discoveredAt"}
+DISCOVER_KEYS = set(DISCOVER_FACTS["dra"]) | {"dcgmHost", "dcgmPort", "dcgmNamespace", "dcgmWait", "cpuNodeSelector",
+                                              "gpuNodeSelector", "source", "discoveredAt"}
 
 
 def discover_facts(mode, values):
@@ -75,6 +79,9 @@ def discover_facts(mode, values):
     facts["dcgmHost"] = override or f"{facts['dcgmDaemonSet']}.{facts['dcgmNamespace']}.svc"
     facts["dcgmPort"] = str(values["dcgmPort"])
     facts["dcgmWait"] = "false" if override else "true"
+    # discover publishes the selectors it checked, exactly as it received them.
+    facts["cpuNodeSelector"] = cpu_selector_raw(values)
+    facts["gpuNodeSelector"] = gpu_selector_raw(values)
     return facts
 
 
@@ -240,16 +247,19 @@ def defaults(params):
     return {v: p["defaultValue"] for v, p in params.items() if "defaultValue" in p}
 
 
-def cpu_selector(values):
-    """The CPU node selector every CPU workload must carry: cpuNodeSelector, or the pool label."""
-    raw = str(values.get("cpuNodeSelector") or "") or f"workload.example.com/pool={values['cpuNodePool']}"
-    return dict(p.strip().split("=", 1) for p in raw.split(",") if p.strip())
+def parse_selector(raw):
+    """Comma-separated key=value labels as a dict."""
+    return dict(p.strip().split("=", 1) for p in str(raw or "").split(",") if p.strip())
 
 
-def gpu_selector(values):
-    """The GPU node selector every GPU workload must carry: gpuNodeSelector, or the GPU pool label."""
-    raw = str(values.get("gpuNodeSelector") or "") or "workload.example.com/pool=gpu-compute"
-    return dict(p.strip().split("=", 1) for p in raw.split(",") if p.strip())
+def cpu_selector_raw(values):
+    """The CPU node selector in effect, as the Stack hands it to discover: cpuNodeSelector, or the pool label."""
+    return str(values.get("cpuNodeSelector") or "") or f"workload.example.com/pool={values['cpuNodePool']}"
+
+
+def gpu_selector_raw(values):
+    """The GPU node selector in effect: gpuNodeSelector, or the GPU pool label."""
+    return str(values.get("gpuNodeSelector") or "") or "workload.example.com/pool=gpu-compute"
 
 
 def check_refs(where, node, declared, extra_ok=()):
@@ -317,14 +327,29 @@ for mode, facts in DISCOVER_FACTS.items():
         if value not in discover_manifests:
             fail(f"apps/: {DISCOVER} never writes {key}={value!r} for {mode}; the test's DISCOVER_FACTS and the Job disagree")
 
-# The gate is a copy of the nvidia-gpu-operator Stack's gate, so either Stack installs alone. The
-# check script must stay the same in both.
+# The gate is a copy of the nvidia-gpu-operator Stack's gate, so either Stack installs alone.
+# Apart from the names, the two Apps must be the same: a fix to one belongs in both.
 gpu_gate_path = root.parent.parent / GPU_STACK_GATE
 if gpu_gate_path.exists() and gate_doc:
-    script = lambda text: text[text.index('{{- define "gate.check" -}}'):text.index("{{- end -}}", text.index('{{- define "gate.check" -}}'))]
-    theirs = (load(gpu_gate_path) or [{}])[0].get("spec", {}).get("config", {}).get("manifests", "")
-    if script(theirs) != script(gate_doc["doc"]["spec"]["config"]["manifests"]):
-        fail(f"apps/: the gate check script differs from {GPU_STACK_GATE}; keep the two copies in step")
+    theirs = copy.deepcopy((load(gpu_gate_path) or [{}])[0].get("spec") or {})
+    ours = copy.deepcopy(gate_doc["doc"]["spec"])
+    for spec_, name_, display in ((theirs, "nvidia-gpu-operator-gate", "NVIDIA GPU Stack - Readiness Gate"),
+                                  (ours, GATE, "NVSentinel - Readiness Gate")):
+        spec_["config"]["manifests"] = spec_["config"]["manifests"].replace(name_, "GATE")
+        if spec_.pop("displayName", None) != display:
+            fail(f"apps/: unexpected gate displayName in {name_}")
+        spec_.pop("defaultNamespace", None)
+    for key in sorted(set(theirs) | set(ours)):
+        if theirs.get(key) != ours.get(key):
+            fail(f"apps/: the gate App's spec.{key} differs from {GPU_STACK_GATE}; keep the two copies in step")
+
+# The Slinky drainer's manifests are a copy of upstream's at one tag. A version bump without a
+# re-sync would run a new image against the old CRD and RBAC.
+slinky_text = apps.get(SLINKY, {}).get("path").read_text() if SLINKY in apps else ""
+copied = re.search(r"^# manifests copied from: (\S+)$", slinky_text, flags=re.M)
+slinky_version = defaults(apps.get(SLINKY, {}).get("params", {})).get("version")
+if not copied or copied.group(1) != slinky_version:
+    fail(f"apps/: {SLINKY} pins version {slinky_version!r}, but its manifests were copied from {copied.group(1) if copied else None!r}; re-sync them from upstream and update the 'manifests copied from' line")
 
 # --- StackTemplate -------------------------------------------------------------------------------
 st_path = root / "stacktemplate.yaml"
@@ -393,6 +418,21 @@ for name in ("nvsentinel",):
 if "slinky-drainer" in tasks and "slinky-drainer" not in ancestors("nvsentinel"):
     fail("stacktemplate.yaml task nvsentinel: must depend on slinky-drainer; node-drainer mounts its drain template")
 
+# discover checks the node selectors and publishes them. A task that read the parameter itself
+# would deploy a selector discover rejected, because a running Stack re-syncs changed tasks without
+# waiting for discover.
+for name, task in tasks.items():
+    if name == "discover":
+        continue
+    passed = (task.get("app") or task.get("argoCDApplication") or {}).get("parameters") or {}
+    for param in ("cpuNodeSelector", "gpuNodeSelector", "capacityNodeSelector"):
+        value = str(passed.get(param, ""))
+        if param in passed and (".Values." in value or ".Outputs." not in value):
+            fail(f"stacktemplate.yaml task {name}: {param} must come from a task output, not from a parameter: {value!r}")
+passed = (tasks.get("nvsentinel", {}).get("argoCDApplication") or {}).get("parameters") or {}
+if not {"cpuNodeSelector", "gpuNodeSelector"} <= set(passed):
+    fail("stacktemplate.yaml task nvsentinel: must pass cpuNodeSelector and gpuNodeSelector from discover's outputs")
+
 # A rollout wait on a DaemonSet that schedules no pods yet passes at once, so dcgmready must
 # follow gpuready, which proves a GPU node is there.
 if "dcgmready" in tasks and "gpuready" not in ancestors("dcgmready"):
@@ -452,6 +492,10 @@ VARIANTS = {
                   "cpuNodeSelector": "foo.acme.corp/cpu-node=true, tier=services",
                   "gpuNodeSelector": "foo.acme.corp/gpu-node=true, tier=gpu"},
     "dra": {"gpuDriverMode": "dra"},
+    # Remediation and Slinky drain both act on drained nodes. With drain off they must stay off,
+    # or a node could be rebooted with its pods still on it.
+    "cordon-remediate-no-drain": {"gpuDriverMode": "device-plugin", "cordon": "true", "drain": "false",
+                                  "remediation": "reboot", "slinkyDrain": "true"},
     "reboot": {"gpuDriverMode": "device-plugin", "drain": "true", "remediation": "reboot",
                "drainMode": "AllowCompletion", "dcgmHost": "dcgm.monitoring.svc"},
     "dra-alternate": {"gpuDriverMode": "dra", "driverPreinstalled": "true",
@@ -467,15 +511,16 @@ VARIANTS = {
                       "cpuNodeSelector": "foo.acme.corp/cpu-node=true",
                       "gpuNodeSelector": "foo.acme.corp/gpu-node=true"},
 }
+chart_runs = []
 for variant, overrides in VARIANTS.items():
     values = {**defaults(stack_params), **overrides}
     on = lambda k: str(values[k]) == "true"
     slinky = on("cordon") and on("drain") and on("slinkyDrain")
-    cpu_sel = cpu_selector(values)
+    cpu_sel = parse_selector(cpu_selector_raw(values))
     cpu_pod_sel = {"kubernetes.io/os": "linux", **cpu_sel}
-    gpu_sel = gpu_selector(values)
+    gpu_sel = parse_selector(gpu_selector_raw(values))
     gpu_pod_sel = {"kubernetes.io/os": "linux", **gpu_sel}
-    parse_sel = lambda raw: dict(p.strip().split("=", 1) for p in (raw or "").split(",") if p.strip())
+    parse_sel = parse_selector
     # The variants name the mode: auto needs a cluster, and is exercised against a fake kubectl below.
     mode = values["gpuDriverMode"]
     dra = mode == "dra"
@@ -545,6 +590,8 @@ for variant, overrides in VARIANTS.items():
                 fail(f"{ref} for {where}: rendered Helm values are not YAML: {e}")
                 continue
             rendered[name] = {"ref": ref, "values": hv, "syncPolicy": spec_r["spec"].get("syncPolicy") or {}}
+            if name == "nvsentinel":
+                chart_runs.append((variant, spec_r["spec"]["source"], hv))
 
         if name == "discover" and name in rendered:
             cms = [d for d in rendered[name]["docs"] if d.get("kind") == "ConfigMap"]
@@ -561,8 +608,10 @@ for variant, overrides in VARIANTS.items():
             if dict(p.strip().split("=", 1) for p in env.get("CPU_NODE_SELECTOR", "").split(",") if p.strip()) != cpu_sel \
                     or env.get("PINNED_VOLUME_NAMESPACE") != "nvsentinel":
                 fail(f"{where}: the guard gets CPU_NODE_SELECTOR={env.get('CPU_NODE_SELECTOR')!r} PINNED_VOLUME_NAMESPACE={env.get('PINNED_VOLUME_NAMESPACE')!r}; expected the CPU node selector and nvsentinel")
-            if env.get("GPU_NODE_SELECTOR", "") != str(values.get("gpuNodeSelector") or ""):
-                fail(f"{where}: the selector check gets GPU_NODE_SELECTOR={env.get('GPU_NODE_SELECTOR')!r}; expected gpuNodeSelector as given")
+            if parse_sel(env.get("GPU_NODE_SELECTOR")) != gpu_sel:
+                fail(f"{where}: the selector check gets GPU_NODE_SELECTOR={env.get('GPU_NODE_SELECTOR')!r}; expected the GPU node selector {gpu_sel}")
+            if env.get("REQUIRE_CERT_MANAGER") != str(values["cordon"]):
+                fail(f"{where}: REQUIRE_CERT_MANAGER={env.get('REQUIRE_CERT_MANAGER')!r} with cordon={values['cordon']}; cordon is what needs cert-manager")
             if env.get("REQUESTED_MODE") != values["gpuDriverMode"]:
                 fail(f"{where}: the Job does not receive gpuDriverMode={values['gpuDriverMode']}")
             got = (env.get("GPU_OPERATOR_NAMESPACE"), env.get("DCGM_HOST"), env.get("DCGM_PORT"))
@@ -707,6 +756,20 @@ for variant, overrides in VARIANTS.items():
                     fail(f"{where}: does not watch slinkyNamespace={values['slinkyNamespace']}")
                 if dep["spec"]["template"]["spec"].get("nodeSelector") != cpu_pod_sel:
                     fail(f"{where}: the controller is not on the CPU services pool")
+                # The controller reads and deletes the Slurm worker pods, through a Role in their
+                # namespace. In the wrong namespace, or short a verb, a drain never completes.
+                role = docs.get(("Role", "slinky-drainer-pods")) or {}
+                binding = docs.get(("RoleBinding", "slinky-drainer-pods")) or {}
+                account = dep["spec"]["template"]["spec"].get("serviceAccountName")
+                pod_verbs = {v for r in role.get("rules") or [] if "pods" in r.get("resources", []) and "" in r.get("apiGroups", [])
+                             for v in r.get("verbs", [])}
+                if (role.get("metadata") or {}).get("namespace") != values["slinkyNamespace"] or not {"get", "list", "watch", "delete"} <= pod_verbs:
+                    fail(f"{where}: Role slinky-drainer-pods must grant get, list, watch and delete on pods in slinkyNamespace={values['slinkyNamespace']}; found namespace {(role.get('metadata') or {}).get('namespace')!r} and verbs {sorted(pod_verbs)}")
+                subjects = [(x.get("kind"), x.get("name"), x.get("namespace")) for x in binding.get("subjects") or []]
+                if (binding.get("metadata") or {}).get("namespace") != values["slinkyNamespace"] \
+                        or (binding.get("roleRef") or {}).get("name") != "slinky-drainer-pods" \
+                        or ("ServiceAccount", account, "nvsentinel") not in subjects:
+                    fail(f"{where}: RoleBinding slinky-drainer-pods must bind the Role to the controller's ServiceAccount {account!r} in slinkyNamespace; found {subjects}")
     if "nvsentinel" in rendered:
         nd = rendered["nvsentinel"]["values"].get("node-drainer") or {}
         cd = nd.get("customDrain") or {}
@@ -762,17 +825,57 @@ for ns in ("gpu-operator", "nvidia-system"):
 if names[0] == names[1]:
     fail(f"apps/: {DISCOVER} keeps Job name {names[0]} when gpuOperatorNamespace changes; it would not decide again")
 
-# Run the discover script against a fake kubectl. The fake lists FAKE_CP ClusterPolicies and FAKE_GC
-# GPUClusters, one PVC in nvsentinel when FAKE_PV is set, gives its PV the node affinity
-# FAKE_TERMS, reports a node only for the exact selector FAKE_MATCH, and prints the patch it is
-# asked to make, which stands in for the ConfigMap.
+# The values above are checked against what this file expects, not against the chart. Render the
+# NVSentinel chart itself with each variant's values, so a values key a chart version renamed or
+# rejects fails here and not when Argo CD syncs.
+charts_rendered = 0
+if not offline and chart_runs:
+    source = chart_runs[0][1]
+    chart_dir = work / "upstream-chart"
+    r = subprocess.run(["helm", "pull", f"{source['repoURL']}/{source['chart']}" if not source["repoURL"].endswith(source["chart"]) else source["repoURL"],
+                        "--version", str(source["targetRevision"]), "--untar", "--untardir", str(chart_dir)], capture_output=True, text=True)
+    if r.returncode != 0:
+        fail(f"apps/{PREFIX}-nvsentinel: could not pull {source['repoURL']} {source['targetRevision']} (pass --offline to skip): {r.stderr.strip()[-300:]}")
+    else:
+        for variant, source, hv in chart_runs:
+            vf = work / f"chart-values-{variant}.yaml"
+            vf.write_text(yaml.safe_dump(hv))
+            r = subprocess.run(["helm", "template", source["helm"]["releaseName"], str(chart_dir / source["chart"]),
+                                "--namespace", "nvsentinel", "-f", str(vf)], capture_output=True, text=True)
+            if r.returncode != 0:
+                fail(f"task nvsentinel ({variant}): the NVSentinel chart {source['targetRevision']} does not render with these values: {r.stderr.strip()[-400:]}")
+            else:
+                charts_rendered += 1
+
+# Run the discover script against a fake kubectl. For the GPU Operator: FAKE_CP ClusterPolicies and
+# FAKE_GC GPUClusters, FAKE_WARN as a warning on stderr of a successful list, FAKE_ERR as the error
+# of a failed one, and FAKE_DCGM as the ClusterPolicy's spec.dcgm.enabled. FAKE_CERT_MANAGER is
+# yes, no, or an error message. For the volume guard: one PVC in nvsentinel when FAKE_PV is set,
+# its PV with the node affinity FAKE_TERMS, and a node only for the exact selector FAKE_MATCH. The
+# patch is written to FAKE_PATCH, which stands in for the ConfigMap.
 fake = work / "fakebin"
 fake.mkdir()
-(fake / "kubectl").write_text("""#!/bin/sh
+(fake / "kubectl").write_text(r"""#!/bin/sh
+list() {
+  if [ -n "${FAKE_ERR:-}" ]; then echo "$FAKE_ERR" >&2; exit 1; fi
+  if [ -n "${FAKE_WARN:-}" ]; then echo "$FAKE_WARN" >&2; fi
+  i=0; while [ "$i" -lt "${2:-0}" ]; do echo "$1/object-$i"; i=$((i+1)); done
+  exit 0
+}
 case "$*" in
-  *clusterpolicies*) i=0; while [ "$i" -lt "${FAKE_CP:-0}" ]; do echo clusterpolicy/cp-$i; i=$((i+1)); done; exit 0 ;;
-  *gpuclusters*) i=0; while [ "$i" -lt "${FAKE_GC:-0}" ]; do echo gpucluster/gc-$i; i=$((i+1)); done; exit 0 ;;
-  *"patch configmap"*) echo "PATCH $*" >&2; exit 0 ;;
+  # First: the patch names other kinds too.
+  *"patch configmap"*)
+    while [ $# -gt 1 ]; do shift; done
+    printf '%s' "$1" > "${FAKE_PATCH:-/dev/null}"; exit 0 ;;
+  *certificates.cert-manager.io*)
+    case "${FAKE_CERT_MANAGER:-yes}" in
+      yes) echo customresourcedefinition.apiextensions.k8s.io/certificates.cert-manager.io; exit 0 ;;
+      no) echo 'Error from server (NotFound): customresourcedefinitions.apiextensions.k8s.io "certificates.cert-manager.io" not found' >&2; exit 1 ;;
+      *) echo "$FAKE_CERT_MANAGER" >&2; exit 1 ;;
+    esac ;;
+  *clusterpolicies*jsonpath*) printf '%s' "${FAKE_DCGM:-true}"; exit 0 ;;
+  *clusterpolicies*) list clusterpolicy "${FAKE_CP:-0}" ;;
+  *gpuclusters*) list gpucluster "${FAKE_GC:-0}" ;;
   *"get pvc"*) [ -n "$FAKE_PV" ] && echo "$FAKE_PV"; exit 0 ;;
   *"get pv "*) echo "$FAKE_TERMS"; exit 0 ;;
   *"get nodes"*)
@@ -787,52 +890,105 @@ docs = render_app(apps[DISCOVER], {"cpuNodeSelector": "x=y", "pinnedVolumeNamesp
 script = next(d for d in docs if d.get("kind") == "Job")["spec"]["template"]["spec"]["containers"][0]["args"][0]
 HOST = "kubernetes.io/hostname In node-a|"
 POOL = "workload.example.com/pool=cpu-services"
+GPU_POOL = "workload.example.com/pool=gpu-compute"
+patch_file = work / "discover-patch.json"
 
 
 def run_discover(**env):
     base = {"PATH": f"{fake}:/usr/bin:/bin", "HOME": str(work), "REQUESTED_MODE": "device-plugin",
             "CONTRACT_NAME": "nvsentinel-discovery", "CONTRACT_NAMESPACE": "nvsentinel-stack",
             "GPU_OPERATOR_NAMESPACE": "gpu-operator", "DCGM_HOST": "", "DCGM_PORT": "5555",
-            "CPU_NODE_SELECTOR": POOL, "GPU_NODE_SELECTOR": "", "PINNED_VOLUME_NAMESPACE": "nvsentinel",
-            "FAKE_PV": "", "FAKE_TERMS": "", "FAKE_MATCH": ""}
+            "REQUIRE_CERT_MANAGER": "false", "CPU_NODE_SELECTOR": POOL, "GPU_NODE_SELECTOR": GPU_POOL,
+            "PINNED_VOLUME_NAMESPACE": "nvsentinel", "FAKE_PV": "", "FAKE_TERMS": "", "FAKE_MATCH": "",
+            "FAKE_PATCH": str(patch_file)}
+    patch_file.write_text("")
     r = subprocess.run(["sh", "-c", script], env={**base, **env}, capture_output=True, text=True)
-    return r.returncode, r.stdout + r.stderr
+    text = patch_file.read_text()
+    try:
+        data = json.loads(text)["data"] if text else {}
+    except (ValueError, KeyError):
+        fail(f"apps/{DISCOVER}: the patch it sends is not a JSON merge patch with data: {text[:200]!r}")
+        data = {}
+    return r.returncode, r.stdout + r.stderr, data
 
 
+def expect(case, env, ok, says, want=None):
+    """Run discover; on success `want` is what the patch must hold, and a failure must publish nothing."""
+    code, out, data = run_discover(**env)
+    where = f"apps/{DISCOVER}, {case}"
+    if (code == 0) != ok or says not in out:
+        fail(f"{where}: exit {code}, expected {'success' if ok else 'failure'} saying {says!r}: {out.strip()[-400:]}")
+    elif not ok and data:
+        fail(f"{where}: failed, but still published {data}")
+    elif ok and {k: data.get(k) for k in want or {}} != (want or {}):
+        fail(f"{where}: published {({k: data.get(k) for k in want})}, expected {want}")
+
+
+# The node selectors: checked for key=value form, published as given, and the CPU one checked
+# against the volumes it must still reach. A term the guard cannot turn into a label selector
+# (Gt, Lt) makes the volume's reach unknown, which must not be reported as stranded.
 for case, sel, pv, terms, match, ok, says in [
     ("pinned volume still reachable", POOL, "pv-1", HOST, f"kubernetes.io/hostname in (node-a),{POOL}", True, "reaches every pinned volume"),
     ("selector strands the volume", "foo.acme.corp/cpu-node=true", "pv-1", HOST, f"kubernetes.io/hostname in (node-a),{POOL}", False, "can reach PersistentVolume pv-1"),
     ("zonal volume, node in zone", "foo.acme.corp/cpu-node=true", "pv-1", "topology.kubernetes.io/zone In europe-west4-b|",
      "topology.kubernetes.io/zone in (europe-west4-b),foo.acme.corp/cpu-node=true", True, "reaches every pinned volume"),
+    ("volume with a term the guard cannot evaluate", "foo.acme.corp/cpu-node=true", "pv-1", "some.key Gt 3|", "", True, "reaches every pinned volume"),
     ("no volumes yet", "foo.acme.corp/cpu-node=true", "", "", "", True, "reaches every pinned volume"),
     ("malformed selector", "foo", "", "", "", False, "is not a key=value label"),
 ]:
-    code, out = run_discover(CPU_NODE_SELECTOR=sel, FAKE_PV=pv, FAKE_TERMS=terms, FAKE_MATCH=match)
-    if (code == 0) != ok or says not in out:
-        fail(f"apps/{DISCOVER} guard, {case}: exit {code}, expected {'success' if ok else 'failure'} saying {says!r}: {out.strip()[-300:]}")
-code, out = run_discover(GPU_NODE_SELECTOR="tier=gpu,foo")
-if code == 0 or "GPU node selector 'tier=gpu,foo': 'foo' is not a key=value label" not in out:
-    fail(f"apps/{DISCOVER} selector check, bare GPU key: exit {code}: {out.strip()[-300:]}")
+    expect(f"guard, {case}", {"CPU_NODE_SELECTOR": sel, "FAKE_PV": pv, "FAKE_TERMS": terms, "FAKE_MATCH": match}, ok, says,
+           {"cpuNodeSelector": sel, "gpuNodeSelector": GPU_POOL})
+expect("bare GPU key", {"GPU_NODE_SELECTOR": "tier=gpu,foo"}, False, "GPU node selector 'tier=gpu,foo': 'foo' is not a key=value label")
 
-# Mode detection and the DCGM endpoint, read from the patch the Job sends.
-for case, env, ok, says in [
-    ("auto, ClusterPolicy", {"REQUESTED_MODE": "auto", "FAKE_CP": "1"}, True,
-     ['"mode":"device-plugin"', '"dcgmHost":"nvidia-dcgm.gpu-operator.svc"', '"dcgmDaemonSet":"nvidia-dcgm"', '"dcgmWait":"true"',
-      '"capacitySource":"allocatable"', '"capacityResource":"nvidia.com/gpu"']),
-    ("auto, GPUCluster", {"REQUESTED_MODE": "auto", "FAKE_GC": "1", "GPU_OPERATOR_NAMESPACE": "nvidia-system", "DCGM_PORT": "5556"}, True,
-     ['"mode":"dra"', '"dcgmHost":"nvidia-dcgm-dra.nvidia-system.svc"', '"dcgmPort":"5556"', '"dcgmNamespace":"nvidia-system"',
-      '"capacitySource":"resourceslices"', '"capacityResource":"gpu.nvidia.com"']),
-    ("auto, no GPU Operator", {"REQUESTED_MODE": "auto"}, False, ["there is no GPU Operator to follow"]),
-    ("auto, both CRs", {"REQUESTED_MODE": "auto", "FAKE_CP": "1", "FAKE_GC": "1"}, False, ["both a ClusterPolicy and a GPUCluster exist"]),
-    ("explicit dra, no GPU Operator yet", {"REQUESTED_MODE": "dra"}, True, ['"mode":"dra"', '"dcgmHost":"nvidia-dcgm-dra.gpu-operator.svc"']),
-    ("explicit mode against the other CR", {"REQUESTED_MODE": "dra", "FAKE_CP": "1"}, True, ["WARNING: gpuDriverMode is dra"]),
-    ("dcgmHost override", {"REQUESTED_MODE": "auto", "FAKE_CP": "1", "DCGM_HOST": "dcgm.monitoring.svc"}, True,
-     ['"dcgmHost":"dcgm.monitoring.svc"', '"dcgmWait":"false"']),
-    ("unknown mode", {"REQUESTED_MODE": "cdi"}, False, ["gpuDriverMode must be auto, device-plugin or dra"]),
-]:
-    code, out = run_discover(**env)
-    if (code == 0) != ok or any(x not in out for x in says):
-        fail(f"apps/{DISCOVER}, {case}: exit {code}, expected {'success' if ok else 'failure'} saying {says}: {out.strip()[-400:]}")
+# Mode detection and the DCGM endpoint, read from the patch: every DISCOVER_FACTS key, so swapped
+# names for the two modes fail here.
+expect("auto, ClusterPolicy", {"REQUESTED_MODE": "auto", "FAKE_CP": "1"}, True, "existing ClusterPolicy",
+       {**DISCOVER_FACTS["device-plugin"], "dcgmHost": "nvidia-dcgm.gpu-operator.svc", "dcgmPort": "5555",
+        "dcgmNamespace": "gpu-operator", "dcgmWait": "true"})
+expect("auto, GPUCluster", {"REQUESTED_MODE": "auto", "FAKE_GC": "1", "GPU_OPERATOR_NAMESPACE": "nvidia-system", "DCGM_PORT": "5556"},
+       True, "existing GPUCluster",
+       {**DISCOVER_FACTS["dra"], "dcgmHost": "nvidia-dcgm-dra.nvidia-system.svc", "dcgmPort": "5556",
+        "dcgmNamespace": "nvidia-system", "dcgmWait": "true"})
+expect("auto, no GPU Operator", {"REQUESTED_MODE": "auto"}, False, "there is no GPU Operator to follow")
+expect("auto, both CRs", {"REQUESTED_MODE": "auto", "FAKE_CP": "1", "FAKE_GC": "1"}, False, "both a ClusterPolicy and a GPUCluster exist")
+expect("explicit dra, no GPU Operator yet", {"REQUESTED_MODE": "dra"}, True, "gpuDriverMode parameter",
+       {**DISCOVER_FACTS["dra"], "dcgmHost": "nvidia-dcgm-dra.gpu-operator.svc"})
+expect("explicit device-plugin, no GPU Operator yet", {"REQUESTED_MODE": "device-plugin"}, True, "gpuDriverMode parameter",
+       {**DISCOVER_FACTS["device-plugin"], "dcgmHost": "nvidia-dcgm.gpu-operator.svc"})
+expect("explicit mode against the other CR", {"REQUESTED_MODE": "dra", "FAKE_CP": "1"}, True, "WARNING: gpuDriverMode is dra", {"mode": "dra"})
+expect("dcgmHost override", {"REQUESTED_MODE": "auto", "FAKE_CP": "1", "DCGM_HOST": "dcgm.monitoring.svc"}, True, "comes from the dcgmHost parameter",
+       {"dcgmHost": "dcgm.monitoring.svc", "dcgmWait": "false"})
+expect("unknown mode", {"REQUESTED_MODE": "cdi"}, False, "gpuDriverMode must be auto, device-plugin or dra")
+
+# count(): a CRD that is not installed is zero objects, a warning on a successful list is not an
+# object, and any other error fails rather than being read as "none".
+expect("CRDs not installed", {"REQUESTED_MODE": "device-plugin", "FAKE_ERR": "error: the server doesn't have a resource type \"gpuclusters\""},
+       True, "found 0 ClusterPolicy and 0 GPUCluster", {"mode": "device-plugin"})
+expect("auto, CRDs not installed", {"REQUESTED_MODE": "auto", "FAKE_ERR": "error: the server doesn't have a resource type \"gpuclusters\""},
+       False, "there is no GPU Operator to follow")
+expect("auto, GPUCluster and a warning on stderr", {"REQUESTED_MODE": "auto", "FAKE_GC": "1", "FAKE_WARN": "Warning: something is deprecated"},
+       True, "found 0 ClusterPolicy and 1 GPUCluster", {"mode": "dra"})
+expect("list forbidden", {"REQUESTED_MODE": "auto", "FAKE_ERR": "Error from server (Forbidden): clusterpolicies.nvidia.com is forbidden"},
+       False, "could not list clusterpolicies.nvidia.com")
+
+# cert-manager, which cordon needs: checked only when asked for, and a failed check is not read
+# as "not installed".
+expect("cert-manager required and installed", {"REQUIRE_CERT_MANAGER": "true"}, True, "cert-manager is installed", {"mode": "device-plugin"})
+expect("cert-manager required and missing", {"REQUIRE_CERT_MANAGER": "true", "FAKE_CERT_MANAGER": "no"}, False,
+       "Install cert-manager, or set cordon to false")
+expect("cert-manager check forbidden", {"REQUIRE_CERT_MANAGER": "true", "FAKE_CERT_MANAGER": "Error from server (Forbidden): no"}, False,
+       "could not check for cert-manager")
+expect("cert-manager missing but not required", {"FAKE_CERT_MANAGER": "no"}, True, "gpuDriverMode=device-plugin", {"mode": "device-plugin"})
+
+# The GPU Operator's Helm chart leaves standalone DCGM off. With a ClusterPolicy that says so and
+# no dcgmHost, there is no Service to publish.
+expect("DCGM disabled in the ClusterPolicy", {"REQUESTED_MODE": "auto", "FAKE_CP": "1", "FAKE_DCGM": "false"}, False,
+       "has dcgm.enabled=false")
+expect("DCGM disabled, dcgmHost set", {"REQUESTED_MODE": "auto", "FAKE_CP": "1", "FAKE_DCGM": "false", "DCGM_HOST": "dcgm.monitoring.svc"},
+       True, "comes from the dcgmHost parameter", {"dcgmHost": "dcgm.monitoring.svc"})
+expect("DCGM field not set", {"REQUESTED_MODE": "auto", "FAKE_CP": "1", "FAKE_DCGM": ""}, True, "existing ClusterPolicy", {"mode": "device-plugin"})
+expect("no ClusterPolicy to read DCGM from", {"REQUESTED_MODE": "device-plugin", "FAKE_DCGM": "false"}, True, "gpuDriverMode=device-plugin",
+       {"mode": "device-plugin"})
 
 # --- Examples ------------------------------------------------------------------------------------
 for path in sorted((root / "example").glob("*.yaml")):
@@ -854,5 +1010,6 @@ if errors:
     for error in errors:
         print(f"FAIL {error}", file=sys.stderr)
     sys.exit(1)
-print(f"ok manifests, {counter['render']} template renders, {counter['app']} App renders")
+print(f"ok manifests, {counter['render']} template renders, {counter['app']} App renders, "
+      + ("upstream chart not rendered: --offline" if offline else f"upstream chart rendered {charts_rendered} times"))
 CHECKS

@@ -76,6 +76,14 @@
     },
     {
       "customType": "regex",
+      "description": "NVSentinel: chart and release versions pinned as parameter defaults",
+      "fileMatch": ["^community-stacks/nvsentinel/stacktemplate\\.yaml$", "^community-stacks/nvsentinel/apps/.+\\.yaml$"],
+      "matchStrings": [
+        "# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+)(?: registryUrl=(?<registryUrl>\\S+))?\\s+defaultValue: [\"']?(?<currentValue>[^\\s\"']+)[\"']?"
+      ]
+    },
+    {
+      "customType": "regex",
       "description": "NVIDIA GPU Operator: vCluster version pinned in the tenant cluster template",
       "fileMatch": ["^community-stacks/nvidia-gpu-operator/virtualclustertemplate\\.yaml$"],
       "matchStrings": [
