@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "name": "invalid-missing-platform-version",
+  "displayName": "NVIDIA Run:ai central control plane",
+  "description": "Fixture for the stack.json schema. A copy of the Run:ai example, reduced to one member.",
+  "author": "NVIDIA",
+  "maintainers": [
+    "vCluster Labs"
+  ],
+  "members": [
+    "stacktemplate.yaml"
+  ]
+}

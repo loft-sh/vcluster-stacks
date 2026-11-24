@@ -1,0 +1,8 @@
+# Fixture for catalog/stack.schema.json. It is never installed.
+apiVersion: management.loft.sh/v1
+kind: StackTemplate
+metadata:
+  name: fixture-invalid-missing-name
+spec:
+  displayName: fixture-invalid-missing-name
+  description: Fixture member of the invalid-missing-name fixture.
