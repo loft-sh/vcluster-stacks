@@ -1,13 +1,13 @@
-# NVIDIA GPU Operator and NVSentinel as one Stack, gated on GPUs the scheduler can actually see.
+# NVIDIA GPU Operator as a Stack, gated on GPUs the scheduler can actually see.
 #
-# Two kinds of task. GPU Operator and NVSentinel are argoCDApplication tasks: Argo CD owns their
-# reconciliation once the Stack has ordered the rollout. The readiness gates and the smoke test
-# are app tasks: Platform Apps whose manifests live in apps/, and whose Jobs run the
+# Two kinds of task. The GPU Operator is an argoCDApplication task: Argo CD owns its
+# reconciliation once the Stack has ordered the rollout. discover, the readiness gates and the
+# smoke test are app tasks: Platform Apps whose manifests live in apps/, and whose Jobs run the
 # vCluster Platform image (.Values.__image__), so the Stack needs no image or chart of its own.
 #
-# cert-manager is not part of the Stack. NVSentinel in the dry-run configuration used here renders
-# no cert-manager resources; its MongoDB store, Janitor and preflight components need it, so a
-# production NVSentinel needs cert-manager installed first.
+# NVSentinel is not part of this Stack. It is the nvsentinel Stack in community-stacks/nvsentinel,
+# which installs on top of this one or of any other GPU Operator install. An instance created
+# before the split still owns an NVSentinel Application: see the README's Upgrade section.
 #
 # Apply everything in apps/ together with this template. A templateRef is resolved when the task
 # runs, so a missing template shows as TemplateNotFound on that task.
@@ -18,11 +18,10 @@
 #   gpuready        (02) app: waits for minGPUs GPUs, marks gpu-stack-contract ready
 #   dcgmready       (02) app: waits for the DCGM DaemonSet to finish rolling out
 #   gpu-smoke-test  (03) app: CUDA VectorAdd on the GPU pool
-#   nvsentinel      (03) argoCDApplication: NVSentinel in dry-run mode
 #
-# gpuDriverMode: the GPU Operator, both gates, the smoke test and NVSentinel all differ between the
-# device-plugin and the DRA stack, and a mismatch fails quietly (NVSentinel watching a DCGM that
-# does not exist, a gate counting a resource nobody advertises). Only discover reads the parameter;
+# gpuDriverMode: the GPU Operator, both gates and the smoke test all differ between the
+# device-plugin and the DRA stack, and a mismatch fails quietly (a gate waiting for a DCGM that
+# does not exist, or counting a resource nobody advertises). Only discover reads the parameter;
 # every other task takes the resolved mode and the names that go with it from discover's outputs.
 #
 # Timeouts: every App `timeout` stays below the Platform per-deploy cap of 30m, and each task
@@ -39,9 +38,9 @@ metadata:
   labels:
     app.kubernetes.io/part-of: nvidia-gpu-operator-stack
 spec:
-  displayName: NVIDIA GPU Operator and NVSentinel
-  description: NVIDIA GPU Operator and NVSentinel on GPU workers, with controllers and readiness gates on CPU
-    service workers, gated on GPUs the scheduler can actually see and proven with a CUDA smoke test.
+  displayName: NVIDIA GPU Operator
+  description: NVIDIA GPU Operator on GPU workers, with controllers and readiness gates on CPU service
+    workers, gated on GPUs the scheduler can actually see and proven with a CUDA smoke test.
   # NVIDIA's own NGC catalog logo for the GPU Operator, the icon in its Chart.yaml.
   icon: https://assets.nvidiagrid.net/ngc/logos/GPUoperator.png
   owner:
@@ -57,8 +56,8 @@ spec:
       section: Argo CD
     - variable: cpuNodePool
       label: CPU Service Pool Label
-      description: Value of workload.example.com/pool on CPU service workers. The GPU Operator controller, the
-        NVSentinel labeler and the gate Jobs run there.
+      description: Value of workload.example.com/pool on CPU service workers. The GPU Operator controller and
+        the gate Jobs run there.
       type: string
       required: true
       defaultValue: cpu-services
@@ -77,14 +76,14 @@ spec:
       description: Comma-separated key=value labels that select the GPU workers, replacing
         workload.example.com/pool=gpu-compute. Leave empty to keep that selector, which also keeps an
         upgrade from moving anything. The gpuready gate counts GPUs only on these nodes, and the NFD
-        workers, NVSentinel's GPU agents and the smoke test run there, tolerating the nvidia.com/gpu
+        workers and the smoke test run there, tolerating the nvidia.com/gpu
         NoSchedule taint. Changing it moves those pods. discover fails on a bare key; write a label with an
         empty value as key=.
       type: string
       section: Node Pools
     - variable: minGPUs
       label: Minimum Allocatable GPUs
-      description: How many GPUs the scheduler must advertise before the gpuready gate passes and NVSentinel starts.
+      description: How many GPUs the scheduler must advertise before the gpuready gate passes.
       type: number
       required: true
       defaultValue: '1'
@@ -96,7 +95,7 @@ spec:
         pods request nvidia.com/gpu. dra runs its experimental GPUCluster stack, where the NVIDIA DRA driver
         publishes GPUs as ResourceSlices and pods request them through ResourceClaims; it needs Kubernetes
         1.34 or later. auto keeps the mode of a GPU Operator already in the cluster and installs
-        device-plugin otherwise. NVSentinel always follows the GPU Operator.
+        device-plugin otherwise.
       options:
         - auto
         - device-plugin
@@ -106,7 +105,7 @@ spec:
     - variable: driverPreinstalled
       label: NVIDIA Driver Preinstalled
       description: Enable when the node OS image already contains the NVIDIA driver. GPU Operator then skips the
-        driver and NVSentinel labels nodes in preinstalled-driver mode.
+        driver.
       type: boolean
       defaultValue: 'false'
       section: GPU Operator
@@ -126,13 +125,6 @@ spec:
       section: Versions
       # renovate: datasource=helm depName=gpu-operator registryUrl=https://helm.ngc.nvidia.com/nvidia
       defaultValue: v26.7.2
-    - variable: nvsentinelVersion
-      label: NVSentinel Chart and Image Version
-      type: string
-      required: true
-      section: Versions
-      # renovate: datasource=github-releases depName=NVIDIA/NVSentinel
-      defaultValue: v1.32.0
   # Values the gate publishes, readable from the StackInstance outputs subresource.
   publishedOutputs:
     - name: gpudrivermode
@@ -335,8 +327,9 @@ spec:
             name: gpu-stack-contract
             jsonPath: '{.data.dcgmPort}'
     # The GPU Operator creates dcgm-exporter and nvidia-dcgm together, with nothing ordering
-    # them. NVSentinel started against a DCGM host engine that is not serving reports
-    # GpuDcgmConnectivityFailure. This gate only waits: no capacity check, no contract.
+    # them. A DCGM client started against a host engine that is not serving fails to connect.
+    # With this gate, a Healthy Stack means the published dcgmhost is serving. It only waits: no
+    # capacity check, no contract.
     # It follows gpuready so a GPU node exists: a DaemonSet that schedules no pods yet has
     # already finished rolling out. rollout covers any number of GPU workers.
     - name: dcgmready
@@ -358,7 +351,7 @@ spec:
           capacityMin: "0"
           timeoutSeconds: "780"
     # Proves the GPU computes, not only that the scheduler advertised it. Runs beside the
-    # dcgmready gate and NVSentinel, and occupies one GPU for the few seconds it takes.
+    # dcgmready gate, and occupies one GPU for the few seconds it takes.
     - name: gpu-smoke-test
       dependsOn:
         - discover
@@ -371,23 +364,3 @@ spec:
           gpuNodeSelector: '{{ .Outputs.gpuready.gpunodeselector }}'
           gpuCount: "1"
           gpuDriverMode: '{{ .Outputs.discover.mode }}'
-    - name: nvsentinel
-      dependsOn:
-        - discover
-        - gpuready
-        - dcgmready
-      timeout: 20m0s
-      argoCDApplication:
-        templateRef:
-          name: nvidia-gpu-operator-nvsentinel
-        parameters:
-          cpuNodePool: '{{ .Values.cpuNodePool }}'
-          cpuNodeSelector: '{{ .Outputs.discover.cpunodeselector }}'
-          gpuNodeSelector: '{{ .Outputs.discover.gpunodeselector }}'
-          version: '{{ .Values.nvsentinelVersion }}'
-          project: '{{ .Values.argoProject }}'
-          driverPreinstalled: '{{ .Values.driverPreinstalled | toString }}'
-          gpuDriverMode: '{{ .Outputs.discover.mode }}'
-          # Read from the contract the gate published rather than hard-coded here.
-          dcgmHost: '{{ .Outputs.gpuready.dcgmhost }}'
-          dcgmPort: '{{ .Outputs.gpuready.dcgmport }}'

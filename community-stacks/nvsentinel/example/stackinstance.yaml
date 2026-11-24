@@ -1,0 +1,46 @@
+# Installs the nvsentinel Stack into an existing cluster. Apply it in the project namespace that
+# owns the cluster, for example
+# `kubectl apply -n p-default -f example/stackinstance.yaml`.
+#
+# The cluster must already have:
+#   - the Argo CD integration enabled (integrations.argoCD.connector in its vcluster.yaml),
+#   - the NVIDIA GPU Operator running, with DCGM, from the nvidia-gpu-operator Stack or any other
+#     install,
+#   - cert-manager, unless cordon is "false",
+#   - at least one CPU worker labeled workload.example.com/pool=cpu-services, and
+#   - GPU workers labeled workload.example.com/pool=gpu-compute.
+# Set cpuNodeSelector and gpuNodeSelector when the nodes carry other labels.
+#
+# spec.owner is required and, like spec.destination, immutable: to move the Stack, delete and
+# recreate it.
+apiVersion: management.loft.sh/v1
+kind: StackInstance
+metadata:
+  name: nvsentinel
+  labels:
+    app.kubernetes.io/part-of: nvsentinel-stack
+spec:
+  displayName: NVIDIA NVSentinel
+  owner:
+    user: admin
+  destination:
+    virtualCluster:
+      name: my-tenant-cluster
+  templateRef:
+    name: nvsentinel
+  # Delete a task's application when a template update removes the task.
+  prunePolicy: Prune
+  parameters:
+    argoProject: default
+    cpuNodePool: cpu-services
+    # auto follows the GPU Operator already in the cluster. Set "device-plugin" or "dra" when the
+    # GPU Operator is installed at the same time as this Stack.
+    gpuDriverMode: auto
+    # NVSentinel cordons faulty GPU nodes; it never reboots them unless remediation is set. Needs
+    # cert-manager in the cluster; set "false" for monitoring only.
+    cordon: "true"
+    # "true" also evicts pods from cordoned nodes.
+    drain: "false"
+    dryRun: "false"
+    # Set to "true" when the GPU node image already contains the NVIDIA driver.
+    driverPreinstalled: "false"

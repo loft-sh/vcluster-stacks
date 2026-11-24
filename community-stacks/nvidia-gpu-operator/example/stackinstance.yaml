@@ -19,7 +19,7 @@ metadata:
   labels:
     app.kubernetes.io/part-of: nvidia-gpu-operator-stack
 spec:
-  displayName: NVIDIA GPU Operator and NVSentinel
+  displayName: NVIDIA GPU Operator
   owner:
     user: admin
   destination:
@@ -27,6 +27,8 @@ spec:
       name: my-tenant-cluster
   templateRef:
     name: nvidia-gpu-operator
+  # Delete a task's application when a template update removes the task.
+  prunePolicy: Prune
   parameters:
     argoProject: default
     cpuNodePool: cpu-services

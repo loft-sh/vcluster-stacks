@@ -1,0 +1,446 @@
+# CPU controllers and GPU node agents use the pool labels from the nvidia-gpu-operator Stack's
+# nodeprofiles.yaml, or cpuNodeSelector and gpuNodeSelector when set.
+# platformConnector is a node-local socket service, so it stays with GPU health monitors.
+#
+# gpuDriverMode must match the GPU Operator's. With dra, the metadata-collector holds a DRA
+# admin-access ResourceClaim on each node's GPUs instead of running with the `nvidia` RuntimeClass,
+# which the DRA stack does not create. Kubernetes admits admin-access claims only in a namespace
+# labeled resource.kubernetes.io/admin-access=true, and the chart does not set it, so Argo CD labels
+# the namespace it creates. The label is "false" in device-plugin mode, which grants nothing.
+#
+# Fault handling: by default NVSentinel cordons a GPU node it finds faulty (fault quarantine,
+# dryRun off). drain=true also evicts pods from a cordoned node (node-drainer, as drainMode,
+# drainTimeoutMinutes and drainImmediateNamespaces say); it has no effect without cordon, since the
+# drainer acts on quarantined nodes.
+# slinkyDrain=true hands nodes matching slinkyNodeSelector to NVSentinel's Slinky drainer instead
+# (customDrain): node-drainer creates a DrainRequest and the drainer drains the node through Slurm.
+# The drainer, its CRD and the drain template ConfigMap come from the slinky-drainer App, which must
+# be deployed first. Nodes not matching the selector drain as drainMode says.
+# remediation (reboot, gpu-reset) is described in the Stack's README.
+#
+# Quarantine keeps its state in NVSentinel's MongoDB store, which gets its TLS certificates from
+# cert-manager, so cordon=true requires cert-manager in the cluster. cordon=false
+# runs monitoring only, with no MongoDB and no cert-manager dependency. dryRun=true keeps
+# quarantine running but only logs what it would cordon.
+#
+# The circuit breaker parameters and their trade-offs are described in the Stack's README.
+apiVersion: management.loft.sh/v1
+kind: ArgoCDApplicationTemplate
+metadata:
+  name: nvsentinel-nvsentinel
+  labels:
+    app.kubernetes.io/part-of: nvsentinel-stack
+spec:
+  displayName: NVSentinel
+  owner:
+    team: loft-admins
+  parameters:
+    - variable: cpuNodePool
+      label: CPU Service Pool Label
+      description: Value of workload.example.com/pool on CPU service workers.
+      type: string
+      required: true
+      defaultValue: cpu-services
+    - variable: cpuNodeSelector
+      label: CPU Node Selector
+      description: Comma-separated key=value labels that select the CPU service workers. Empty selects
+        workload.example.com/pool=<cpuNodePool>.
+      type: string
+    - variable: gpuNodeSelector
+      label: GPU Node Selector
+      description: Comma-separated key=value labels that select the GPU workers. Empty selects
+        workload.example.com/pool=gpu-compute.
+      type: string
+    - variable: version
+      label: Chart Version and Image Tag
+      type: string
+      required: true
+      # renovate: datasource=github-releases depName=NVIDIA/NVSentinel
+      defaultValue: v1.32.0
+    - variable: project
+      label: Argo CD Project
+      type: string
+      required: true
+      defaultValue: default
+    - variable: driverPreinstalled
+      label: NVIDIA Driver Preinstalled
+      type: boolean
+      defaultValue: 'false'
+    - variable: gpuDriverMode
+      label: GPU Driver Mode
+      description: Must match the GPU Operator. Inside the Stack, the discover task supplies it.
+      options:
+        - device-plugin
+        - dra
+      defaultValue: device-plugin
+    - variable: cordon
+      label: Cordon Faulty GPU Nodes
+      description: Cordon a node when NVSentinel detects a GPU fault. Never reboots. Needs
+        cert-manager in the cluster, for the MongoDB store that quarantine uses.
+      type: boolean
+      defaultValue: 'true'
+    - variable: drain
+      label: Drain Cordoned GPU Nodes
+      description: Also evict pods from a node NVSentinel cordoned, as drainMode says. No effect unless cordoning
+        is on.
+      type: boolean
+      defaultValue: 'false'
+    - variable: drainMode
+      label: Drain Mode
+      description: How the drain treats pods in user namespaces. Immediate evicts them at once through the
+        Eviction API, honoring PodDisruptionBudgets. AllowCompletion waits, with no time limit, for pods to
+        finish on their own. DeleteAfterTimeout waits too, then force deletes the ones still running after
+        drainTimeoutMinutes.
+      options:
+        - Immediate
+        - AllowCompletion
+        - DeleteAfterTimeout
+      defaultValue: Immediate
+    - variable: drainTimeoutMinutes
+      label: Drain Timeout Minutes
+      description: With DeleteAfterTimeout, minutes after the fault was detected at which pods still running are
+        force deleted.
+      type: number
+      defaultValue: '60'
+      min: 1
+    - variable: drainImmediateNamespaces
+      label: Drain Immediate Namespaces
+      description: Comma-separated namespaces, or globs such as test-*, whose pods are evicted at once whatever
+        drainMode says.
+      type: string
+    - variable: slinkyDrain
+      label: Drain Slurm Nodes Through Slinky
+      description: Hand cordoned nodes matching the Slinky node selector to NVSentinel's Slinky drainer, which
+        waits for Slurm to drain them before deleting the Slurm worker pods. Needs drain on and the
+        slinky-drainer App deployed.
+      type: boolean
+      defaultValue: 'false'
+    - variable: slinkyNodeSelector
+      label: Slinky Node Selector
+      description: Label selector for the nodes that drain through Slurm. Matching nodes get no pod eviction, so
+        pods outside the Slinky namespace stay on them.
+      type: string
+      defaultValue: nvidia.com/gpu.present=true
+    - variable: dryRun
+      label: Dry Run
+      description: Log the cordons and drains NVSentinel would make without making them.
+      type: boolean
+      defaultValue: 'false'
+    - variable: remediation
+      label: Remediation
+      description: What NVSentinel does to a node it cordoned and drained. none leaves it to you. Needs cordon
+        and drain.
+      options:
+        - none
+        - reboot
+        - gpu-reset
+      defaultValue: none
+    - variable: circuitBreakerEnabled
+      label: Circuit Breaker Enabled
+      description: Stop cordoning when too many GPU nodes are cordoned within the window. Off removes that limit,
+        but one or two GPU nodes then recover without a manual reset.
+      type: boolean
+      defaultValue: 'true'
+    - variable: circuitBreakerDuration
+      label: Circuit Breaker Window
+      description: Window the circuit breaker counts cordons in, as a Go duration such as 5m or 1h.
+      type: string
+      defaultValue: 5m
+    - variable: circuitBreakerPercentage
+      label: Circuit Breaker Percentage
+      description: Share of GPU nodes cordoned within the window that trips the circuit breaker, which then
+        stops all cordoning and uncordoning until reset.
+      type: number
+      defaultValue: '50'
+      min: 1
+    - variable: circuitBreakerMaxNodes
+      label: Circuit Breaker Max Nodes
+      description: Cordons within the window that trip the breaker regardless of fleet size. 0 uses the
+        percentage alone; when both apply, the lower one wins.
+      type: number
+      defaultValue: '0'
+      min: 0
+    - variable: mongodbReplicas
+      label: MongoDB Replicas
+      description: Replicas of NVSentinel's MongoDB store, used when cordoning is on. 1 fits a small CPU pool; 3
+        survives the loss of one CPU node, with each replica requesting 1 CPU and 1.5Gi.
+      type: number
+      defaultValue: '1'
+      min: 1
+    - variable: mongodbStorageClass
+      label: MongoDB Storage Class
+      description: StorageClass for the MongoDB volumes. Empty uses the cluster's default StorageClass. Set it at
+        install; a StatefulSet's volume claims cannot change afterwards.
+      type: string
+    - variable: dcgmHost
+      label: DCGM Service Host
+      description: Supplied by the discover task when this template runs inside the nvsentinel Stack. The
+        default applies when it is deployed on its own.
+      type: string
+      defaultValue: nvidia-dcgm.gpu-operator.svc
+    - variable: dcgmPort
+      label: DCGM Service Port
+      type: string
+      defaultValue: '5555'
+  template:
+    spec:
+      destination:
+        namespace: nvsentinel
+      project: '{{ .Values.project }}'
+      source:
+        chart: nvsentinel
+        repoURL: oci://ghcr.io/nvidia/nvsentinel
+        targetRevision: '{{ .Values.version }}'
+        helm:
+          releaseName: nvsentinel
+          values: |
+            {{- /* cpuNodeSelector (comma-separated key=value), or workload.example.com/pool=<cpuNodePool> when empty. */}}
+            {{- $cpuNodeSelector := dict "kubernetes.io/os" "linux" }}
+            {{- range splitList "," (.Values.cpuNodeSelector | default (printf "workload.example.com/pool=%s" (.Values.cpuNodePool | default "cpu-services"))) }}
+            {{- if trim . }}
+            {{- $kv := splitn "=" 2 (trim .) }}
+            {{- $_ := set $cpuNodeSelector $kv._0 ($kv._1 | default "") }}
+            {{- end }}
+            {{- end }}
+            {{- /* gpuNodeSelector (comma-separated key=value), or workload.example.com/pool=gpu-compute when empty. */}}
+            {{- /* $gpuLabels holds only those pairs, for platformConnector's affinity. */}}
+            {{- $gpuLabels := dict }}
+            {{- range splitList "," (.Values.gpuNodeSelector | default "workload.example.com/pool=gpu-compute") }}
+            {{- if trim . }}
+            {{- $kv := splitn "=" 2 (trim .) }}
+            {{- $_ := set $gpuLabels $kv._0 ($kv._1 | default "") }}
+            {{- end }}
+            {{- end }}
+            {{- /* No merge: the Platform's template functions do not include it. */}}
+            {{- $gpuNodeSelector := dict "kubernetes.io/os" "linux" }}
+            {{- range $k, $v := $gpuLabels }}
+            {{- $_ := set $gpuNodeSelector $k $v }}
+            {{- end }}
+            {{- $dra := eq (.Values.gpuDriverMode | default "device-plugin") "dra" }}
+            {{- $cordon := ne (.Values.cordon | toString) "false" }}
+            {{- $drain := and $cordon (eq (.Values.drain | toString) "true") }}
+            {{- $slinky := and $drain (eq (.Values.slinkyDrain | toString) "true") }}
+            {{- /* Remediation acts on drained nodes, so it needs drain. gpu-reset falls back to a reboot. */}}
+            {{- $remediation := .Values.remediation | default "none" }}
+            {{- $remediate := and $drain (or (eq $remediation "reboot") (eq $remediation "gpu-reset")) }}
+            {{- $gpuReset := and $remediate (eq $remediation "gpu-reset") }}
+            {{- $replicas := .Values.mongodbReplicas | default "1" | int }}
+            global:
+              # Booleans arrive as strings; the default is cordon on, dry run off.
+              dryRun: {{ eq (.Values.dryRun | toString) "true" }}
+              # A YAML boolean: the chart fails on a quoted value.
+              gpuDraEnabled: {{ $dra }}
+              image:
+                tag: '{{ .Values.version }}'
+              dcgm:
+                enabled: true
+                service:
+                  # default guards against an empty value if this runs outside the Stack.
+                  endpoint: {{ .Values.dcgmHost | default "nvidia-dcgm.gpu-operator.svc" | quote }}
+                  port: {{ .Values.dcgmPort | default "5555" }}
+              gpuHealthMonitor:
+                enabled: true
+              syslogHealthMonitor:
+                enabled: true
+              nicHealthMonitor:
+                enabled: false
+              cspHealthMonitor:
+                enabled: false
+              healthEventsAnalyzer:
+                enabled: false
+              # Quarantine stores its state in MongoDB and does not start without it.
+              mongodbStore:
+                enabled: {{ $cordon }}
+              faultQuarantine:
+                enabled: {{ $cordon }}
+              # Drain is opt-in and needs quarantine; remediation is opt-in and needs drain.
+              nodeDrainer:
+                enabled: {{ $drain }}
+              faultRemediation:
+                enabled: {{ $remediate }}
+              janitor:
+                enabled: {{ $remediate }}
+              janitorProvider:
+                enabled: {{ $remediate }}
+              {{- if $gpuReset }}
+              # Evict only the pods using the faulty GPU before resetting it.
+              partialDrainEnabled: true
+              {{- end }}
+              tracing:
+                enabled: false
+                endpoint: ''
+              auditLogging:
+                enabled: false
+              nodeSelector:
+                {{- range $k, $v := $gpuNodeSelector }}
+                {{ $k }}: {{ $v | quote }}
+                {{- end }}
+              tolerations:
+              - key: nvidia.com/gpu
+                operator: Exists
+                effect: NoSchedule
+              systemNodeSelector:
+                {{- range $k, $v := $cpuNodeSelector }}
+                {{ $k }}: {{ $v | quote }}
+                {{- end }}
+              systemNodeTolerations: []
+            networkPolicy:
+              enabled: true
+            podMonitor:
+              enabled: false
+              interval: 30s
+            labeler:
+              assumeDriverInstalled: {{ .Values.driverPreinstalled | toString }}
+            janitor-provider:
+              csp:
+                {{- if $remediate }}
+                # Reboots from a privileged Job on the node: no cloud credentials, works on any node.
+                # It cannot terminate nodes, so REPLACE_VM remediations get no automatic action.
+                provider: generic
+                {{- else }}
+                provider: kind
+                {{- end }}
+            janitor:
+              config:
+                controllers:
+                  gpuReset:
+                    resetJob:
+                      {{- if $dra }}
+                      # The janitor chart refuses the default `nvidia` RuntimeClass in DRA mode, which has none.
+                      runtimeClassName: ""
+                      {{- end }}
+                      # Where the reset Job finds nvidia-smi: the GPU Operator's driver container, or the
+                      # host when the driver is preinstalled.
+                      hostDriverRootPath: {{ if eq (.Values.driverPreinstalled | toString) "true" }}/{{ else }}/run/nvidia/driver{{ end }}
+            {{- if $gpuReset }}
+            fault-remediation:
+              maintenance:
+                # COMPONENT_RESET resets the faulty GPU instead of rebooting the node (the chart default).
+                actions:
+                  COMPONENT_RESET:
+                    apiGroup: janitor.dgxc.nvidia.com
+                    version: v1alpha1
+                    kind: GPUReset
+                    scope: Cluster
+                    completeConditionType: Complete
+                    templateFileName: gpureset-template.yaml
+                    equivalenceGroup: reset
+                    impactedEntityScope: GPU_UUID
+                    supersedingEquivalenceGroups:
+                      - restart
+                templates:
+                  # fault-remediation renders this itself, so it sits in a raw string the Platform leaves alone.
+                  gpureset-template.yaml: |
+                    {{ `apiVersion: {{ .ApiGroup }}/{{ .Version }}
+                    kind: GPUReset
+                    metadata:
+                      name: maintenance-{{ .HealthEvent.NodeName }}-{{ .HealthEventID }}
+                    spec:
+                      nodeName: {{ .HealthEvent.NodeName }}
+                      selector:
+                        uuids:
+                          - {{ .ImpactedEntityScopeValue }}` }}
+            {{- end }}
+            {{- if $cordon }}
+            fault-quarantine:
+              # The chart requests a full CPU; on a 4 CPU services node next to MongoDB that leaves
+              # no room for a rolling update. The limit stays at the chart's 1 CPU.
+              resources:
+                requests:
+                  cpu: 250m
+              circuitBreaker:
+                enabled: {{ ne (.Values.circuitBreakerEnabled | toString) "false" }}
+                # A Go duration; fault-quarantine fails to start on anything else.
+                duration: {{ .Values.circuitBreakerDuration | default "5m" | quote }}
+                percentage: {{ .Values.circuitBreakerPercentage | default "50" | int }}
+                maxNodes: {{ .Values.circuitBreakerMaxNodes | default "0" | int }}
+            {{- end }}
+            {{- if $drain }}
+            node-drainer:
+              # Namespaces in drainImmediateNamespaces also match "*"; node-drainer evicts Immediate
+              # namespaces first, so the stricter mode wins.
+              userNamespaces:
+              {{- range splitList "," (.Values.drainImmediateNamespaces | default "") }}
+              {{- if trim . }}
+              - name: {{ trim . | quote }}
+                mode: Immediate
+              {{- end }}
+              {{- end }}
+              - name: "*"
+                mode: {{ .Values.drainMode | default "Immediate" | quote }}
+              # Counted from the health event's creation, not from the start of the drain.
+              deleteAfterTimeoutMinutes: {{ .Values.drainTimeoutMinutes | default "60" | int }}
+              {{- if $slinky }}
+              customDrain:
+                enabled: true
+                # Never empty: an empty selector sends every node through the Slinky drainer.
+                nodeSelector: {{ .Values.slinkyNodeSelector | default "nvidia.com/gpu.present=true" | quote }}
+                # Created by the slinky-drainer App.
+                templateConfigMapName: slinky-drain-template
+                templateMountPath: /etc/drain-template
+                templateFileName: drain-template.yaml
+                namespace: nvsentinel
+                apiGroup: nvsentinel.nvidia.com
+                version: v1alpha1
+                kind: DrainRequest
+                resource: drainrequests
+                statusConditionType: DrainComplete
+                statusConditionStatus: "True"
+              {{- end }}
+            {{- end }}
+            mongodb-store:
+              mongodb:
+                replicaCount: {{ $replicas }}
+                # cert-manager issues one server certificate per replica.
+                tls:
+                  replicaset:
+                    existingSecrets:
+                      {{- range $i := until $replicas }}
+                      - mongo-server-cert-{{ $i }}
+                      {{- end }}
+                # Also places the MongoDB setup Jobs.
+                nodeSelector:
+                  {{- range $k, $v := $cpuNodeSelector }}
+                  {{ $k }}: {{ $v | quote }}
+                  {{- end }}
+                persistence:
+                  size: 10Gi
+                  {{- with .Values.mongodbStorageClass }}
+                  # Fixed once the StatefulSet exists: volumeClaimTemplates are immutable.
+                  storageClass: {{ . | quote }}
+                  {{- end }}
+            platformConnector:
+              affinity:
+                nodeAffinity:
+                  requiredDuringSchedulingIgnoredDuringExecution:
+                    nodeSelectorTerms:
+                    - matchExpressions:
+                      {{- range $k, $v := $gpuLabels }}
+                      - key: {{ $k }}
+                        operator: In
+                        values:
+                        - {{ $v | quote }}
+                      {{- end }}
+            nodeConditionCleanup:
+              nodeSelector:
+                {{- range $k, $v := $cpuNodeSelector }}
+                {{ $k }}: {{ $v | quote }}
+                {{- end }}
+              tolerations: []
+      syncPolicy:
+        managedNamespaceMetadata:
+          labels:
+            resource.kubernetes.io/admin-access: '{{ if eq (.Values.gpuDriverMode | default "device-plugin") "dra" }}true{{ else }}false{{ end }}'
+        automated:
+          prune: true
+          selfHeal: true
+        retry:
+          backoff:
+            duration: 30s
+            factor: 2
+            maxDuration: 10m
+          limit: 20
+        syncOptions:
+          - CreateNamespace=true
+          - ServerSideApply=true
+          - SkipDryRunOnMissingResource=true

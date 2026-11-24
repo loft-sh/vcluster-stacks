@@ -1,0 +1,452 @@
+# NVSentinel as a Stack of its own: GPU health monitoring and fault handling for a cluster that
+# already runs the NVIDIA GPU Operator.
+#
+# The GPU Operator is a prerequisite, not part of the Stack. It can come from the
+# nvidia-gpu-operator Stack, from Helm, or from anywhere else: the discover task reads the driver
+# mode from the GPU Operator's own CR, and the DCGM names follow from the mode.
+#
+# Two kinds of task. NVSentinel is an argoCDApplication task: Argo CD owns its reconciliation once
+# the Stack has ordered the rollout. discover, the readiness gates and the Slinky drainer are app
+# tasks: Platform Apps whose manifests live in apps/. The discover and gate Jobs run the
+# vCluster Platform image (.Values.__image__).
+#
+# cert-manager is not part of the Stack, but the default configuration needs it. NVSentinel cordons
+# faulty GPU nodes (cordon, on by default) through fault quarantine, which keeps its state in
+# NVSentinel's MongoDB store, and the store's TLS certificates come from cert-manager. Install
+# cert-manager first, or set cordon to false for monitoring only. NVSentinel drains a cordoned node
+# only with drain, and reboots or resets a drained node only with remediation. With slinkyDrain as
+# well, nodes running Slurm through Slinky drain through Slurm instead.
+#
+# Apply everything in apps/ together with this template. A templateRef is resolved when the task
+# runs, so a missing template shows as TemplateNotFound on that task.
+#
+# Tasks (the apps/ file numbers are a topological order of the graph):
+#   discover        (00) app: resolves gpuDriverMode (device-plugin or dra) and the DCGM names
+#   gpuready        (01) app: waits for one GPU on the GPU node selector
+#   dcgmready       (01) app: waits for the DCGM DaemonSet to finish rolling out
+#   slinky-drainer  (02) app: NVSentinel's Slinky drainer, rendered empty unless enabled
+#   nvsentinel      (03) argoCDApplication: NVSentinel, cordoning faulty GPU nodes
+#
+# gpuDriverMode: NVSentinel and the gates differ between the device-plugin and the DRA stack, and a
+# mismatch fails quietly (NVSentinel watching a DCGM that does not exist, a gate counting a
+# resource nobody advertises). Only discover reads the parameter; every other task takes the
+# resolved mode and the names that go with it from discover's outputs.
+#
+# Timeouts: every App `timeout` stays below the Platform per-deploy cap of 30m, and each task
+# timeout exceeds its App timeout, so the task timeout is the reporting path for a stuck step.
+# Write durations with seconds (15m0s): metav1.Duration normalizes on write, and a GitOps copy
+# written as 15m drifts forever.
+#
+# Stack-driven AppInstances do not apply App parameter defaults, so app tasks pass every value
+# they rely on, and booleans arrive as the strings "true" and "false".
+apiVersion: management.loft.sh/v1
+kind: StackTemplate
+metadata:
+  name: nvsentinel
+  labels:
+    app.kubernetes.io/part-of: nvsentinel-stack
+spec:
+  displayName: NVIDIA NVSentinel
+  description: NVSentinel GPU health monitoring and fault handling for a cluster that runs the NVIDIA GPU
+    Operator. Cordons faulty GPU nodes by default, and can drain them, drain Slurm nodes through Slinky, and
+    reboot the node or reset the GPU.
+  owner:
+    team: loft-admins
+  parameters:
+    - variable: argoProject
+      label: Argo CD Project
+      description: Argo CD project NVSentinel's Application belongs to. It must permit the chart source and the
+        nvsentinel namespace.
+      type: string
+      required: true
+    - variable: cpuNodePool
+      label: CPU Service Pool Label
+      description: Value of workload.example.com/pool on the CPU workers that run NVSentinel's controllers,
+        MongoDB and the Stack's Jobs.
+      type: string
+      required: true
+      defaultValue: cpu-services
+      section: Node Pools
+    - variable: cpuNodeSelector
+      label: CPU Node Selector
+      description: Comma-separated key=value labels that select the CPU service workers, replacing
+        workload.example.com/pool=<cpuNodePool>. Leave empty to keep that selector. Changing it moves every CPU
+        workload; discover fails on a selector that would strand NVSentinel's MongoDB volume, but cannot stop
+        the change. Check before changing it. discover also fails on a bare key; write a label with an empty
+        value as key=.
+      type: string
+      section: Node Pools
+    - variable: gpuNodeSelector
+      label: GPU Node Selector
+      description: Comma-separated key=value labels that select the GPU workers, replacing
+        workload.example.com/pool=gpu-compute. Leave empty to keep that selector. NVSentinel's GPU agents run
+        on these nodes, tolerating the nvidia.com/gpu NoSchedule taint, and the gpuready gate looks for a GPU
+        only there. Use the GPU Operator's selector. discover fails on a bare key; write a label with an empty
+        value as key=.
+      type: string
+      section: Node Pools
+    - variable: gpuDriverMode
+      label: GPU Driver Mode
+      description: How the GPU Operator exposes GPUs. auto reads it from the GPU Operator CR in the cluster
+        (GPUCluster means dra, ClusterPolicy means device-plugin) and fails when there is none. Set
+        device-plugin or dra when the GPU Operator is installed at the same time as this Stack.
+      options:
+        - auto
+        - device-plugin
+        - dra
+      defaultValue: auto
+      section: GPU Operator
+    - variable: gpuOperatorNamespace
+      label: GPU Operator Namespace
+      description: Namespace the GPU Operator runs DCGM in.
+      type: string
+      required: true
+      defaultValue: gpu-operator
+      section: GPU Operator
+    - variable: dcgmHost
+      label: DCGM Host
+      description: DCGM host engine endpoint for NVSentinel's GPU health monitor. Leave empty for the GPU
+        Operator's Service (nvidia-dcgm, or nvidia-dcgm-dra with DRA) in the GPU Operator namespace. When set,
+        the dcgmready gate does not wait for a DaemonSet.
+      type: string
+      section: GPU Operator
+    - variable: dcgmPort
+      label: DCGM Port
+      type: string
+      required: true
+      defaultValue: '5555'
+      section: GPU Operator
+    - variable: driverPreinstalled
+      label: NVIDIA Driver Preinstalled
+      description: Set true when the GPU node image already contains the NVIDIA driver. NVSentinel then labels
+        in preinstalled-driver mode, and the GPU reset Job finds nvidia-smi on the host.
+      type: boolean
+      defaultValue: 'false'
+      section: GPU Operator
+    - variable: cordon
+      label: Cordon Faulty GPU Nodes
+      description: Cordon a GPU node when NVSentinel detects a fault on it. Draining (drain) and
+        rebooting (remediation) are separate and off by default. Needs cert-manager in the cluster, for
+        the MongoDB store quarantine uses. Set false for monitoring only.
+      type: boolean
+      defaultValue: 'true'
+      section: Fault Handling
+    - variable: drain
+      label: Drains Cordoned GPU Nodes
+      description: Also evict pods from a GPU node NVSentinel cordoned, as drainMode says. No effect
+        unless cordon is on.
+      type: boolean
+      defaultValue: 'false'
+      section: Fault Handling
+    - variable: drainMode
+      label: Drain Mode
+      description: How the drain treats pods in user namespaces. Immediate evicts them at once through the
+        Eviction API, like kubectl drain, honoring PodDisruptionBudgets. AllowCompletion waits, with no time
+        limit, for pods to finish on their own, so a Deployment's pods hold the drain open. DeleteAfterTimeout
+        waits too, then force deletes the ones still running after drainTimeoutMinutes.
+      options:
+        - Immediate
+        - AllowCompletion
+        - DeleteAfterTimeout
+      defaultValue: Immediate
+      section: Fault Handling
+    - variable: drainTimeoutMinutes
+      label: Drain Timeout Minutes
+      description: With DeleteAfterTimeout, minutes after the fault was detected at which pods still running are
+        force deleted.
+      type: number
+      defaultValue: '60'
+      min: 1
+      section: Fault Handling
+    - variable: drainImmediateNamespaces
+      label: Drain Immediate Namespaces
+      description: Comma-separated namespaces, or globs such as test-*, whose pods are evicted at once whatever
+        drainMode says.
+      type: string
+      section: Fault Handling
+    - variable: remediation
+      label: Remediation
+      description: What NVSentinel does to a GPU node it cordoned and drained. none leaves recovery to you,
+        reboot reboots the node, and gpu-reset tries to reset only the faulty GPU first. No effect unless
+        cordon and drain are on. Use with static node pools only; see the Stack README.
+      options:
+        - none
+        - reboot
+        - gpu-reset
+      defaultValue: none
+      section: Fault Handling
+    - variable: slinkyDrain
+      label: Drains Slurm Nodes Through Slinky
+      description: Drain cordoned GPU nodes that match the Slinky node selector through Slurm, with NVSentinel's
+        Slinky drainer, instead of evicting their pods. It waits until the Slurm node is drained and its jobs
+        have finished, then deletes the Slurm worker pods. Needs the Slinky Slurm operator. No effect unless
+        cordon and drain are on.
+      type: boolean
+      defaultValue: 'false'
+      section: Slinky
+    - variable: slinkyNodeSelector
+      label: Slinky Node Selector
+      description: Label selector for the nodes that drain through Slurm. The default matches every GPU node, where a
+        default Slinky install runs its Slurm workers. Matching nodes get no pod eviction, so pods outside the
+        Slinky namespace stay on them.
+      type: string
+      defaultValue: nvidia.com/gpu.present=true
+      section: Slinky
+    - variable: slinkyNamespace
+      label: Slinky Namespace
+      description: Namespace of the Slurm worker pods. On a drained node, every pod in it is deleted.
+      type: string
+      defaultValue: slurm
+      section: Slinky
+    - variable: dryRun
+      label: Dry Run
+      description: Log the cordons and drains NVSentinel would make without making them.
+      type: boolean
+      defaultValue: 'false'
+      section: Fault Handling
+    - variable: circuitBreakerEnabled
+      label: Circuit Breaker Enabled
+      description: Stop cordoning when too many GPU nodes are cordoned within the window, so a fleet-wide fault
+        cannot cordon every GPU node. Off removes that limit, but one or two GPU nodes then recover without a
+        manual reset. Turning it back on keeps an earlier trip until it is reset.
+      type: boolean
+      defaultValue: 'true'
+      section: Circuit Breaker
+    - variable: circuitBreakerDuration
+      label: Circuit Breaker Window
+      description: Window the circuit breaker counts cordons in, as a Go duration such as 5m or 1h. Fault
+        quarantine fails to start on any other format.
+      type: string
+      defaultValue: 5m
+      section: Circuit Breaker
+    - variable: circuitBreakerPercentage
+      label: Circuit Breaker Percentage
+      description: Share of GPU nodes cordoned within the window that trips NVSentinel's circuit breaker. A
+        tripped breaker stops all cordoning and uncordoning until it is reset by hand. With one GPU node, the
+        first cordon always trips it.
+      type: number
+      defaultValue: '50'
+      min: 1
+      section: Circuit Breaker
+    - variable: circuitBreakerMaxNodes
+      label: Circuit Breaker Max Nodes
+      description: Cordons within the window that trip the breaker regardless of fleet size. 0 uses the
+        percentage alone; when both apply, the lower one wins.
+      type: number
+      defaultValue: '0'
+      min: 0
+      section: Circuit Breaker
+    - variable: mongodbReplicas
+      label: MongoDB Replicas
+      description: Replicas of NVSentinel's MongoDB store, used when cordoning is on. Each requests 1 CPU and
+        1.5Gi on the CPU services pool. 3 survives the loss of one CPU node.
+      type: number
+      defaultValue: '1'
+      min: 1
+      section: MongoDB
+    - variable: mongodbStorageClass
+      label: MongoDB Storage Class
+      description: StorageClass for NVSentinel's MongoDB volumes, used when cordoning is on. Empty uses the
+        cluster's default StorageClass, without which the volumes stay Pending. Set it at install; changing it
+        later fails the NVSentinel task, because a StatefulSet's volume claims are immutable.
+      type: string
+      section: MongoDB
+    - variable: version
+      label: NVSentinel Chart and Image Version
+      type: string
+      required: true
+      section: Versions
+      # renovate: datasource=github-releases depName=NVIDIA/NVSentinel
+      defaultValue: v1.32.0
+  # What discover resolved, readable from the StackInstance outputs subresource.
+  publishedOutputs:
+    - name: gpudrivermode
+      fromTask:
+        task: discover
+        output: mode
+    - name: dcgmhost
+      fromTask:
+        task: discover
+        output: dcgmhost
+    - name: dcgmport
+      fromTask:
+        task: discover
+        output: dcgmport
+  tasks:
+    # Reads the driver mode from the GPU Operator already in the cluster. Its outputs are the only
+    # place the rest of the graph learns the mode; the DCGM names come with it so no task repeats
+    # the mapping.
+    - name: discover
+      timeout: 6m0s
+      app:
+        templateRef:
+          name: nvsentinel-discover
+        parameters:
+          gpuDriverMode: '{{ .Values.gpuDriverMode }}'
+          gpuOperatorNamespace: '{{ .Values.gpuOperatorNamespace }}'
+          dcgmHost: '{{ .Values.dcgmHost }}'
+          dcgmPort: '{{ .Values.dcgmPort }}'
+          cpuNodeSelector: '{{ .Values.cpuNodeSelector | default (printf "workload.example.com/pool=%s" .Values.cpuNodePool) }}'
+          # Checked for key=value form only. Empty keeps the pool label, which needs no check.
+          gpuNodeSelector: '{{ .Values.gpuNodeSelector }}'
+          # discover fails if the selector would strand a volume here. It reports, the Stack does not wait for it.
+          pinnedVolumeNamespace: nvsentinel
+      outputs:
+        - name: mode
+          fromResource:
+            apiVersion: v1
+            kind: ConfigMap
+            namespace: nvsentinel-stack
+            name: nvsentinel-discovery
+            jsonPath: '{.data.mode}'
+        - name: dcgmhost
+          fromResource:
+            apiVersion: v1
+            kind: ConfigMap
+            namespace: nvsentinel-stack
+            name: nvsentinel-discovery
+            jsonPath: '{.data.dcgmHost}'
+        - name: dcgmport
+          fromResource:
+            apiVersion: v1
+            kind: ConfigMap
+            namespace: nvsentinel-stack
+            name: nvsentinel-discovery
+            jsonPath: '{.data.dcgmPort}'
+        - name: dcgmdaemonset
+          fromResource:
+            apiVersion: v1
+            kind: ConfigMap
+            namespace: nvsentinel-stack
+            name: nvsentinel-discovery
+            jsonPath: '{.data.dcgmDaemonSet}'
+        - name: dcgmnamespace
+          fromResource:
+            apiVersion: v1
+            kind: ConfigMap
+            namespace: nvsentinel-stack
+            name: nvsentinel-discovery
+            jsonPath: '{.data.dcgmNamespace}'
+        - name: dcgmwait
+          fromResource:
+            apiVersion: v1
+            kind: ConfigMap
+            namespace: nvsentinel-stack
+            name: nvsentinel-discovery
+            jsonPath: '{.data.dcgmWait}'
+        - name: capacitysource
+          fromResource:
+            apiVersion: v1
+            kind: ConfigMap
+            namespace: nvsentinel-stack
+            name: nvsentinel-discovery
+            jsonPath: '{.data.capacitySource}'
+        - name: capacityresource
+          fromResource:
+            apiVersion: v1
+            kind: ConfigMap
+            namespace: nvsentinel-stack
+            name: nvsentinel-discovery
+            jsonPath: '{.data.capacityResource}'
+    # Holds until the scheduler sees one GPU on the GPU node selector. With device-plugin it sums
+    # nvidia.com/gpu in node allocatable; with dra it counts whole GPUs (type gpu) that the
+    # gpu.nvidia.com driver publishes in ResourceSlices. It proves a GPU node has joined and its
+    # driver works, which the dcgmready gate below depends on.
+    - name: gpuready
+      dependsOn:
+        - discover
+      timeout: 28m0s
+      app:
+        templateRef:
+          name: nvsentinel-gate
+        parameters:
+          cpuNodeSelector: '{{ .Values.cpuNodeSelector | default (printf "workload.example.com/pool=%s" .Values.cpuNodePool) }}'
+          gateName: gpuready
+          capacitySource: '{{ .Outputs.discover.capacitysource }}'
+          capacityResource: '{{ .Outputs.discover.capacityresource }}'
+          # Whole GPUs only. Ignored with allocatable.
+          capacityDeviceType: gpu
+          capacityMin: "1"
+          capacityNodeSelector: '{{ .Values.gpuNodeSelector | default "workload.example.com/pool=gpu-compute" }}'
+          timeoutSeconds: "1380"
+    # NVSentinel started against a DCGM host engine that is not serving reports
+    # GpuDcgmConnectivityFailure. This gate waits for the DCGM DaemonSet to finish rolling out. It
+    # follows gpuready so a GPU node exists: a DaemonSet that schedules no pods yet has already
+    # finished rolling out. With a dcgmHost override there is no DaemonSet to name, so the wait is
+    # off and the gate only repeats the capacity count.
+    - name: dcgmready
+      dependsOn:
+        - discover
+        - gpuready
+      timeout: 15m0s
+      app:
+        templateRef:
+          name: nvsentinel-gate
+        parameters:
+          cpuNodeSelector: '{{ .Values.cpuNodeSelector | default (printf "workload.example.com/pool=%s" .Values.cpuNodePool) }}'
+          gateName: dcgmready
+          waitEnabled: '{{ .Outputs.discover.dcgmwait }}'
+          waitResource: 'daemonset/{{ .Outputs.discover.dcgmdaemonset }}'
+          waitNamespace: '{{ .Outputs.discover.dcgmnamespace }}'
+          waitCondition: rollout
+          watchAPIGroup: apps
+          watchResources: daemonsets
+          capacitySource: '{{ .Outputs.discover.capacitysource }}'
+          capacityResource: '{{ .Outputs.discover.capacityresource }}'
+          capacityDeviceType: gpu
+          capacityMin: "1"
+          capacityNodeSelector: '{{ .Values.gpuNodeSelector | default "workload.example.com/pool=gpu-compute" }}'
+          timeoutSeconds: "780"
+    # Always runs, and renders nothing unless Slinky drain is effectively on. The same expression
+    # decides customDrain in the nvsentinel task, so the drain template it mounts always exists.
+    - name: slinky-drainer
+      dependsOn:
+        - discover
+        - gpuready
+      timeout: 12m0s
+      app:
+        templateRef:
+          name: nvsentinel-slinky-drainer
+        parameters:
+          enabled: '{{ and (eq (toString .Values.cordon) "true") (eq (toString .Values.drain) "true") (eq (toString .Values.slinkyDrain) "true") }}'
+          version: '{{ .Values.version }}'
+          slinkyNamespace: '{{ .Values.slinkyNamespace }}'
+          cpuNodePool: '{{ .Values.cpuNodePool }}'
+          cpuNodeSelector: '{{ .Values.cpuNodeSelector }}'
+    - name: nvsentinel
+      dependsOn:
+        - discover
+        - gpuready
+        - dcgmready
+        # node-drainer mounts the drain template and creates DrainRequests.
+        - slinky-drainer
+      timeout: 20m0s
+      argoCDApplication:
+        templateRef:
+          name: nvsentinel-nvsentinel
+        parameters:
+          cpuNodePool: '{{ .Values.cpuNodePool }}'
+          cpuNodeSelector: '{{ .Values.cpuNodeSelector }}'
+          gpuNodeSelector: '{{ .Values.gpuNodeSelector }}'
+          version: '{{ .Values.version }}'
+          project: '{{ .Values.argoProject }}'
+          driverPreinstalled: '{{ .Values.driverPreinstalled | toString }}'
+          gpuDriverMode: '{{ .Outputs.discover.mode }}'
+          cordon: '{{ .Values.cordon | toString }}'
+          drain: '{{ .Values.drain | toString }}'
+          drainMode: '{{ .Values.drainMode }}'
+          drainTimeoutMinutes: '{{ .Values.drainTimeoutMinutes }}'
+          drainImmediateNamespaces: '{{ .Values.drainImmediateNamespaces }}'
+          remediation: '{{ .Values.remediation }}'
+          slinkyDrain: '{{ and (eq (toString .Values.cordon) "true") (eq (toString .Values.drain) "true") (eq (toString .Values.slinkyDrain) "true") }}'
+          slinkyNodeSelector: '{{ .Values.slinkyNodeSelector }}'
+          dryRun: '{{ .Values.dryRun | toString }}'
+          mongodbReplicas: '{{ .Values.mongodbReplicas }}'
+          mongodbStorageClass: '{{ .Values.mongodbStorageClass }}'
+          circuitBreakerEnabled: '{{ .Values.circuitBreakerEnabled | toString }}'
+          circuitBreakerDuration: '{{ .Values.circuitBreakerDuration }}'
+          circuitBreakerPercentage: '{{ .Values.circuitBreakerPercentage }}'
+          circuitBreakerMaxNodes: '{{ .Values.circuitBreakerMaxNodes }}'
+          # What discover resolved, not hard-coded here.
+          dcgmHost: '{{ .Outputs.discover.dcgmhost }}'
+          dcgmPort: '{{ .Outputs.discover.dcgmport }}'
