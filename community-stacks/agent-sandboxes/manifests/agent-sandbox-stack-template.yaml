@@ -22,7 +22,7 @@
 #
 #   hostnetpolicy ─► calico ─► calicocrds ─► calicoconfig ─► calicoready ─┬─► preflight ─► vnode ─► vnodeready ──────┐
 #                                                                         └─► controller ─┬─► router ─┬───┐          │
-#                                                                                         │           └─► vbox ◄─────┤
+#                                                                                         │           └─► teardown ◄─┤
 #                                                                                         └─► guardrails ─┴─► pool ◄─┘
 #                                                                                                              │
 #                                                                                                              └─► verify
@@ -51,9 +51,7 @@
 #               (warmPoolType). The other type is claimed cold.
 #   verify      Proves the pool is warm on vNode with remapped UIDs, the NetworkPolicy
 #               exists, and the VAP rejects a non-compliant Sandbox.
-#   vbox        vBox, the web UI for sandboxes, claims and the audit trail, from its
-#               public Helm chart, into its own namespace vbox-system.
-#   teardown    Pre-delete hook: on Stack deletion removes the sandbox objects, then vBox,
+#   teardown    Pre-delete hook: on Stack deletion removes the sandbox objects, then
 #               the controller and vNode in a safe order. Calico and the CRDs stay.
 #
 # Apply against the vCluster Platform management API:
@@ -76,7 +74,7 @@ spec:
     Installs Calico as the CNI and vNode as the sandbox runtime, then the Kubernetes
     Agent Sandbox controller (Helm), Sandbox Router, admission and quota guardrails,
     hardened, vNode-isolated Python and Chrome SandboxTemplates with a warm pool of
-    one of them, and the vBox UI into a tenant cluster with private nodes.
+    one of them into a tenant cluster with private nodes.
   parameters:
     # Versions
     - variable: vnodeVersion
@@ -111,15 +109,6 @@ spec:
       type: string
       defaultValue: v1.0.6
       validation: '^v[0-9]+\.[0-9]+\.[0-9]+$'
-      section: Versions
-    - variable: vboxVersion
-      label: vBox chart version
-      description: >-
-        Version of the vBox Helm chart at vboxChart. The chart's appVersion selects the
-        matching image, <your-registry>/vbox-ui:<appVersion> (the chart's image.repository).
-      type: string
-      defaultValue: 0.1.0
-      validation: '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'
       section: Versions
     - variable: toolsImage
       label: Installer image
@@ -200,8 +189,8 @@ spec:
     - variable: systemNodeRole
       label: System node role
       description: >-
-        Runs the Sandbox Router, the Agent Sandbox controller, the Tigera operator and
-        vBox only on nodes labelled pool.agent-sandbox.io/role=<this>, the always-on
+        Runs the Sandbox Router, the Agent Sandbox controller and the Tigera operator
+        only on nodes labelled pool.agent-sandbox.io/role=<this>, the always-on
         base node of the agent-sandbox-aws template. Autoscaled sandbox nodes then hold
         nothing but sandboxes, so they empty out and are removed. Empty: no restriction.
       type: string
@@ -305,48 +294,6 @@ spec:
       defaultValue: 64Gi
       section: Sandboxes
 
-    # vBox
-    - variable: vboxEnabled
-      label: Install vBox
-      description: >-
-        The vBox web UI for sandboxes, claims and the audit trail, in its own namespace
-        vbox-system. Turning it off uninstalls it; its namespace, settings Secret and
-        audit trail volume are kept.
-      type: boolean
-      defaultValue: "true"
-      section: vBox
-    - variable: vboxChart
-      label: vBox chart
-      description: >-
-        OCI reference of the vBox Helm chart, as pushed by `helm push` (see
-        agent-sandboxes/README.md). The install job pulls it without credentials, so the
-        repository must be public.
-      type: string
-      defaultValue: oci://<your-registry>/vbox
-      section: vBox
-    - variable: vboxPublicUrl
-      label: vBox public URL
-      description: >-
-        The URL browsers reach vBox at, the base of its OpenID Connect redirect URI.
-        Empty: derived from each request, which is right for kubectl port-forward.
-      type: string
-      defaultValue: ""
-      section: vBox
-    - variable: vboxServiceType
-      label: vBox service type
-      description: >-
-        internal: a ClusterIP Service, reached with kubectl port-forward. exposed: a
-        LoadBalancer Service annotated for an AWS Network Load Balancer, which needs the
-        AWS CCM in the tenant cluster. Sign-in is off until it is configured on vBox's
-        Settings page, so an exposed vBox is open to anyone who can reach the address
-        until then.
-      type: string
-      options:
-        - internal
-        - exposed
-      defaultValue: internal
-      section: vBox
-
   tasks:
     # 1. Calico operator. Installed by a host-network Helm-hook Job running helm, not
     #    as a chart App, on purpose. Deleting a tenant cluster deletes its Stack first,
@@ -354,7 +301,7 @@ spec:
     #    pre-delete hook then deletes the Installation ("cleaned up prior to tearing
     #    down the operator"), the operator removes calico-node, and every pod still
     #    running can no longer have its network torn down ("plugin type=calico failed
-    #    (delete)"). They hang in Terminating, vBox's PVC with them, and the cluster
+    #    (delete)"). They hang in Terminating, with their PVCs, and the cluster
     #    deletion waits forever. A release installed by this Job is never uninstalled
     #    by the platform, so Calico outlives the Stack, like vNode does; deleting the
     #    task removes only its ConfigMap. Remove Calico by hand with
@@ -694,7 +641,7 @@ spec:
     #    dependsOn. A chart App's DaemonSet was gone within a second, while the sandbox
     #    pods were still stopping, and the kubelet cannot stop a vNode container without
     #    the vNode manager, so they hung in Terminating. Deleting a bash task removes only
-    #    its Job, so vNode outlives the Stack, like the controller and vBox do, and a
+    #    its Job, so vNode outlives the Stack, like the controller does, and a
     #    recreated Stack upgrades the same release. Remove it by hand with
     #    `helm uninstall vnode-runtime -n vnode-runtime` once no sandbox pods are left.
     - name: vnode
@@ -1996,109 +1943,7 @@ spec:
                         - name: tmp
                           emptyDir: {}
 
-    # 13. vBox, the web UI for the sandboxes, from its public Helm chart. A Helm job
-    #    rather than a chart App, like the controller task, because the chart is an
-    #    OCI artifact. The release record goes in default: the chart creates the
-    #    vbox-system namespace itself and refuses to be installed into it.
-    #    After router, so the Agent Sandbox CRDs and agent-sandbox-system (where the
-    #    chart puts the Role for reading the router's access log) exist. After
-    #    vnodeready too: vNode restarts containerd on every node as it installs, which
-    #    can take the vBox pod down while helm --wait is still waiting for it.
-    #    Listed last on purpose: keep tasks at stable positions in this list.
-    - name: vbox
-      dependsOn:
-        - router
-        - vnodeready
-      timeout: 15m
-      app:
-        template:
-          spec:
-            displayName: vBox
-            description: Web UI for sandboxes, claims and the audit trail, in vbox-system.
-            defaultNamespace: kube-system
-            wait: true
-            config:
-              bash:
-                image: "{{ .Values.toolsImage }}"
-                clusterRole: cluster-admin
-                script: |-
-                  set -euo pipefail
-                  {{- if eq (print .Values.vboxEnabled) "true" }}
-                  {{- if eq (print .Values.vboxServiceType) "exposed" }}
-                  # Exposed as a Network Load Balancer: the AWS CCM creates one in the
-                  # nodes' region and VPC for a Service annotated
-                  # aws-load-balancer-type: nlb (a Classic ELB without it). The CCM never
-                  # converts an existing load balancer, so a LoadBalancer Service created
-                  # without the annotation is deleted first; the CCM then removes its
-                  # Classic ELB, and helm recreates the Service, which gets an NLB.
-                  LBTYPE=$(kubectl -n vbox-system get svc vbox -o jsonpath='{.spec.type}/{.metadata.annotations.service\.beta\.kubernetes\.io/aws-load-balancer-type}' 2>/dev/null || true)
-                  if [ "${LBTYPE%%/*}" = LoadBalancer ] && [ "${LBTYPE#*/}" != nlb ]; then
-                    echo "Replacing the vbox Service's Classic ELB with an NLB"
-                    kubectl -n vbox-system delete svc vbox --wait --timeout=5m
-                  fi
-                  {{- end }}
-                  helm upgrade --install vbox "{{ .Values.vboxChart }}" \
-                    --version "{{ .Values.vboxVersion }}" \
-                    --namespace default \
-                    --set-string publicUrl="{{ .Values.vboxPublicUrl }}" \
-                    --set collector.routerNamespace=agent-sandbox-system \
-                    {{- if .Values.systemNodeRole }}
-                    --set-string 'nodeSelector.pool\.agent-sandbox\.io/role={{ .Values.systemNodeRole }}' \
-                    {{- end }}
-                    {{- if eq (print .Values.vboxServiceType) "exposed" }}
-                    --set service.type=LoadBalancer \
-                    --set-string 'service.annotations.service\.beta\.kubernetes\.io/aws-load-balancer-type=nlb' \
-                    {{- else }}
-                    --set service.type=ClusterIP \
-                    {{- end }}
-                    --wait=legacy --timeout 10m
-                  kubectl -n vbox-system get deployment,service,persistentvolumeclaim
-                  {{- if eq (print .Values.vboxServiceType) "exposed" }}
-                  # helm --wait does not wait for a load balancer address, so report
-                  # whichever there is rather than failing the install over it.
-                  ADDR=""
-                  for i in $(seq 1 30); do
-                    ADDR=$(kubectl -n vbox-system get svc vbox -o jsonpath='{.status.loadBalancer.ingress[0].hostname}{.status.loadBalancer.ingress[0].ip}')
-                    if [ -n "$ADDR" ]; then break; fi
-                    sleep 10
-                  done
-                  if [ -n "$ADDR" ]; then
-                    VBOX_ADDRESS="http://${ADDR}"
-                    echo "Open vBox: ${VBOX_ADDRESS}"
-                  else
-                    VBOX_ADDRESS="pending: the vbox LoadBalancer had no address after 5 minutes"
-                    echo "WARN: the vbox LoadBalancer Service has no address after 5 minutes."
-                    echo "      Is a load balancer controller running in this tenant cluster?"
-                  fi
-                  echo "Or: kubectl -n vbox-system port-forward svc/vbox 8080:80"
-                  {{- else }}
-                  VBOX_ADDRESS=$(kubectl -n vbox-system get svc vbox -o jsonpath='{.spec.clusterIP}')
-                  echo "Open vBox: kubectl -n vbox-system port-forward svc/vbox 8080:80 (ClusterIP ${VBOX_ADDRESS})"
-                  {{- end }}
-                  {{- else }}
-                  # Disabled: remove the release. The chart keeps vbox-system, the
-                  # settings Secret and the audit trail volume.
-                  helm uninstall vbox --namespace default --ignore-not-found --wait=legacy
-                  VBOX_ADDRESS="disabled"
-                  {{- end }}
-
-                  # Recorded for the Stack's vboxAddress output. A ConfigMap rather than
-                  # the Service itself, because the value depends on the service type
-                  # (load balancer URL or ClusterIP) and the Service does not exist at
-                  # all while vBox is disabled.
-                  kubectl -n kube-system create configmap agent-sandbox-vbox \
-                    --from-literal=address="${VBOX_ADDRESS}" \
-                    --dry-run=client -o yaml | kubectl apply -f -
-      outputs:
-        - name: address
-          fromResource:
-            apiVersion: v1
-            kind: ConfigMap
-            namespace: kube-system
-            name: agent-sandbox-vbox
-            jsonPath: "{.data.address}"
-
-    # 14. Gate between the operator and its configuration. The tigera-operator chart
+    # 13. Gate between the operator and its configuration. The tigera-operator chart
     #    ships no CRDs: the operator creates them itself a few seconds after it starts
     #    (manageCRDs), and the calico task counts as done as soon as the release is
     #    deployed. Without this gate calicoconfig raced the operator and failed its
@@ -2242,33 +2087,33 @@ spec:
                         - name: tmp
                           emptyDir: {}
 
-    # 15. Ordered teardown when the Stack is deleted. The platform uninstalls every
+    # 14. Ordered teardown when the Stack is deleted. The platform uninstalls every
     #    task at once, ignoring dependsOn, and only removes what each task created
-    #    itself, so the releases the bash and Job tasks installed (vBox, the
+    #    itself, so the releases the bash and Job tasks installed (the
     #    controller, vNode) outlived the Stack. This task's release carries a Helm
     #    pre-delete hook, so its uninstall runs this Job first: it removes what the
     #    platform cannot, in an order the platform cannot:
     #      1. sandbox claims, warm pools and sandboxes, so nothing recreates pods
     #      2. wait until no vNode pod is left (vNode is still installed, so they stop)
-    #      3. vBox and its ConfigMap, 4. the controller, 5. vNode, only if step 2
+    #      3. the controller, 4. vNode, only if step 2
     #         confirmed no vNode pod remains, so it can never cause the deadlock the
     #         vnode task comment describes.
     #    Kept on purpose: Calico, the cluster's network, which goes with the cluster;
-    #    the Agent Sandbox CRDs, whose deletion would delete every sandbox and claim;
-    #    vBox's namespace, settings Secret and audit trail (the chart keeps them).
+    #    the Agent Sandbox CRDs, whose deletion would delete every sandbox and claim.
     #    Host-network and tolerating every taint, so it also runs while the tenant
     #    cluster itself is being deleted. It always exits 0 and has a deadline below
     #    Helm's 5m hook timeout: a cleanup problem must never block a deletion.
     #    Listed last on purpose: keep tasks at stable positions in this list.
     - name: teardown
       dependsOn:
-        - vbox
+        - router
+        - vnodeready
       timeout: 10m
       app:
         template:
           spec:
             displayName: Teardown on Stack deletion
-            description: Pre-delete hook that removes vBox, the controller and vNode in a safe order.
+            description: Pre-delete hook that removes the controller and vNode in a safe order.
             defaultNamespace: kube-system
             wait: true
             config:
@@ -2280,8 +2125,8 @@ spec:
                   name: agent-sandbox-teardown
                   namespace: kube-system
                 data:
-                  removes: sandbox objects, then vBox, the Agent Sandbox controller and vNode
-                  keeps: Calico, the Agent Sandbox CRDs, vBox's namespace and audit trail
+                  removes: sandbox objects, then the Agent Sandbox controller and vNode
+                  keeps: Calico and the Agent Sandbox CRDs
                 ---
                 apiVersion: v1
                 kind: ServiceAccount
@@ -2370,7 +2215,7 @@ spec:
 
                               echo "2. Waiting for vNode pods to stop (vNode stays installed until they have)"
                               LEFT=$(vnode_pods)
-                              # Worst case adds up to 120s here plus 120s of helm timeouts
+                              # Worst case adds up to 120s here plus 75s of helm timeouts
                               # below: inside the Job's 270s deadline, so the hook itself
                               # can never fail and block the Stack's deletion.
                               for i in $(seq 1 24); do
@@ -2380,18 +2225,14 @@ spec:
                                 LEFT=$(vnode_pods)
                               done
 
-                              echo "3. Removing vBox (its namespace, settings and audit trail are kept)"
-                              helm uninstall vbox --namespace default --ignore-not-found --wait=legacy --timeout 45s 2>&1 || true
-                              kubectl -n kube-system delete configmap agent-sandbox-vbox --ignore-not-found 2>&1 || true
-
-                              echo "4. Removing the Agent Sandbox controller (its CRDs are kept)"
+                              echo "3. Removing the Agent Sandbox controller (its CRDs are kept)"
                               helm uninstall agent-sandbox --namespace agent-sandbox-system --ignore-not-found --wait=legacy --timeout 45s 2>&1 || true
 
                               if [ "$LEFT" -eq 0 ]; then
-                                echo "5. Removing vNode"
+                                echo "4. Removing vNode"
                                 helm uninstall vnode-runtime --namespace vnode-runtime --ignore-not-found --wait=legacy --timeout 30s 2>&1 || true
                               else
-                                echo "5. Keeping vNode: ${LEFT} vNode pod(s) still running, and they could not be stopped without it."
+                                echo "4. Keeping vNode: ${LEFT} vNode pod(s) still running, and they could not be stopped without it."
                                 echo "   Remove it later with: helm uninstall vnode-runtime -n vnode-runtime"
                               fi
                               echo "Calico is kept: it is the cluster's network and goes with the cluster."
@@ -2433,9 +2274,3 @@ spec:
       fromTask:
         task: pool
         output: warmpoolname
-    # http://<load balancer> when vboxServiceType is exposed, the Service's ClusterIP
-    # when internal, "disabled" when vboxEnabled is false.
-    - name: vboxAddress
-      fromTask:
-        task: vbox
-        output: address

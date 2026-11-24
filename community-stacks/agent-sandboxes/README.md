@@ -12,8 +12,6 @@ vCluster Platform UI. Inside it, the
 [Kubernetes Agent Sandbox](https://agent-sandbox.sigs.k8s.io) hands out sandboxes on
 demand, each one running under vNode and fenced in by policy.
 
-![vBox, the Agent Sandbox web UI, listing two warm Python sandboxes from python-pool, both Available and Ready, running on vNode](docs/vbox-sandboxes.png)
-
 **What you get**
 
 - **Sandboxes in seconds.** A warm pool keeps pre-started sandboxes ready, so an agent
@@ -28,9 +26,6 @@ demand, each one running under vNode and fenced in by policy.
 - **Capacity that follows demand.** Sandbox nodes are autoscaled EC2 instances in the
   AWS region you pick, added for pending sandboxes and removed once empty. System
   components stay on one always-on base node, so sandbox nodes really do empty out.
-- **Visibility.** vBox, pictured above, shows every sandbox, claim, warm pool and
-  template, the runtime each sandbox runs on, and an audit trail of which client used
-  which sandbox.
 
 **How it fits together**
 
@@ -71,12 +66,6 @@ demand, each one running under vNode and fenced in by policy.
    `data.xlsx` is a sample sales workbook to ask questions about. See
    [Smoke test](#smoke-test) for running several agents at once.
 
-5. **vBox** shows what the agents are doing. It is a web UI, installed by the Stack,
-   that lists every sandbox object in the tenant cluster: sandboxes, claims, warm
-   pools and templates, with the runtime each sandbox runs on and an audit trail of
-   which client used which sandbox. The Stack publishes its address as the
-   `vboxAddress` output.
-
 **What's in this folder**
 
 | Path | What |
@@ -88,9 +77,6 @@ demand, each one running under vNode and fenced in by policy.
 | `data-analytics-agent/run_agents.py` | Smoke test: runs several agents at once against the warm pool |
 | `data-analytics-agent/data.xlsx` | Sample sales workbook the agents analyze |
 | `data-analytics-agent/pyproject.toml`, `uv.lock` | The agents' Python project, for `uv sync` |
-| `vbox/vbox-ui/` | Source of vBox (Next.js app, Dockerfile) |
-| `chart/` | vBox's Helm chart |
-| `docs/` | Images for this README |
 
 ## What the Stack does
 
@@ -111,72 +97,17 @@ It installs, in dependency order:
 | **Sandbox Router** | The data-plane proxy agents reach sandboxes through. Only the agent namespace may call it. |
 | **Guardrails** | A ValidatingAdmissionPolicy that rejects any sandbox not on vNode or not hardened, plus a quota, limits and claim-only RBAC for the agent service account. |
 | **Sandbox templates and warm pool** | Two official sandboxes, a Python runtime (port 8888) and Chrome with the DevTools Protocol (port 9222), and a warm pool that keeps one of them ready. |
-| **vBox** | A web UI for sandboxes, claims, warm pools and templates, with an audit trail of which client used which sandbox. |
 
 Around these, a few short-lived jobs make the install reliable rather than adding
 anything that keeps running: they allow host networking for Calico and vNode under
 the AWS node provider's admission policy, wait for Calico and vNode to be ready, check
 the nodes' kernel and container runtime, and verify at the end that sandboxes really
 run under vNode and that the admission policy rejects a privileged one. Deleting the
-Stack runs a teardown that removes vBox, the controller and vNode in a safe order.
+Stack runs a teardown that removes the controller and vNode in a safe order.
 Calico stays, because it is the cluster's network; it goes with the cluster.
 
-The Stack publishes `sandboxNamespace`, `warmPoolName`, `vboxAddress`,
-`routerClusterIP` and `warmPoolReady` as outputs, which is what an agent needs to
-claim a sandbox and what a person needs to open vBox.
-
-## How vBox works
-
-vBox is a single Next.js server (App Router, TypeScript) running as one pod in its
-own `vbox-system` namespace inside the tenant cluster. It has no database server
-and no agent of its own: everything it shows comes from the tenant cluster's API
-server, and the little it stores lives in SQLite files on a PersistentVolumeClaim.
-
-```
-                      tenant cluster API server
-                 ▲              ▲               ▲
-  get/list       │              │ pods/log      │ list/update
-  Sandbox,       │              │ (follow)      │ settings Secret
-  Claim, Pool,   │              │               │
-  Template, Pods │              │               │
-┌────────────────┴──┐ ┌─────────┴──────────┐ ┌──┴───────────────────┐
-│ Pages             │ │ Audit collector    │ │ Sign-in (optional)   │
-│ server-rendered,  │ │ polls claims 3 s,  │ │ OIDC code flow +     │
-│ read on every     │ │ follows Sandbox    │ │ PKCE, server-side    │
-│ request, 5 s auto │ │ Router access log  │ │ sessions             │
-│ refresh           │ │                    │ │                      │
-└───────────────────┘ └─────────┬──────────┘ └──┬───────────────────┘
-                                ▼               ▼
-                       /data/audit.db      /data/auth.db   (PVC)
-```
-
-It has three parts, all in the same process:
-
-- **Pages.** Sandboxes, Claims, Warm Pools and Templates are rendered on the server
-  from a fresh read of the four Agent Sandbox kinds plus their pods, PVCs and
-  NetworkPolicies. Nothing is cached between requests, so a page always shows what
-  the API server holds. The service account's ClusterRole is `get`/`list` only, with
-  no `watch` and no writes.
-- **Audit collector.** Started with the server (`src/instrumentation.ts`), it turns
-  two sources into one session per claimed sandbox: `SandboxClaim` transitions,
-  polled every 3 seconds (created, assigned warm or cold, ready, released, with the
-  client from the `agents.x-k8s.io/created-by` label), and the Sandbox Router's
-  access log, followed live, where every client request becomes a step. It reads
-  only the router's logs, never the sandbox pods' own logs or request payloads.
-  Events go into `audit.db`, which is append-only (triggers reject `UPDATE` and
-  `DELETE`) and hash-chained, so tampering shows up as a broken chain on the
-  session timeline. Saved read positions and per-event dedup keys let a restarted
-  collector resume without gaps or duplicates.
-- **Sign-in.** Off until an OpenID Connect provider is configured on the Settings
-  page. The provider settings live in a Secret in `vbox-system` that vBox finds by
-  the `vbox.vcluster.com/oidc-config: "true"` annotation, which is the one object
-  vBox writes. Sessions live in `auth.db`, kept apart from the audit trail because
-  they are mutable. `src/proxy.ts` turns away unauthenticated requests, and pages
-  and routes check the session again where the data is used.
-
-Because a single collector owns `audit.db`, vBox runs as one replica. The source is
-in [`vbox/vbox-ui/`](vbox/vbox-ui/), and its README covers the pages, the audit
-trail and sign-in in detail.
+The Stack publishes `sandboxNamespace`, `warmPoolName`, `routerClusterIP` and
+`warmPoolReady` as outputs, which is what an agent needs to claim a sandbox.
 
 ## Where it runs
 
@@ -215,66 +146,7 @@ the files in this folder.
   6.1 or a runtime other than containerd, and warns on a containerd version outside
   1.7 or 2.0. It does not check the cgroup version.
 
-### 1. Build and publish vBox
-
-The Stack installs vBox from a Helm chart in an OCI registry, and the chart runs an
-image from the same registry. Neither is published for you: `<your-registry>` is a
-placeholder in `chart/values.yaml` (`image.repository`) and in
-`manifests/agent-sandbox-stack-template.yaml` (the `vboxChart` default). Do this once, and
-again for every new vBox version, before applying the templates.
-
-**The registry must allow anonymous pulls.** The Stack's install job pulls the chart
-without logging in, and the tenant cluster's nodes pull the image without a pull
-secret. Any OCI registry works: GitHub Container Registry, Docker Hub, ECR Public,
-Harbor and so on. GitHub creates new packages as private; make both public after the
-first push.
-
-Run everything from this directory. You need Docker with buildx, Helm 3.8+ and
-`kubectl`.
-
-```bash
-# Where both go: a registry host plus a namespace, no scheme, no trailing slash.
-export REGISTRY=ghcr.io/your-org            # or docker.io/you, public.ecr.aws/<alias>, ...
-VERSION=$(awk '/^appVersion:/ {gsub(/"/, "", $2); print $2}' chart/Chart.yaml)   # image tag
-CHART_VERSION=$(awk '/^version:/ {print $2}' chart/Chart.yaml)                    # chart version
-
-# 1. Log in to the registry (the host part of $REGISTRY).
-docker login "${REGISTRY%%/*}"
-helm registry login "${REGISTRY%%/*}"
-
-# 2. Build and push the image. The tenant clusters' EC2 nodes are amd64; on an arm64
-#    Mac this cross-builds.
-docker buildx build --platform linux/amd64 \
-  -t "$REGISTRY/vbox-ui:$VERSION" --push vbox/vbox-ui
-
-# 3. Point the chart and the StackTemplate at the registry.
-sed -i.bak "s#<your-registry>#$REGISTRY#g" chart/values.yaml manifests/agent-sandbox-stack-template.yaml
-rm chart/values.yaml.bak manifests/agent-sandbox-stack-template.yaml.bak
-
-# 4. Check the chart now renders your image.
-helm template vbox chart -n default | grep 'image:'
-#   image: "ghcr.io/your-org/vbox-ui:0.1.0"
-
-# 5. Package and push the chart. It is pushed as $REGISTRY/vbox.
-helm package chart
-helm push "vbox-$CHART_VERSION.tgz" "oci://$REGISTRY"
-rm "vbox-$CHART_VERSION.tgz"
-```
-
-The image tag is the chart's `appVersion`, so the chart and the image it runs always
-match; `image.tag` in `chart/values.yaml` overrides that.
-
-**Releasing a new vBox version:** bump `version` and `appVersion` in
-`chart/Chart.yaml`, repeat steps 2, 4 and 5 (step 3 only needs doing once), then
-update the StackTemplate's `vboxVersion` default to the new chart `version`, or set
-`vboxVersion` on the Stack.
-
-`vbox/vbox-ui/scripts/install.sh` is a separate developer shortcut: it builds the
-image, pushes it to a private ECR repository in your AWS account and installs the
-chart straight into the cluster of your current kube context, with an ECR token as a
-pull secret. The Stack does not use it.
-
-### 2. Apply the platform objects
+### Apply the platform objects
 
 ```bash
 vcluster platform connect management
@@ -289,8 +161,8 @@ entries leaves stale fields behind.
 
 Then create a tenant cluster from **Agent Sandbox on AWS (Auto Nodes)**. The template
 declares the **Agent Sandbox** Stack in its `deploy.stacks`, so it installs on its
-own once the cluster is up, with the warm sandbox type, warm pool size, sandbox
-egress and vBox service type you picked. Because the template declares it, the
+own once the cluster is up, with the warm sandbox type, warm pool size and sandbox
+egress you picked. Because the template declares it, the
 platform recreates the Stack if you delete it from the cluster; to remove everything,
 delete the tenant cluster.
 
@@ -329,5 +201,5 @@ Every agent's output is prefixed with its name (`agent-1`, `agent-2`, ...). At t
 end a table lists each agent's exit code, how long its sandbox was alive and its
 claim. The script exits non-zero if any agent failed, never got a sandbox, or
 released it before the minimum lifetime. Each agent labels its claim with
-`agents.x-k8s.io/created-by: agent-<n>`, so the runs show up as separate clients on
-vBox's **Audit** page.
+`agents.x-k8s.io/created-by: agent-<n>`, so the runs can be told apart, for example
+with `kubectl -n agent-sandboxes get sandboxclaims -L agents.x-k8s.io/created-by`.

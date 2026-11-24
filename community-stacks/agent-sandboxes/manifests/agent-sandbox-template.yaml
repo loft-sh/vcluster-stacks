@@ -31,14 +31,14 @@
 #
 # Compatibility with the "agent-sandbox" StackTemplate:
 #   - Only parameters the StackTemplate declares are passed (podCIDR, vnodeIsolation,
-#     warmPoolType, sandboxEgress, warmPoolReplicas, vboxServiceType); option lists and
+#     warmPoolType, sandboxEgress, warmPoolReplicas); option lists and
 #     ranges match its definitions. vnodeIsolation is fixed to per-pod, not a parameter.
 #   - The Stack always installs both SandboxTemplates (python-template and
 #     chrome-template); warmPoolType only picks which one the warm pool keeps ready.
 #   - networking.podCIDR equals the Stack's podCIDR (Calico IP pool).
 #   - Flannel is disabled because the Stack installs Calico and fails if Flannel runs.
 #   - The node provider deploys the AWS CCM (ccm-enabled), which serves LoadBalancer
-#     Services such as an exposed vBox. vCluster's embedded CCM stays enabled, as
+#     Services. vCluster's embedded CCM stays enabled, as
 #     in the provider's own quickstart, which runs the two side by side.
 #   - Sandboxes (Python 250m CPU / 512 MiB requests, Chrome 500m / 1 GiB) fit the t3
 #     sandbox pool.
@@ -87,19 +87,6 @@ spec:
         - public-internet
         - none
       defaultValue: public-internet
-      section: Sandboxes
-    - variable: vboxServiceType
-      label: vBox service type
-      description: >-
-        internal: ClusterIP, reached with kubectl port-forward. exposed: LoadBalancer,
-        an internet-facing AWS Network Load Balancer in the nodes' region, created by
-        the cluster's AWS CCM. Sign-in is off until configured on vBox's Settings page,
-        so an exposed vBox is open to anyone on the internet until then.
-      type: string
-      options:
-        - internal
-        - exposed
-      defaultValue: internal
       section: Sandboxes
 
     # Infrastructure
@@ -183,15 +170,15 @@ spec:
               properties:
                 region: "{{ .Values.region }}"
                 # The AWS cloud-controller-manager, deployed by the node provider into
-                # kube-system: it creates load balancers for LoadBalancer Services (an
-                # exposed vBox) in the tenant VPC's public subnets. Set here rather than
+                # kube-system: it creates load balancers for LoadBalancer Services
+                # in the tenant VPC's public subnets. Set here rather than
                 # left to the shared provider's fallback. Its permissions go on the node
                 # instance profile, reachable only from host-network pods (IMDS hop
                 # limit 1).
                 vcluster.com/ccm-enabled: "true"
                 # No EBS CSI driver: the provider defaults it on, which would add volume
-                # permissions to every node's instance profile. Sandbox workspaces and
-                # vBox's audit trail use the local-path provisioner below.
+                # permissions to every node's instance profile. Sandbox workspaces use
+                # the local-path provisioner below.
                 vcluster.com/csi-enabled: "false"
                 vcluster.com/vpc-cidr: "{{ .Values.vpcCIDR }}"
               # Always-on node: Calico control components, the Agent Sandbox
@@ -258,7 +245,6 @@ spec:
                 warmPoolType: "{{ .Values.warmPoolType }}"
                 sandboxEgress: "{{ .Values.sandboxEgress }}"
                 warmPoolReplicas: "{{ .Values.warmPoolReplicas }}"
-                vboxServiceType: "{{ .Values.vboxServiceType }}"
               defaults:
                 taskTimeout: 15m
               # A task removed from the StackTemplate is uninstalled, not left behind.

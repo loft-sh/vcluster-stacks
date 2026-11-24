@@ -34,8 +34,8 @@ AWS_REGION = os.environ.get("AWS_REGION", "eu-central-1")
 WARMPOOL = "python-pool"
 SANDBOX_NAMESPACE = "agent-sandboxes"
 
-# Which agent this is. Set on the claim as the label vBox attributes sessions by, so
-# parallel agents show up separately on its Audit page.
+# Which agent this is. Set on the claim as the agents.x-k8s.io/created-by label, so
+# parallel agents' claims can be told apart.
 AGENT_NAME = os.environ.get("AGENT_NAME", "data-analytics-agent")
 # Keep the sandbox for at least this long before terminating it, to simulate a longer
 # interaction. 0 terminates it as soon as the agent has answered.
