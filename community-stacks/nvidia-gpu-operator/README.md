@@ -592,96 +592,29 @@ kubectl delete apps,argocdapplicationtemplates,stacktemplates,virtualclustertemp
 
 ## Test changes
 
-From the repository root, run the static checks (bash 4 or later, python3 with PyYAML, helm and jq):
+From the repository root (bash 4 or later, python3 with PyYAML, helm and jq):
 
 ```bash
 ./community-stacks/nvidia-gpu-operator/test-manifests.sh
 ```
 
-The checks render the graph four times: with the default parameters, with a variant that takes
-the other branch of every conditional, and with both of those in DRA mode. They render StackTemplate tasks and ArgoCDApplicationTemplates with
-Helm's template engine. They render each App's manifests as the chart the Platform builds, with
-only the parameters the task passes. They assert:
+The script renders the Stack for several parameter sets, in both driver modes, and checks what
+the Platform does not validate for you: names, parameters, how the tasks are wired, the cluster
+template, and the `discover` and gate scripts against a fake `kubectl`.
 
-- Names carry the `nvidia-gpu-operator` prefix and the `part-of` label, and match their files.
-- Every `.Values` reference is a declared parameter. Every task passes only parameters that its
-  template declares, and each task type matches its template's kind. The tenant cluster
-  template passes every Stack parameter.
-- Timeouts are in canonical Go duration form. App timeouts stay under the 30 minute cap, and
-  each task timeout exceeds the App or Job deadline it waits on.
-- Tasks with outputs have no hyphen, and the graph is acyclic. Every `.Outputs` reference reads
-  a declared output of a dependency, from a key the contract holds, in the namespace the gate
-  deploys to. `dcgmready` follows `gpuready`.
-- Only `discover` reads `gpuDriverMode`. Every other mode-dependent task takes
-  `.Outputs.discover.mode`. `discover`'s outputs read keys its Job writes and its release does not
-  declare, and the Job script contains the value the test expects for each mode.
-- `discover` and the gate run the Platform image on the CPU pool, and each App renders exactly one
-  Job.
-- Every CPU workload carries the same CPU node selector: `workload.example.com/pool=<cpuNodePool>`
-  by default, and exactly the `cpuNodeSelector` labels when set (the alternate variants set it).
-  `cpuNodeSelector` defaults to empty.
-- Every GPU workload carries the same GPU node selector: `workload.example.com/pool=gpu-compute` by
-  default, and exactly the `gpuNodeSelector` labels when set. That covers the NFD workers,
-  NVSentinel's `global.nodeSelector` and `platformConnector` affinity, the gate's capacity count,
-  the contract's `gpuNodeSelector` and `gpuPool`, and the smoke test. `gpuNodeSelector` defaults
-  to empty.
-- Every task except `discover` takes the node selectors from a task output, not from the
-  parameters, so it only ever gets a selector `discover` has checked.
-- A changed setting names a new Job: the gate, `discover` and smoke test Job names change with
-  the selectors, the driver mode and the capacity source.
-- `discover` runs against a fake `kubectl`. It passes for `key=value` selectors, including an
-  empty value, publishes them as given, and fails for a bare key in either selector without
-  publishing anything. It resolves `auto` from a `ClusterPolicy`, a `GPUCluster` or neither, fails
-  with both, and publishes the names of the resolved mode. A CRD that is not installed counts as
-  no objects, a warning on a successful list is not counted as an object, and any other error
-  fails the Job.
-- The gate's capacity count runs against the same fake. With `resourceslices` it counts only
-  devices of the named driver and type on the selected nodes, and with `allocatable` it sums the
-  resource over those nodes. Each passes at the minimum and fails one below it.
-- No ArgoCDApplicationTemplate uses `merge`, which the Platform's template renderer does not
-  define.
-- The mode reaches every component: one GPU Operator CR, with the NVIDIADriver CRD on for a
-  `GPUCluster` and off otherwise; the gate's capacity source, resource and RBAC; the DCGM DaemonSet; the smoke
-  test's GPU request; and NVSentinel's `gpuDraEnabled` (a YAML boolean) and its namespace label.
-- The parameters do what they promise. `driverPreinstalled` reaches GPU Operator and NVSentinel,
-  `waitForClusterPolicy` switches the gate's wait, and `minGPUs` sets the capacity it counts.
-- No NVSentinel component that needs cert-manager is enabled.
-- The tenant cluster template renders one `autoNodes` entry per provider, every pool references
-  a NodeProfile defined here, and `gpuNodeCount` sets the GPU pool size.
-
-CI also runs a server-side dry run of every manifest against vCluster Platform.
+CI runs the script, and a server-side dry run of every manifest against vCluster Platform.
 
 ### Tested
 
-An earlier version of this Stack ran end to end on bare metal on 2026-09-23. That version used
-Argo CD for every task, ran its gates from a separately built image and also installed
-cert-manager. Both gates passed, the CUDA sample reported `Test PASSED`, and NVSentinel started
-behind `dcgmready`. The GPU node joined at 19:39:10 and `gpuready` passed at 19:44:50, with the
-driver preinstalled in the node image.
+Tested on GCE private nodes:
 
-This version ran end to end in DRA mode on 2026-11-10, on a vCluster 0.37.6 cluster with private
-nodes on GCE (Kubernetes 1.36.6, vCluster Platform 4.12.5, Argo CD 3.6.1). The cluster had one
-CPU node and one GPU node with 2x T4. The StackInstance set `gpuDriverMode: dra` and
-`minGPUs: "2"`, and the Stack reached `Healthy` 4m34s after it was created:
+- DRA mode end to end, with 2x T4 (vCluster Platform 4.12, Kubernetes 1.36).
+- Device-plugin mode, with one T4 (vCluster Platform 5.0, Kubernetes 1.36): the
+  upgrade from the previous version with default parameters. `auto` kept the device plugin, the
+  gates ran once more, and no workload moved.
 
-- `discover` resolved `dra` from the parameter and published the DRA names.
-- The GPU Operator deployed a `GPUCluster` and an `NVIDIADriver`, with no `ClusterPolicy`.
-- `gpuready` counted 2 `gpu.nvidia.com` devices of type `gpu` in ResourceSlices.
-- `dcgmready` waited for `nvidia-dcgm-dra`.
-- The smoke test got its GPU through a ResourceClaim and reported `Test PASSED`.
-- NVSentinel started with `gpuDraEnabled`. Argo CD labeled its namespace
-  `resource.kubernetes.io/admin-access=true`, and the metadata collector's admin-access claim was
-  allocated on both GPUs. The GPU health monitor read from `nvidia-dcgm-dra`, and
-  `GpuDcgmConnectivityFailure` stayed `False`.
-- The published outputs included `gpudrivermode: dra`.
-
-These have not been exercised:
-
-- Device-plugin mode and `auto` detection with this version, and switching modes on a running
-  cluster.
-- The provider parameters in the tenant cluster template. The run used an existing cluster.
-- `waitForClusterPolicy: true` and more than one GPU worker.
-- Removal.
+Not tested: switching the driver mode on a running cluster, `waitForClusterPolicy: true`, more
+than one GPU worker, the cluster template's provider parameters, and removal.
 
 ## License
 
