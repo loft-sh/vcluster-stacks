@@ -121,8 +121,9 @@ Application manages, so it cannot sum allocatable GPUs across nodes or publish w
 Health checks also live in `argocd-cm` or in Argo CD itself, so they cannot travel inside a
 Stack.
 
-The gate is a Job instead. `gpuready` deploys the gate App, whose Job counts GPUs on nodes labeled
-`workload.example.com/pool=gpu-compute`. With the device plugin it sums allocatable
+The gate is a Job instead. `gpuready` deploys the gate App, whose Job counts GPUs on nodes that
+match the GPU node selector, `workload.example.com/pool=gpu-compute` by default. With the device
+plugin it sums allocatable
 `nvidia.com/gpu`. With DRA it counts the devices of type `gpu` that the `gpu.nvidia.com` driver
 publishes in ResourceSlices for those nodes, because DRA devices never appear in node
 allocatable. When the count reaches `minGPUs`, the Job patches `ready`, `observedCount`,
@@ -141,11 +142,13 @@ of hard-coding values:
 # nvsentinel
 dcgmHost: '{{ .Outputs.gpuready.dcgmhost }}'
 # gpu-smoke-test
-gpuNodeSelector: 'workload.example.com/pool={{ .Outputs.gpuready.gpupool }}'
+gpuNodeSelector: '{{ .Outputs.gpuready.gpunodeselector }}'
 ```
 
-The StackTemplate also publishes `gpucount`, `gpupool`, `dcgmhost` and `dcgmport` as Stack
-outputs.
+The StackTemplate also publishes `gpucount`, `gpupool`, `gpunodeselector`, `dcgmhost` and
+`dcgmport` as Stack outputs. Use `gpunodeselector` to place your own GPU workloads: it always
+holds the selector the Stack uses. `gpupool` is kept for existing consumers. It is `gpu-compute`
+by default, and empty when `gpuNodeSelector` is set.
 
 By default the gate does not wait on `ClusterPolicy`. `ClusterPolicy` aggregates every GPU
 Operator operand, so it stays `notReady` while `dcgm-exporter` loses a startup race that nothing
@@ -209,8 +212,23 @@ Pods reach a pool through a `nodeSelector` on `workload.example.com/pool`. Pods 
 | NVSentinel labeler | CPU pool |
 | NVSentinel health monitors, metadata collector, `platformConnector` | GPU pool, with the GPU taint toleration |
 
-The CPU pool label value is the `cpuNodePool` parameter. The GPU pool value `gpu-compute` is
-fixed in the templates.
+CPU workloads select `workload.example.com/pool=<cpuNodePool>`. To select CPU workers by other
+labels, for example on a cluster whose nodes do not come from these NodeProfiles, set
+`cpuNodeSelector` to comma-separated `key=value` pairs, such as
+`foo.acme.corp/cpu-node=true,tier=services`. It replaces the pool label everywhere a CPU workload
+is placed.
+
+GPU workloads select `workload.example.com/pool=gpu-compute`. To select GPU workers by other
+labels, set `gpuNodeSelector`, for example to `foo.acme.corp/gpu-node=true`. The NFD workers,
+NVSentinel's GPU agents and the smoke test then run only on matching nodes, and `gpuready` counts
+only their GPUs. These pods also tolerate the `nvidia.com/gpu` taint, so GPU workers can be
+tainted or not.
+
+Both selectors take `key=value` pairs only, and `discover` fails on anything else. A bare key such
+as `foo.acme.corp/gpu-node` is rejected, because the pod node selectors built from it would match
+only an empty label value. For a label that has an empty value, write `foo.acme.corp/gpu-node=`.
+
+See [Upgrade](#upgrade) before you change either selector on a running Stack.
 
 The profiles do not use `startupTaints`. Those are removed when the node becomes Ready, which
 does not prove that NVIDIA initialization has completed. The `gpuready` gate handles GPU
@@ -285,15 +303,17 @@ the Stack parameters through `deploy.stacks`.
 | `cpuNodeProvider` | required | Node provider for the CPU services worker. Can equal `gpuNodeProvider`. |
 | `cpuNodeType` | `large` | The provider's `vcluster.com/profile` node type for the CPU worker |
 | `cpuNodePool` | `cpu-services` | Value of `workload.example.com/pool` on CPU workers |
+| `cpuNodeSelector` | empty | Comma-separated `key=value` labels that select CPU workers instead of the pool label. Leave empty with the NodeProfiles. |
+| `gpuNodeSelector` | empty | Comma-separated `key=value` labels that select GPU workers instead of `workload.example.com/pool=gpu-compute`. Leave empty with the NodeProfiles. |
 | `minGPUs` | `1` | GPUs that must be available before `gpuready` passes |
 | `gpuDriverMode` | `auto` | `device-plugin`, `dra`, or `auto` to keep an existing GPU Operator's mode. See [GPU driver mode](#gpu-driver-mode). |
 | `driverPreinstalled` | `false` | `true` when the node image has the NVIDIA driver. GPU Operator skips the driver, and NVSentinel labels in preinstalled-driver mode. |
 | `waitForClusterPolicy` | `false` | `true` also waits for every GPU Operator operand (`ClusterPolicy`, or `GPUCluster` with DRA) |
 | `gpuOperatorVersion` | `v26.7.2` | GPU Operator chart version. DRA mode needs v26.7.0 or later. |
-| `nvsentinelVersion` | `v1.31.0` | NVSentinel chart and image version |
+| `nvsentinelVersion` | `v1.32.0` | NVSentinel chart and image version |
 
-The StackTemplate declares the Stack parameters: `argoProject`, `cpuNodePool`, `minGPUs`,
-`gpuDriverMode`, `driverPreinstalled`, `waitForClusterPolicy`, `gpuOperatorVersion` and
+The StackTemplate declares the Stack parameters: `argoProject`, `cpuNodePool`, `cpuNodeSelector`,
+`gpuNodeSelector`, `minGPUs`, `gpuDriverMode`, `driverPreinstalled`, `waitForClusterPolicy`, `gpuOperatorVersion` and
 `nvsentinelVersion`. The others shape the tenant cluster.
 
 Notes:
@@ -440,8 +460,24 @@ containers:
   parameter values rendered at creation. A new or changed template parameter reaches existing
   tenant clusters only after **Sync Template** on the instance, or `spec.templateRef.syncOnce:
   true`. Until then, a new parameter renders as an empty string, with no error.
-- **Re-running a gate.** The gate Job name carries a hash of its settings. A Job spec is
-  immutable, so a changed setting creates a new Job, which runs the gate again.
+- **Re-running a gate.** The gate Job name carries a hash of its settings and its check script.
+  A Job spec is immutable, so a changed setting creates a new Job, which runs the gate again. The
+  `discover` Job works the same way. Upgrading to the version that added `cpuNodeSelector` renames
+  both gate Jobs and `discover` once, so they run again.
+- **CPU node selector.** An empty `cpuNodeSelector`, its default, keeps
+  `workload.example.com/pool=<cpuNodePool>`. A tenant cluster that has not synced its template yet
+  also passes it empty. Either way an upgrade renders the same node selectors and moves nothing.
+  Changing `cpuNodePool` or `cpuNodeSelector` moves every CPU workload: the GPU Operator
+  controller, the NFD master and garbage collector, NVSentinel's CPU components and the Jobs.
+  Label the target CPU workers first, then change the parameter. Until a node matches, those pods
+  stay Pending.
+- **GPU node selector.** An empty `gpuNodeSelector`, its default, keeps
+  `workload.example.com/pool=gpu-compute`, and an upgrade moves nothing. The version that added it
+  also adds `gpuNodeSelector` to the gate's contract, so `gpuready` runs once more. Changing it
+  moves the NFD workers and NVSentinel's GPU agents, and re-runs `gpuready` and the smoke test
+  against the new nodes. Label the GPU workers first: until enough GPUs match, `gpuready` holds and
+  then fails, while NVSentinel's agents already move, because the Stack re-syncs changed tasks
+  without waiting for the gate.
 - **Switching the GPU driver mode.** Change `gpuDriverMode` to `device-plugin` or `dra`.
   `discover` decides again, and every task follows. Plan for downtime: the GPU Operator replaces
   its whole node stack, including the driver DaemonSet, so GPU workloads on the nodes are
@@ -497,8 +533,7 @@ kubectl delete apps,argocdapplicationtemplates,stacktemplates,virtualclustertemp
   node joined. A driver build slower than about 23 minutes fails the gate.
 - The gates are one-shot. If the GPU degrades later, the gate does not notice. Ongoing health is
   a monitoring concern.
-- The GPU pool label value `gpu-compute` and the contract namespace `gpu-stack` are fixed in the
-  templates.
+- The contract namespace `gpu-stack` is fixed in the templates.
 - The GPU Operator CRD upgrade hook has no node selector in the pinned chart. It does not
   tolerate the GPU taint, so the taint keeps it off GPU workers.
 - The smoke test occupies one GPU for the few seconds it runs.
@@ -511,8 +546,14 @@ kubectl delete apps,argocdapplicationtemplates,stacktemplates,virtualclustertemp
 
 ## Troubleshooting
 
-- **GPU Operator controller, `discover` or a gate Job Pending.** No CPU worker has the
-  `cpuNodePool` label. These pods cannot use the GPU pool.
+- **GPU Operator controller, `discover` or a gate Job Pending.** No CPU worker matches the CPU
+  node selector: the `cpuNodePool` label, or `cpuNodeSelector` when set. These pods cannot use the
+  GPU pool.
+- **`gpuready` counts 0 GPUs, or NVSentinel's GPU agents and the NFD workers schedule nowhere.**
+  No GPU worker matches the GPU node selector: `workload.example.com/pool=gpu-compute`, or
+  `gpuNodeSelector` when set. `kubectl get nodes -l <selector>` shows what matches.
+- **`discover` failed with "is not a key=value label".** `cpuNodeSelector` or `gpuNodeSelector`
+  holds a bare key. Write a label with an empty value as `key=`.
 - **`discover` failed with "both a ClusterPolicy and a GPUCluster exist".** The cluster is in a
   state the GPU Operator rejects, usually after a switch from DRA. Delete the CR for the mode you
   do not use, or set `gpuDriverMode` explicitly. The Job log names both commands.
@@ -571,6 +612,18 @@ only the parameters the task passes. They assert:
   declare, and the Job script contains the value the test expects for each mode.
 - `discover` and the gate run the Platform image on the CPU pool, and each App renders exactly one
   Job.
+- Every CPU workload carries the same CPU node selector: `workload.example.com/pool=<cpuNodePool>`
+  by default, and exactly the `cpuNodeSelector` labels when set (the alternate variants set it).
+  `cpuNodeSelector` defaults to empty. The gate and `discover` Job names change with the selector.
+- Every GPU workload carries the same GPU node selector: `workload.example.com/pool=gpu-compute` by
+  default, and exactly the `gpuNodeSelector` labels when set. That covers the NFD workers,
+  NVSentinel's `global.nodeSelector` and `platformConnector` affinity, the gate's capacity count,
+  the contract's `gpuNodeSelector` and `gpuPool`, and the smoke test. `gpuNodeSelector` defaults
+  to empty, and the gate and smoke test Job names change with it.
+- `discover`'s selector check runs against a fake `kubectl`: it passes for `key=value` pairs,
+  including an empty value, and fails for a bare key in either selector.
+- No ArgoCDApplicationTemplate uses `merge`, which the Platform's template renderer does not
+  define.
 - The mode reaches every component: one GPU Operator CR, with the NVIDIADriver CRD on for a
   `GPUCluster`; the gate's capacity source, resource and RBAC; the DCGM DaemonSet; the smoke
   test's GPU request; and NVSentinel's `gpuDraEnabled` (a YAML boolean) and its namespace label.

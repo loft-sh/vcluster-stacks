@@ -63,6 +63,18 @@ spec:
         fi
       }
 
+      # A node selector is comma-separated key=value labels. A bare key is rejected: kubectl reads it
+      # as "the label exists", while the pod nodeSelectors the tasks render turn it into key="", so
+      # the gate would count nodes that no GPU component can schedule on.
+      check_selector() {
+        for pair in $(printf '%s' "$2" | tr ',' ' '); do
+          printf '%s\n' "$pair" | grep -Eq '^([a-z0-9]([-a-z0-9.]*[a-z0-9])?/)?[A-Za-z0-9]([-A-Za-z0-9_.]*[A-Za-z0-9])?=([A-Za-z0-9]([-A-Za-z0-9_.]*[A-Za-z0-9])?)?$' \
+            || fail "$1 node selector '$2': '${pair}' is not a key=value label. Write a label with an empty value as key="
+        done
+      }
+      check_selector CPU "${CPU_NODE_SELECTOR}"
+      check_selector GPU "${GPU_NODE_SELECTOR:-}"
+
       cp=$(count clusterpolicies.nvidia.com)
       gc=$(count gpuclusters.nvidia.com)
       log "found ${cp} ClusterPolicy and ${gc} GPUCluster"
@@ -120,8 +132,8 @@ spec:
       {{- end -}}
 
       {{- $requested := .Values.gpuDriverMode | default "auto" -}}
-      {{- /* A Job spec is immutable. Changing any setting names a new Job, which also decides again. */ -}}
-      {{- $hash := printf "%s|%s" $requested (.Values.cpuNodeSelector | default "") | sha256sum | trunc 8 -}}
+      {{- /* A Job spec is immutable. Changing any setting, or the script, names a new Job, which also decides again. */ -}}
+      {{- $hash := printf "%s|%s|%s|%s" $requested (.Values.cpuNodeSelector | default "") (.Values.gpuNodeSelector | default "") (include "discover.script" . | sha256sum) | sha256sum | trunc 8 -}}
       # The Job adds the decision to this ConfigMap. `kubectl -n gpu-stack get cm gpu-driver-mode -o yaml`
       # shows what was decided and why.
       apiVersion: v1
@@ -212,9 +224,13 @@ spec:
             serviceAccountName: {{ .Release.Name | trunc 50 | trimSuffix "-" }}-discover
             restartPolicy: Never
             {{- with .Values.cpuNodeSelector }}
-            {{- $kv := splitn "=" 2 . }}
             nodeSelector:
-              {{ $kv._0 }}: {{ $kv._1 | quote }}
+              {{- range splitList "," . }}
+              {{- if trim . }}
+              {{- $kv := splitn "=" 2 (trim .) }}
+              {{ $kv._0 }}: {{ $kv._1 | default "" | quote }}
+              {{- end }}
+              {{- end }}
             {{- end }}
             securityContext:
               runAsNonRoot: true
@@ -243,6 +259,10 @@ spec:
                     value: /tmp/.kube-cache
                   - name: REQUESTED_MODE
                     value: {{ $requested | quote }}
+                  - name: CPU_NODE_SELECTOR
+                    value: {{ .Values.cpuNodeSelector | default "" | quote }}
+                  - name: GPU_NODE_SELECTOR
+                    value: {{ .Values.gpuNodeSelector | default "" | quote }}
                   - name: CONTRACT_NAME
                     value: gpu-driver-mode
                   - name: CONTRACT_NAMESPACE
@@ -267,5 +287,10 @@ spec:
       defaultValue: auto
     - variable: cpuNodeSelector
       label: CPU node selector
-      description: Optional key=value label selector for the node that runs the Job.
+      description: Optional comma-separated key=value labels for the node that runs the Job.
+      type: string
+    - variable: gpuNodeSelector
+      label: GPU node selector
+      description: Optional comma-separated key=value labels that select the GPU workers. The Job only checks
+        the format, and fails on a bare key.
       type: string
