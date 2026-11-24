@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "name": "run-ai-central-control-plane",
+  "displayName": "NVIDIA Run:ai central control plane",
+  "description": "Fixture for the stack.json schema. A copy of the Run:ai example, reduced to one member.",
+  "author": "NVIDIA",
+  "maintainers": [
+    "vCluster Labs"
+  ],
+  "icon": "icon.svg",
+  "readme": "README.md",
+  "platformVersion": ">=5.1.0",
+  "members": [
+    "stacktemplate.yaml"
+  ]
+}
