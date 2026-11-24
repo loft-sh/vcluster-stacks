@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "name": "nvidia-nvke-mgmt",
+  "displayName": "NVIDIA NVKE Management Plane",
+  "description": "This integration installs the management plane of NVIDIA NVKE into a cluster from a release that you build with NVKR, NVIDIA's build and release tool for NVKE.",
+  "author": "vCluster Labs",
+  "readme": "README.md",
+  "platformVersion": ">=5.1.0",
+  "members": [
+    "stacktemplate.yaml",
+    "virtualclustertemplate-*.yaml",
+    "apps/*.yaml"
+  ]
+}
