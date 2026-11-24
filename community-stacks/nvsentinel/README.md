@@ -626,8 +626,6 @@ is still open. These remain:
 
 The GPU Operator is not touched.
 
-Removal has not been exercised end to end for this Stack.
-
 When no instance references them, remove the templates from the Platform:
 
 ```bash
@@ -667,10 +665,12 @@ kubectl delete apps,argocdapplicationtemplates,stacktemplates -l app.kubernetes.
 
 ## Troubleshooting
 
-- **`discover` failed, and you have fixed the cause.** The task has to run again. Whether the
-  Platform retries a failed task by itself has not been verified for this Stack. A parameter
-  change that reaches `discover` always does it, because it names a new Job: for example, set
-  `gpuDriverMode` from `auto` to the mode the cluster runs.
+- **`discover` failed.** The task status only says that the Job failed. The reason is in the Job
+  log: `kubectl -n nvsentinel-stack logs -l app.kubernetes.io/name=nvsentinel-discover`. The
+  Platform retries a failed task a few times, a minute apart, so `discover` passes by itself once
+  the cause is fixed. If the retries have run out, a parameter change that reaches `discover`
+  runs it again, because it names a new Job: for example, set `gpuDriverMode` from `auto` to the
+  mode the cluster runs.
 - **`discover` failed with "Install cert-manager, or set cordon to false".** `cordon` is on and
   the cluster has no cert-manager. Install it, or set `cordon: "false"` for monitoring only.
 - **`discover` failed with "has dcgm.enabled=false".** The GPU Operator runs without its
@@ -731,104 +731,32 @@ kubectl delete apps,argocdapplicationtemplates,stacktemplates -l app.kubernetes.
 
 ## Test changes
 
-From the repository root, run the static checks (bash 4 or later, python3 with PyYAML and helm):
+From the repository root (bash 4 or later, python3 with PyYAML and helm):
 
 ```bash
 ./community-stacks/nvsentinel/test-manifests.sh
 ```
 
-They pull the NVSentinel chart from `ghcr.io`. Pass `--offline` to skip that part.
+The script renders the Stack for several parameter sets and checks what the Platform does not
+validate for you: names, parameters, how the tasks are wired, the fault handling switches, and
+the `discover` script against a fake `kubectl`. It also renders the NVSentinel chart with each
+set of values. That needs `ghcr.io`; pass `--offline` to skip it.
 
-The checks render the graph six times: with the default parameters, with a variant that takes
-the other branch of most conditionals, with both of those in DRA mode, with reboot remediation
-behind a `dcgmHost` override, and with remediation and Slinky drain requested while drain is off. They render StackTemplate tasks and the
-ArgoCDApplicationTemplate with Helm's template engine. They render each App's manifests as the
-chart the Platform builds, with only the parameters the task passes. They assert:
-
-- Names carry the `nvsentinel` prefix and the `part-of` label, and match their files.
-- Every `.Values` reference is a declared parameter. Every task passes only parameters that its
-  template declares, and each task type matches its template's kind.
-- Timeouts are in canonical Go duration form. App timeouts stay under the 30 minute cap, and
-  each task timeout exceeds the App or Job deadline it waits on.
-- Tasks with outputs have no hyphen, and the graph is acyclic. Every `.Outputs` reference reads
-  a declared output of a dependency. `dcgmready` follows `gpuready`, and `nvsentinel` follows
-  `slinky-drainer`.
-- Only `discover` reads `gpuDriverMode`. Every other mode-dependent task takes
-  `.Outputs.discover.mode`. `discover`'s outputs read keys its Job writes and its release does not
-  declare.
-- `discover` runs against a fake `kubectl`, and what it publishes is read back from its patch.
-  It resolves `auto` from a `ClusterPolicy` or a `GPUCluster`, fails with neither and with both,
-  and publishes the names of the resolved mode and the DCGM Service in `gpuOperatorNamespace` on
-  `dcgmPort`, or `dcgmHost` with the rollout wait off. A CRD that is not installed counts as no
-  objects, a warning on a successful list is not counted as an object, and any other error fails
-  the Job. Its volume check passes for a volume a matching node can reach, with no volumes, and
-  for a volume whose affinity it cannot evaluate, and fails for a stranded volume. It fails on a
-  bare key in either selector, on a missing cert-manager when `cordon` is on, and on a
-  `ClusterPolicy` with DCGM off unless `dcgmHost` is set. A failure publishes nothing.
-- Every task except `discover` takes the node selectors from `discover`'s outputs, not from the
-  parameters, so it only ever gets a selector `discover` has checked.
-- `discover` and the gates run the Platform image on the CPU node selector. Both gates count one
-  GPU on the GPU node selector, from the source the mode uses. `dcgmready` waits for the mode's
-  DaemonSet in `gpuOperatorNamespace`, and for nothing when `dcgmHost` is set.
-- The gate App is identical to the NVIDIA GPU Operator Stack's, names aside. That Stack's checks
-  run the gate's capacity count.
-- The gate and `discover` Job names change with the selectors and with `gpuOperatorNamespace`.
-- NVSentinel's DCGM endpoint is what `discover` resolved. Its CPU components carry the CPU node
-  selector, and its GPU agents and `platformConnector` affinity the GPU node selector.
-- The mode reaches NVSentinel: `gpuDraEnabled` (a YAML boolean), the Janitor reset Job's
-  RuntimeClass and the namespace label.
-- NVSentinel defaults to cordoning without draining (`cordon: true`, `dryRun: false`,
-  `drain: false`). Fault quarantine and the MongoDB store follow `cordon`, the node drainer runs
-  only with both `cordon` and `drain`, and remediation runs only with `remediation` on top of
-  both, as described in [Remediation](#remediation). The `GPUReset` template reaches
-  fault-remediation unrendered, and the reset Job's driver path follows `driverPreinstalled`.
-  MongoDB runs on the CPU node selector with one server certificate per replica. The circuit
-  breaker follows `circuitBreakerEnabled`, with the window, percentage and node cap from the
-  parameters. The window default is a valid Go duration.
-- Slinky drain is off by default. The Slinky drainer App renders nothing unless `cordon`, `drain`
-  and `slinkyDrain` are all on, and `customDrain` follows the same switch. When on, the drainer
-  runs the `version` image on the CPU node selector and watches `slinkyNamespace`, its drain
-  template is left for the node drainer to render, and `customDrain` names the ConfigMap, CRD and
-  completion condition the App deploys, with a non-empty node selector.
-- The Slinky drainer's Role and RoleBinding for pods sit in `slinkyNamespace`, grant get, list,
-  watch and delete, and bind the controller's ServiceAccount. Its `manifests copied from` line
-  matches the `version` default.
-- With drain off, remediation, Janitor and the Slinky drainer stay off whatever `remediation`
-  and `slinkyDrain` say.
-- The NVSentinel chart itself renders with each variant's values.
-- The example sets `prunePolicy: Prune`.
-
-The NVIDIA GPU Operator Stack's checks cover its cluster template, which deploys this Stack. CI
-also runs a server-side dry run of every manifest against vCluster Platform.
+CI runs the script, and a server-side dry run of every manifest against vCluster Platform.
 
 ### Tested
 
-This Stack has not run on a cluster as a Stack of its own. These are covered by the static
-checks only:
+Tested in device-plugin mode, on GCE private nodes with one CPU node and one T4 GPU node
+(vCluster Platform 5.0, Kubernetes 1.36, Argo CD 3.6):
 
-- The `discover` task against a real cluster: mode detection, the cert-manager and DCGM checks,
-  and the `gpuOperatorNamespace` and `dcgmHost` parameters.
-- A GPU Operator installed outside the NVIDIA GPU Operator Stack.
-- Drain in each drain mode, Slinky drain, and `reboot` and `gpu-reset` remediation, as this Stack
-  wires them: the renamed parameters, the `slinky-drainer` task and its ordering before
-  `nvsentinel`.
+- A fresh install on top of the NVIDIA GPU Operator Stack, and the upgrade from a GPU Operator
+  Stack that still included NVSentinel.
+- `discover` with cert-manager or the GPU Operator missing, and with a bare-key selector.
+- Cordon on an injected GPU fault, the circuit breaker and its reset.
 - Removal.
 
-Its NVSentinel configuration was tested while it was still part of the NVIDIA GPU Operator Stack,
-on a vCluster 0.37.6 cluster with private nodes on GCE (Kubernetes 1.36.6, vCluster Platform
-4.12.5, Argo CD 3.6.1), with one CPU node and one GPU node with 2x T4:
-
-- On 2026-11-10, in DRA mode and in dry-run monitoring, NVSentinel started with `gpuDraEnabled`.
-  Argo CD labeled its namespace `resource.kubernetes.io/admin-access=true`, and the metadata
-  collector's admin-access claim was allocated on both GPUs. The GPU health monitor read from
-  `nvidia-dcgm-dra`, and `GpuDcgmConnectivityFailure` stayed `False`.
-- The cordon defaults were tested on the same cluster, which already ran cert-manager. Applying
-  them started MongoDB, with its certificates issued by cert-manager, and fault quarantine with
-  `--dry-run=false`. A double-bit ECC error injected into GPU 0 through `dcgmi test --inject` was
-  detected as `GpuMemWatch`, and the node was cordoned 22 seconds after the injection started. No
-  pod was evicted. With one GPU node, the cordon tripped the circuit breaker 45 seconds later.
-  After the fault cleared, the node stayed cordoned until it was uncordoned and the breaker reset
-  by hand, as described in [Reset the circuit breaker](#reset-the-circuit-breaker).
+Not tested in this layout: DRA mode, drain, Slinky drain, remediation, a GPU Operator installed
+outside the NVIDIA GPU Operator Stack, and the cluster template.
 
 ## License
 
