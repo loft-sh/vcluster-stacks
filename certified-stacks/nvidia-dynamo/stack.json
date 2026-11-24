@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "name": "nvidia-dynamo",
+  "displayName": "NVIDIA Dynamo",
+  "description": "This integration installs the NVIDIA Dynamo inference runtime through a native vCluster Platform Stack.",
+  "author": "vCluster Labs",
+  "readme": "README.md",
+  "platformVersion": ">=5.1.0",
+  "members": [
+    "stacktemplate.yaml"
+  ]
+}

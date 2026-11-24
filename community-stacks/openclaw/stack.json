@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "name": "openclaw",
+  "displayName": "OpenClaw agent (vLLM or external model, lossless-claw)",
+  "description": "This Stack installs a self-hosted OpenClaw agent on a cluster.",
+  "author": "vCluster Labs",
+  "readme": "README.md",
+  "platformVersion": ">=5.1.0",
+  "members": [
+    "stacktemplate.yaml",
+    "virtualclustertemplate.yaml",
+    "apps/*.yaml"
+  ]
+}
