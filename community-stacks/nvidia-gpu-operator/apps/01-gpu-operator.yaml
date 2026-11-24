@@ -93,7 +93,7 @@ spec:
               defaultRuntime: containerd
               nodeSelector:
                 {{- range $k, $v := $cpuNodeSelector }}
-                {{ $k }}: {{ $v | quote }}
+                {{ $k | quote }}: {{ $v | quote }}
                 {{- end }}
               tolerations: []
             driver:
@@ -174,17 +174,17 @@ spec:
               master:
                 nodeSelector:
                   {{- range $k, $v := $cpuNodeSelector }}
-                  {{ $k }}: {{ $v | quote }}
+                  {{ $k | quote }}: {{ $v | quote }}
                   {{- end }}
               gc:
                 nodeSelector:
                   {{- range $k, $v := $cpuNodeSelector }}
-                  {{ $k }}: {{ $v | quote }}
+                  {{ $k | quote }}: {{ $v | quote }}
                   {{- end }}
               worker:
                 nodeSelector:
                   {{- range $k, $v := $gpuNodeSelector }}
-                  {{ $k }}: {{ $v | quote }}
+                  {{ $k | quote }}: {{ $v | quote }}
                   {{- end }}
                 tolerations:
                 - key: nvidia.com/gpu

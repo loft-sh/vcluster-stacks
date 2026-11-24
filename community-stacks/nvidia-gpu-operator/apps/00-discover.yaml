@@ -52,10 +52,12 @@ spec:
 
       # Objects of a cluster-scoped kind. A kind whose CRD is not installed counts as 0; any other
       # error, such as missing RBAC, fails the Job instead of being mistaken for "none".
+      # stderr is kept apart: a warning on a successful list must not be counted as an object.
       count() {
-        if out=$(kubectl get "$1" -o name 2>&1); then
+        if out=$(kubectl get "$1" -o name 2>/tmp/count.err); then
           printf '%s\n' "$out" | grep -c . || true
         else
+          out=$(cat /tmp/count.err)
           case "$out" in
             *"doesn't have a resource type"*|*"could not find the requested resource"*) echo 0 ;;
             *) fail "could not list $1: $out" ;;
@@ -72,6 +74,8 @@ spec:
             || fail "$1 node selector '$2': '${pair}' is not a key=value label. Write a label with an empty value as key="
         done
       }
+      # Both selectors are published below only once they pass. The other tasks take them from this
+      # task's outputs, so a selector that fails here never reaches a workload.
       check_selector CPU "${CPU_NODE_SELECTOR}"
       check_selector GPU "${GPU_NODE_SELECTOR:-}"
 
@@ -124,9 +128,10 @@ spec:
       fi
 
       kubectl -n "$CONTRACT_NAMESPACE" patch configmap "$CONTRACT_NAME" --type merge -p "$(printf \
-        '{"data":{"mode":"%s","source":"%s","dcgmHost":"%s.gpu-operator.svc","dcgmDaemonSet":"%s","operatorResource":"%s","operatorResources":"%s","capacitySource":"%s","capacityResource":"%s","discoveredAt":"%s"}}' \
+        '{"data":{"mode":"%s","source":"%s","dcgmHost":"%s.gpu-operator.svc","dcgmDaemonSet":"%s","operatorResource":"%s","operatorResources":"%s","capacitySource":"%s","capacityResource":"%s","cpuNodeSelector":"%s","gpuNodeSelector":"%s","discoveredAt":"%s"}}' \
         "$mode" "$source" "$dcgm_daemonset" "$dcgm_daemonset" "$operator_resource" "$operator_resources" \
-        "$capacity_source" "$capacity_resource" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')")" >/dev/null \
+        "$capacity_source" "$capacity_resource" "$CPU_NODE_SELECTOR" "${GPU_NODE_SELECTOR:-}" \
+        "$(date -u '+%Y-%m-%dT%H:%M:%SZ')")" >/dev/null \
         || fail "could not record the result in configmap ${CONTRACT_NAMESPACE}/${CONTRACT_NAME}"
       log "gpuDriverMode=${mode} (${source})"
       {{- end -}}
@@ -228,7 +233,7 @@ spec:
               {{- range splitList "," . }}
               {{- if trim . }}
               {{- $kv := splitn "=" 2 (trim .) }}
-              {{ $kv._0 }}: {{ $kv._1 | default "" | quote }}
+              {{ $kv._0 | quote }}: {{ $kv._1 | default "" | quote }}
               {{- end }}
               {{- end }}
             {{- end }}
@@ -291,6 +296,6 @@ spec:
       type: string
     - variable: gpuNodeSelector
       label: GPU node selector
-      description: Optional comma-separated key=value labels that select the GPU workers. The Job only checks
-        the format, and fails on a bare key.
+      description: Optional comma-separated key=value labels that select the GPU workers. The Job checks the
+        format, fails on a bare key, and publishes the selector for the other tasks.
       type: string

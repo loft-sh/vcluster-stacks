@@ -74,7 +74,7 @@ jobs:
       - name: Set up manifest validation prerequisites
         run: |
           sudo apt-get update
-          sudo apt-get install --yes ripgrep python3-yaml
+          sudo apt-get install --yes ripgrep python3-yaml jq
       - name: Render Run:ai manifests
         run: ./certified-stacks/run-ai/render.sh --check
       - name: Check NVIDIA Dynamo manifests

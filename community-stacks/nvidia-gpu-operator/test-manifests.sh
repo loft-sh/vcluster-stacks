@@ -9,14 +9,14 @@
 # ArgoCDApplicationTemplate or App. App manifests are rendered as the Helm chart the Platform
 # builds from them.
 #
-# Needs bash >= 4, python3 with PyYAML and helm. Exits 1 on failures, 2 on a missing prerequisite.
+# Needs bash >= 4, python3 with PyYAML, helm and jq. Exits 1 on failures, 2 on a missing prerequisite.
 set -euo pipefail
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 missing=()
 [[ "${BASH_VERSINFO[0]}" -ge 4 ]] || missing+=("bash >= 4 (running ${BASH_VERSION}; macOS /bin/bash is 3.2, try 'brew install bash')")
-for tool in python3 helm; do
+for tool in python3 helm jq; do
   command -v "$tool" >/dev/null || missing+=("$tool")
 done
 command -v python3 >/dev/null && { python3 -c 'import yaml' 2>/dev/null || missing+=("PyYAML (python3 -m pip install pyyaml)"); }
@@ -68,7 +68,7 @@ DISCOVER_FACTS = {
             "operatorResources": "gpuclusters", "capacitySource": "resourceslices",
             "capacityResource": "gpu.nvidia.com"},
 }
-DISCOVER_KEYS = set(DISCOVER_FACTS["dra"]) | {"source", "discoveredAt"}
+DISCOVER_KEYS = set(DISCOVER_FACTS["dra"]) | {"cpuNodeSelector", "gpuNodeSelector", "source", "discoveredAt"}
 
 
 def fail(message):
@@ -233,16 +233,19 @@ def defaults(params):
     return {v: p["defaultValue"] for v, p in params.items() if "defaultValue" in p}
 
 
-def cpu_selector(values):
-    """The CPU node selector every CPU workload must carry: cpuNodeSelector, or the pool label."""
-    raw = str(values.get("cpuNodeSelector") or "") or f"workload.example.com/pool={values['cpuNodePool']}"
-    return dict(p.strip().split("=", 1) for p in raw.split(",") if p.strip())
+def parse_selector(raw):
+    """Comma-separated key=value labels as a dict."""
+    return dict(p.strip().split("=", 1) for p in str(raw or "").split(",") if p.strip())
 
 
-def gpu_selector(values):
-    """The GPU node selector every GPU workload must carry: gpuNodeSelector, or the GPU pool label."""
-    raw = str(values.get("gpuNodeSelector") or "") or "workload.example.com/pool=gpu-compute"
-    return dict(p.strip().split("=", 1) for p in raw.split(",") if p.strip())
+def cpu_selector_raw(values):
+    """The CPU node selector in effect, as the Stack hands it to discover: cpuNodeSelector, or the pool label."""
+    return str(values.get("cpuNodeSelector") or "") or f"workload.example.com/pool={values['cpuNodePool']}"
+
+
+def gpu_selector_raw(values):
+    """The GPU node selector in effect: gpuNodeSelector, or the GPU pool label."""
+    return str(values.get("gpuNodeSelector") or "") or "workload.example.com/pool=gpu-compute"
 
 
 def check_refs(where, node, declared, extra_ok=()):
@@ -390,6 +393,22 @@ for name in ("gpu-operator", "gpu-smoke-test", "nvsentinel"):
     if name in tasks and "gpuDriverMode" not in ((tasks[name].get("app") or tasks[name].get("argoCDApplication") or {}).get("parameters") or {}):
         fail(f"stacktemplate.yaml task {name}: does not pass gpuDriverMode; it would stay on its default mode")
 
+# discover checks the node selectors and publishes them. A task that read the parameter itself
+# would deploy a selector discover rejected, because a running Stack re-syncs changed tasks without
+# waiting for discover.
+for name, task in tasks.items():
+    if name == "discover":
+        continue
+    passed = (task.get("app") or task.get("argoCDApplication") or {}).get("parameters") or {}
+    for param in ("cpuNodeSelector", "gpuNodeSelector", "capacityNodeSelector"):
+        value = str(passed.get(param, ""))
+        if param in passed and (".Values." in value or ".Outputs." not in value):
+            fail(f"stacktemplate.yaml task {name}: {param} must come from a task output, not from a parameter: {value!r}")
+for name in ("gpu-operator", "nvsentinel"):
+    passed = (tasks.get(name, {}).get("argoCDApplication") or {}).get("parameters") or {}
+    if name in tasks and not {"cpuNodeSelector", "gpuNodeSelector"} <= set(passed):
+        fail(f"stacktemplate.yaml task {name}: must pass cpuNodeSelector and gpuNodeSelector from discover's outputs")
+
 # A rollout wait on a DaemonSet that schedules no pods yet passes at once, so dcgmready must
 # follow gpuready, which proves a GPU node is there.
 if "dcgmready" in tasks and "gpuready" not in ancestors("dcgmready"):
@@ -429,15 +448,16 @@ VARIANTS = {
 for variant, overrides in VARIANTS.items():
     values = {**defaults(stack_params), **overrides}
     on = lambda k: str(values[k]) == "true"
-    cpu_sel = cpu_selector(values)
+    cpu_sel = parse_selector(cpu_selector_raw(values))
     cpu_pod_sel = {"kubernetes.io/os": "linux", **cpu_sel}
-    gpu_sel = gpu_selector(values)
+    gpu_sel = parse_selector(gpu_selector_raw(values))
     gpu_pod_sel = {"kubernetes.io/os": "linux", **gpu_sel}
-    parse_sel = lambda raw: dict(p.strip().split("=", 1) for p in (raw or "").split(",") if p.strip())
+    parse_sel = parse_selector
     # auto on a cluster without a GPU Operator resolves to device-plugin.
     mode = {"auto": "device-plugin"}.get(values["gpuDriverMode"], values["gpuDriverMode"])
     dra = mode == "dra"
-    facts = DISCOVER_FACTS[mode]
+    # discover publishes the selectors it checked, exactly as it received them.
+    facts = {**DISCOVER_FACTS[mode], "cpuNodeSelector": cpu_selector_raw(values), "gpuNodeSelector": gpu_selector_raw(values)}
     contract = {}
     outputs = {}
     rendered = {}
@@ -516,8 +536,8 @@ for variant, overrides in VARIANTS.items():
             env = rendered[name]["env"]
             if parse_sel(env.get("CPU_NODE_SELECTOR")) != cpu_sel:
                 fail(f"{where}: the selector check gets CPU_NODE_SELECTOR={env.get('CPU_NODE_SELECTOR')!r}; expected the CPU node selector {cpu_sel}")
-            if env.get("GPU_NODE_SELECTOR", "") != str(values.get("gpuNodeSelector") or ""):
-                fail(f"{where}: the selector check gets GPU_NODE_SELECTOR={env.get('GPU_NODE_SELECTOR')!r}; expected gpuNodeSelector as given")
+            if parse_sel(env.get("GPU_NODE_SELECTOR")) != gpu_sel:
+                fail(f"{where}: the selector check gets GPU_NODE_SELECTOR={env.get('GPU_NODE_SELECTOR')!r}; expected the GPU node selector {gpu_sel}")
             if rendered[name]["env"].get("REQUESTED_MODE") != values["gpuDriverMode"]:
                 fail(f"{where}: the Job does not receive gpuDriverMode={values['gpuDriverMode']}")
             outputs = {"discover": {o["name"]: facts.get(o["fromResource"]["jsonPath"][len("{.data."):-1], "")
@@ -556,8 +576,8 @@ for variant, overrides in VARIANTS.items():
         # The chart's own validations: exactly one CR, and a GPUCluster takes its driver from an NVIDIADriver CR.
         if (hv["clusterPolicy"]["deployCR"], hv["gpuCluster"]["deployCR"]) != (not dra, dra):
             fail(f"task gpu-operator ({variant}): deploys ClusterPolicy={hv['clusterPolicy']['deployCR']} GPUCluster={hv['gpuCluster']['deployCR']} for mode {mode}")
-        if dra and driver and hv["driver"]["nvidiaDriverCRD"]["enabled"] is not True:
-            fail(f"task gpu-operator ({variant}): a GPUCluster with the driver enabled needs driver.nvidiaDriverCRD.enabled=true")
+        if hv["driver"]["nvidiaDriverCRD"]["enabled"] is not dra:
+            fail(f"task gpu-operator ({variant}): driver.nvidiaDriverCRD.enabled={hv['driver']['nvidiaDriverCRD']['enabled']} for mode {mode}; it must be true only with dra")
     if "gpuready" in rendered:
         env = rendered["gpuready"]["env"]
         if bool(env.get("WAIT_RESOURCE")) is not on("waitForClusterPolicy"):
@@ -634,50 +654,184 @@ for variant, overrides in VARIANTS.items():
         if len(terms) != 1 or exprs != {k: ("In", [v]) for k, v in gpu_sel.items()}:
             fail(f"task nvsentinel ({variant}): platformConnector affinity {terms} does not require exactly the GPU node selector {gpu_sel}")
 
-# --- Node selectors: Job names and the discover check --------------------------------------------
-# A Job spec is immutable, so a changed selector must name a new Job, or the upgrade fails.
-for ref in (GATE, DISCOVER):
-    names = []
-    for sel in ("workload.example.com/pool=cpu-services", "foo.acme.corp/cpu-node=true"):
-        docs = render_app(apps[ref], {"cpuNodeSelector": sel}, "hash", f"{ref} hash")
-        names.append([d["metadata"]["name"] for d in docs or [] if d.get("kind") == "Job"])
-    if names[0] == names[1]:
-        fail(f"apps/: {ref} keeps Job name {names[0]} when cpuNodeSelector changes; Helm cannot patch a Job's pod template")
-for ref, param in ((GATE, "capacityNodeSelector"), (f"{PREFIX}-gpu-smoke-test", "gpuNodeSelector")):
-    names = []
-    for sel in ("workload.example.com/pool=gpu-compute", "foo.acme.corp/gpu-node=true"):
-        docs = render_app(apps[ref], {param: sel}, "hash", f"{ref} hash")
-        names.append([d["metadata"]["name"] for d in docs or [] if d.get("kind") == "Job"])
-    if names[0] == names[1]:
+# --- Job names, and the discover and gate scripts ------------------------------------------------
+# A Job spec is immutable, so a changed setting must name a new Job, or the upgrade fails. A new
+# Job is also what makes discover decide again and a gate check again.
+def job_names(ref, params, where):
+    docs = render_app(apps[ref], params, "hash", f"{ref} {where}")
+    return [d["metadata"]["name"] for d in docs or [] if d.get("kind") == "Job"]
+
+
+SMOKE = f"{PREFIX}-gpu-smoke-test"
+for ref, param, a, b in [
+    (GATE, "cpuNodeSelector", "workload.example.com/pool=cpu-services", "foo.acme.corp/cpu-node=true"),
+    (DISCOVER, "cpuNodeSelector", "workload.example.com/pool=cpu-services", "foo.acme.corp/cpu-node=true"),
+    (DISCOVER, "gpuNodeSelector", "workload.example.com/pool=gpu-compute", "foo.acme.corp/gpu-node=true"),
+    (DISCOVER, "gpuDriverMode", "device-plugin", "dra"),
+    (DISCOVER, "gpuDriverMode", "auto", "dra"),
+    (GATE, "capacityNodeSelector", "workload.example.com/pool=gpu-compute", "foo.acme.corp/gpu-node=true"),
+    (GATE, "capacitySource", "allocatable", "resourceslices"),
+    (GATE, "capacityResource", "nvidia.com/gpu", "gpu.nvidia.com"),
+    (SMOKE, "gpuNodeSelector", "workload.example.com/pool=gpu-compute", "foo.acme.corp/gpu-node=true"),
+    (SMOKE, "gpuDriverMode", "device-plugin", "dra"),
+]:
+    names = [job_names(ref, {param: v}, f"{param}={v}") for v in (a, b)]
+    if not names[0] or names[0] == names[1]:
         fail(f"apps/: {ref} keeps Job name {names[0]} when {param} changes; Helm cannot patch a Job's pod template")
 
-# Run the discover script against a fake kubectl that finds no GPU Operator CR: a well-formed
-# selector passes, and a bare key fails for either pool.
+# A fake kubectl for the scripts. For discover: FAKE_CP ClusterPolicies and FAKE_GC GPUClusters,
+# FAKE_WARN as a warning on stderr of a successful list, FAKE_ERR as the error of a failed one, and
+# the patch written to FAKE_PATCH. For the gate: nodes named FAKE_NODES for the selector FAKE_SEL,
+# their allocatable as FAKE_ALLOC, and the ResourceSlice list in the file FAKE_SLICES.
 fake = work / "fakebin"
 fake.mkdir()
-(fake / "kubectl").write_text("""#!/bin/sh
+(fake / "kubectl").write_text(r"""#!/bin/sh
+list() {
+  if [ -n "${FAKE_ERR:-}" ]; then echo "$FAKE_ERR" >&2; exit 1; fi
+  if [ -n "${FAKE_WARN:-}" ]; then echo "$FAKE_WARN" >&2; fi
+  i=0; while [ "$i" -lt "${2:-0}" ]; do echo "$1/object-$i"; i=$((i+1)); done
+  exit 0
+}
 case "$*" in
-  *clusterpolicies*|*gpuclusters*|*"patch configmap"*) exit 0 ;;
+  # First: the patch names the CR kinds too.
+  *"patch configmap"*)
+    while [ $# -gt 1 ]; do shift; done
+    printf '%s' "$1" > "${FAKE_PATCH:-/dev/null}"; exit 0 ;;
+  *clusterpolicies*) list clusterpolicy "${FAKE_CP:-0}" ;;
+  *gpuclusters*) list gpucluster "${FAKE_GC:-0}" ;;
+  *"get resourceslices"*) cat "$FAKE_SLICES"; exit 0 ;;
+  *"get nodes"*)
+    sel=; out=
+    while [ $# -gt 0 ]; do
+      case "$1" in -l) sel=$2; shift ;; -o) out=$2; shift ;; esac
+      shift
+    done
+    [ "$sel" = "${FAKE_SEL:-}" ] || exit 0
+    case "$out" in *allocatable*) echo "${FAKE_ALLOC:-}" ;; *) echo "${FAKE_NODES:-}" ;; esac
+    exit 0 ;;
 esac
 echo "fake kubectl: unexpected $*" >&2; exit 1
 """)
 (fake / "kubectl").chmod(0o755)
-docs = render_app(apps[DISCOVER], {"cpuNodeSelector": "x=y"}, "check", "discover selector check")
-script = next(d for d in docs if d.get("kind") == "Job")["spec"]["template"]["spec"]["containers"][0]["args"][0]
 POOL = "workload.example.com/pool=cpu-services"
+GPU_POOL = "workload.example.com/pool=gpu-compute"
+
+
+def job_script(ref, params, where):
+    docs = render_app(apps[ref], params, "script", f"{ref} {where}")
+    container = next(d for d in docs if d.get("kind") == "Job")["spec"]["template"]["spec"]["containers"][0]
+    return container["args"][0], {e["name"]: e.get("value") or "" for e in container.get("env", [])}
+
+
+def run_script(script, env):
+    r = subprocess.run(["sh", "-c", script], env={"PATH": f"{fake}:/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin", **env},
+                       capture_output=True, text=True)
+    return r.returncode, r.stdout + r.stderr
+
+
+discover_script, _ = job_script(DISCOVER, {"cpuNodeSelector": "x=y"}, "script")
+patch_file = work / "discover-patch.json"
+
+
+def run_discover(**env):
+    patch_file.write_text("")
+    code, out = run_script(discover_script, {
+        "HOME": str(work), "REQUESTED_MODE": "device-plugin", "CONTRACT_NAME": "gpu-driver-mode",
+        "CONTRACT_NAMESPACE": "gpu-stack", "CPU_NODE_SELECTOR": POOL, "GPU_NODE_SELECTOR": GPU_POOL,
+        "FAKE_PATCH": str(patch_file), **env})
+    text = patch_file.read_text()
+    try:
+        data = json.loads(text)["data"] if text else {}
+    except (ValueError, KeyError):
+        fail(f"apps/{DISCOVER}: the patch it sends is not a JSON merge patch with data: {text[:200]!r}")
+        data = {}
+    return code, out, data
+
+
+# The node selectors: a well-formed one passes and is published as given, a bare key fails for
+# either pool and publishes nothing.
 for case, cpu, gpu, ok, says in [
-    ("pool labels", POOL, "", True, ""),
+    ("pool labels", POOL, GPU_POOL, True, ""),
     ("several labels, one with an empty value", "foo.acme.corp/cpu-node=true,tier=", "foo.acme.corp/gpu-node=true", True, ""),
-    ("bare CPU key", "foo", "", False, "CPU node selector 'foo': 'foo' is not a key=value label"),
+    ("bare CPU key", "foo", GPU_POOL, False, "CPU node selector 'foo': 'foo' is not a key=value label"),
     ("bare GPU key", POOL, "tier=gpu,foo", False, "GPU node selector 'tier=gpu,foo': 'foo' is not a key=value label"),
 ]:
-    env = {"PATH": f"{fake}:/usr/bin:/bin", "HOME": str(work), "REQUESTED_MODE": "device-plugin",
-           "CONTRACT_NAME": "gpu-driver-mode", "CONTRACT_NAMESPACE": "gpu-stack",
-           "CPU_NODE_SELECTOR": cpu, "GPU_NODE_SELECTOR": gpu}
-    r = subprocess.run(["sh", "-c", script], env=env, capture_output=True, text=True)
-    out = r.stdout + r.stderr
-    if (r.returncode == 0) != ok or says not in out:
-        fail(f"apps/{DISCOVER} selector check, {case}: exit {r.returncode}, expected {'success' if ok else 'failure'} saying {says!r}: {out.strip()[-300:]}")
+    code, out, data = run_discover(CPU_NODE_SELECTOR=cpu, GPU_NODE_SELECTOR=gpu)
+    if (code == 0) != ok or says not in out:
+        fail(f"apps/{DISCOVER} selector check, {case}: exit {code}, expected {'success' if ok else 'failure'} saying {says!r}: {out.strip()[-300:]}")
+    want = {"cpuNodeSelector": cpu, "gpuNodeSelector": gpu} if ok else {}
+    if {k: data.get(k) for k in want} != want or (not ok and data):
+        fail(f"apps/{DISCOVER} selector check, {case}: published {data}; expected {want or 'nothing'}")
+
+# How the mode is resolved, and what is published for it: every DISCOVER_FACTS key, read back
+# from the patch, so swapped names for the two modes fail here.
+for case, env, want_mode, says in [
+    ("auto, ClusterPolicy", {"REQUESTED_MODE": "auto", "FAKE_CP": "1"}, "device-plugin", "existing ClusterPolicy"),
+    ("auto, GPUCluster", {"REQUESTED_MODE": "auto", "FAKE_GC": "1"}, "dra", "existing GPUCluster"),
+    ("auto, no GPU Operator", {"REQUESTED_MODE": "auto"}, "device-plugin", "no GPU Operator CR yet"),
+    ("auto, both CRs", {"REQUESTED_MODE": "auto", "FAKE_CP": "1", "FAKE_GC": "1"}, None, "both a ClusterPolicy and a GPUCluster exist"),
+    ("explicit device-plugin", {"REQUESTED_MODE": "device-plugin", "FAKE_GC": "1"}, "device-plugin", "gpuDriverMode parameter"),
+    ("explicit dra", {"REQUESTED_MODE": "dra", "FAKE_CP": "1"}, "dra", "gpuDriverMode parameter"),
+    ("unknown mode", {"REQUESTED_MODE": "cdi"}, None, "gpuDriverMode must be auto, device-plugin or dra"),
+    # count(): a CRD that is not installed is zero objects, a warning on a successful list is not
+    # an object, and any other error fails rather than being read as "none".
+    ("auto, CRDs not installed", {"REQUESTED_MODE": "auto", "FAKE_ERR": "error: the server doesn't have a resource type \"gpuclusters\""},
+     "device-plugin", "found 0 ClusterPolicy and 0 GPUCluster"),
+    ("auto, GPUCluster and a warning on stderr", {"REQUESTED_MODE": "auto", "FAKE_GC": "1", "FAKE_WARN": "Warning: v1 ComponentStatus is deprecated"},
+     "dra", "found 0 ClusterPolicy and 1 GPUCluster"),
+    ("auto, warning and no objects", {"REQUESTED_MODE": "auto", "FAKE_WARN": "Warning: something is deprecated"},
+     "device-plugin", "found 0 ClusterPolicy and 0 GPUCluster"),
+    ("auto, list forbidden", {"REQUESTED_MODE": "auto", "FAKE_ERR": "Error from server (Forbidden): clusterpolicies.nvidia.com is forbidden"},
+     None, "could not list clusterpolicies.nvidia.com"),
+]:
+    code, out, data = run_discover(**env)
+    where = f"apps/{DISCOVER}, {case}"
+    if (code == 0) != (want_mode is not None) or says not in out:
+        fail(f"{where}: exit {code}, expected {'success' if want_mode else 'failure'} saying {says!r}: {out.strip()[-300:]}")
+    elif want_mode:
+        got = {k: data.get(k) for k in DISCOVER_FACTS[want_mode]}
+        if got != DISCOVER_FACTS[want_mode]:
+            fail(f"{where}: published {got}, expected {DISCOVER_FACTS[want_mode]}")
+        if not data.get("source") or not data.get("discoveredAt"):
+            fail(f"{where}: the patch lacks source or discoveredAt: {data}")
+    elif data:
+        fail(f"{where}: failed, but still published {data}")
+
+# The gate's capacity count, run for real. With resourceslices only devices of the named driver
+# and type on the selected nodes count; with allocatable the resource is summed over those nodes.
+slices = work / "resourceslices.json"
+slices.write_text(json.dumps({"items": [
+    {"spec": {"driver": "gpu.nvidia.com", "nodeName": "gpu-a", "devices": [
+        {"name": "gpu-0", "attributes": {"type": {"string": "gpu"}}},
+        {"name": "gpu-1", "attributes": {"type": {"string": "gpu"}}},
+        {"name": "vf-0", "attributes": {"type": {"string": "vfio"}}}]}},
+    {"spec": {"driver": "gpu.nvidia.com", "nodeName": "gpu-b", "devices": [
+        {"name": "gpu-0", "attributes": {"type": {"string": "gpu"}}}]}},
+    {"spec": {"driver": "gpu.nvidia.com", "nodeName": "other-pool", "devices": [
+        {"name": "gpu-0", "attributes": {"type": {"string": "gpu"}}}]}},
+    {"spec": {"driver": "other.example.com", "nodeName": "gpu-a", "devices": [
+        {"name": "dev-0", "attributes": {"type": {"string": "gpu"}}}]}},
+    {"spec": {"driver": "gpu.nvidia.com", "nodeName": "gpu-a"}},
+]}))
+for case, params, fake_env, ok, says in [
+    ("ResourceSlices, enough GPUs", {"capacitySource": "resourceslices", "capacityResource": "gpu.nvidia.com", "capacityDeviceType": "gpu", "capacityMin": "3"},
+     {}, True, "3 gpu.nvidia.com devices of type gpu in ResourceSlices"),
+    ("ResourceSlices, one GPU short", {"capacitySource": "resourceslices", "capacityResource": "gpu.nvidia.com", "capacityDeviceType": "gpu", "capacityMin": "4"},
+     {}, False, "only 3 gpu.nvidia.com devices of type gpu in ResourceSlices"),
+    ("ResourceSlices, any device type", {"capacitySource": "resourceslices", "capacityResource": "gpu.nvidia.com", "capacityMin": "4"},
+     {}, True, "4 gpu.nvidia.com devices in ResourceSlices"),
+    ("ResourceSlices, selector matches no node", {"capacitySource": "resourceslices", "capacityResource": "gpu.nvidia.com", "capacityDeviceType": "gpu", "capacityMin": "1"},
+     {"FAKE_SEL": "some=other"}, False, "only 0 gpu.nvidia.com devices"),
+    ("allocatable, enough GPUs", {"capacitySource": "allocatable", "capacityResource": "nvidia.com/gpu", "capacityMin": "3"},
+     {}, True, "3 allocatable nvidia.com/gpu"),
+    ("allocatable, one GPU short", {"capacitySource": "allocatable", "capacityResource": "nvidia.com/gpu", "capacityMin": "4"},
+     {}, False, "only 3 allocatable nvidia.com/gpu"),
+]:
+    script, env = job_script(GATE, {"gateName": "gpuready", "capacityNodeSelector": GPU_POOL, "timeoutSeconds": "1", **params}, case)
+    code, out = run_script(script, {**env, "HOME": str(work), "POLL_SECONDS": "1", "FAKE_SEL": GPU_POOL,
+                                    "FAKE_NODES": "gpu-a gpu-b", "FAKE_ALLOC": "2 1", "FAKE_SLICES": str(slices), **fake_env})
+    if (code == 0) != ok or says not in out:
+        fail(f"apps/{GATE} capacity count, {case}: exit {code}, expected {'success' if ok else 'failure'} saying {says!r}: {out.strip()[-300:]}")
 
 # --- VirtualClusterTemplate ----------------------------------------------------------------------
 vct_path = root / "virtualclustertemplate.yaml"

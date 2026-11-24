@@ -105,8 +105,8 @@ there are no ResourceSlices to claim.
 The other tasks read the mode and the mode-specific names (CR, DCGM DaemonSet and host, what to
 count for capacity) from its outputs. They never read the parameter, so `auto` cannot leave two
 tasks on different modes. Like the gates, `discover`'s Job name carries a hash of its settings.
-It decides again only when `gpuDriverMode` changes, so later reconciles with unchanged settings
-keep the earlier decision.
+The hash covers `gpuDriverMode`, both node selectors and the script itself, so it decides again
+when one of those changes. Later reconciles with unchanged settings keep the earlier decision.
 
 The StackTemplate publishes the resolved mode as the output `gpudrivermode`.
 
@@ -147,8 +147,9 @@ gpuNodeSelector: '{{ .Outputs.gpuready.gpunodeselector }}'
 
 The StackTemplate also publishes `gpucount`, `gpupool`, `gpunodeselector`, `dcgmhost` and
 `dcgmport` as Stack outputs. Use `gpunodeselector` to place your own GPU workloads: it always
-holds the selector the Stack uses. `gpupool` is kept for existing consumers. It is `gpu-compute`
-by default, and empty when `gpuNodeSelector` is set.
+holds the selector the Stack uses. `gpupool` is deprecated and kept only for existing consumers.
+It is `gpu-compute` by default and empty when `gpuNodeSelector` is set, so a selector built from
+it then matches no node. Use `gpunodeselector` instead.
 
 By default the gate does not wait on `ClusterPolicy`. `ClusterPolicy` aggregates every GPU
 Operator operand, so it stays `notReady` while `dcgm-exporter` loses a startup race that nothing
@@ -227,6 +228,10 @@ tainted or not.
 Both selectors take `key=value` pairs only, and `discover` fails on anything else. A bare key such
 as `foo.acme.corp/gpu-node` is rejected, because the pod node selectors built from it would match
 only an empty label value. For a label that has an empty value, write `foo.acme.corp/gpu-node=`.
+
+`discover` also publishes the selectors it checked, and every other task takes them from there.
+A selector that fails the check never reaches a workload: the tasks keep the last one that
+passed, and the Stack reports the failed `discover` task.
 
 See [Upgrade](#upgrade) before you change either selector on a running Stack.
 
@@ -587,7 +592,7 @@ kubectl delete apps,argocdapplicationtemplates,stacktemplates,virtualclustertemp
 
 ## Test changes
 
-From the repository root, run the static checks (bash 4 or later, python3 with PyYAML and helm):
+From the repository root, run the static checks (bash 4 or later, python3 with PyYAML, helm and jq):
 
 ```bash
 ./community-stacks/nvidia-gpu-operator/test-manifests.sh
@@ -614,18 +619,29 @@ only the parameters the task passes. They assert:
   Job.
 - Every CPU workload carries the same CPU node selector: `workload.example.com/pool=<cpuNodePool>`
   by default, and exactly the `cpuNodeSelector` labels when set (the alternate variants set it).
-  `cpuNodeSelector` defaults to empty. The gate and `discover` Job names change with the selector.
+  `cpuNodeSelector` defaults to empty.
 - Every GPU workload carries the same GPU node selector: `workload.example.com/pool=gpu-compute` by
   default, and exactly the `gpuNodeSelector` labels when set. That covers the NFD workers,
   NVSentinel's `global.nodeSelector` and `platformConnector` affinity, the gate's capacity count,
   the contract's `gpuNodeSelector` and `gpuPool`, and the smoke test. `gpuNodeSelector` defaults
-  to empty, and the gate and smoke test Job names change with it.
-- `discover`'s selector check runs against a fake `kubectl`: it passes for `key=value` pairs,
-  including an empty value, and fails for a bare key in either selector.
+  to empty.
+- Every task except `discover` takes the node selectors from a task output, not from the
+  parameters, so it only ever gets a selector `discover` has checked.
+- A changed setting names a new Job: the gate, `discover` and smoke test Job names change with
+  the selectors, the driver mode and the capacity source.
+- `discover` runs against a fake `kubectl`. It passes for `key=value` selectors, including an
+  empty value, publishes them as given, and fails for a bare key in either selector without
+  publishing anything. It resolves `auto` from a `ClusterPolicy`, a `GPUCluster` or neither, fails
+  with both, and publishes the names of the resolved mode. A CRD that is not installed counts as
+  no objects, a warning on a successful list is not counted as an object, and any other error
+  fails the Job.
+- The gate's capacity count runs against the same fake. With `resourceslices` it counts only
+  devices of the named driver and type on the selected nodes, and with `allocatable` it sums the
+  resource over those nodes. Each passes at the minimum and fails one below it.
 - No ArgoCDApplicationTemplate uses `merge`, which the Platform's template renderer does not
   define.
 - The mode reaches every component: one GPU Operator CR, with the NVIDIADriver CRD on for a
-  `GPUCluster`; the gate's capacity source, resource and RBAC; the DCGM DaemonSet; the smoke
+  `GPUCluster` and off otherwise; the gate's capacity source, resource and RBAC; the DCGM DaemonSet; the smoke
   test's GPU request; and NVSentinel's `gpuDraEnabled` (a YAML boolean) and its namespace label.
 - The parameters do what they promise. `driverPreinstalled` reaches GPU Operator and NVSentinel,
   `waitForClusterPolicy` switches the gate's wait, and `minGPUs` sets the capacity it counts.
