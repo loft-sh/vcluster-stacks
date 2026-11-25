@@ -1,0 +1,7 @@
+# Fixture for the content hash. It is never installed.
+apiVersion: management.loft.sh/v1
+kind: App
+metadata:
+  name: fixture-content-hash-b
+spec:
+  displayName: fixture-content-hash-b
