@@ -13,11 +13,17 @@
 # runs, so a missing template shows as TemplateNotFound on that task.
 #
 # Tasks (the apps/ file numbers are a topological order of the graph):
+#   discover        (00) app: resolves gpuDriverMode (device-plugin or dra) and its names
 #   gpu-operator    (01) argoCDApplication: the NVIDIA GPU Operator
-#   gpuready        (02) app: waits for minGPUs allocatable GPUs, marks gpu-stack-contract ready
-#   dcgmready       (02) app: waits for the nvidia-dcgm DaemonSet to finish rolling out
+#   gpuready        (02) app: waits for minGPUs GPUs, marks gpu-stack-contract ready
+#   dcgmready       (02) app: waits for the DCGM DaemonSet to finish rolling out
 #   gpu-smoke-test  (03) app: CUDA VectorAdd on the GPU pool
 #   nvsentinel      (03) argoCDApplication: NVSentinel in dry-run mode
+#
+# gpuDriverMode: the GPU Operator, both gates, the smoke test and NVSentinel all differ between the
+# device-plugin and the DRA stack, and a mismatch fails quietly (NVSentinel watching a DCGM that
+# does not exist, a gate counting a resource nobody advertises). Only discover reads the parameter;
+# every other task takes the resolved mode and the names that go with it from discover's outputs.
 #
 # Timeouts: every App `timeout` stays below the Platform per-deploy cap of 30m, and each task
 # timeout exceeds its App timeout, so the task timeout is the reporting path for a stuck step.
@@ -57,6 +63,25 @@ spec:
       required: true
       defaultValue: cpu-services
       section: Node Pools
+    - variable: cpuNodeSelector
+      label: CPU Node Selector
+      description: Comma-separated key=value labels that select the CPU service workers, replacing
+        workload.example.com/pool=<cpuNodePool>. Leave empty to keep that selector, which also keeps an
+        upgrade from moving anything. Changing it moves every CPU workload. discover fails on a bare key,
+        and the workloads then keep the last selector that passed. Write a label with an empty value as
+        key=.
+      type: string
+      section: Node Pools
+    - variable: gpuNodeSelector
+      label: GPU Node Selector
+      description: Comma-separated key=value labels that select the GPU workers, replacing
+        workload.example.com/pool=gpu-compute. Leave empty to keep that selector, which also keeps an
+        upgrade from moving anything. The gpuready gate counts GPUs only on these nodes, and the NFD
+        workers, NVSentinel's GPU agents and the smoke test run there, tolerating the nvidia.com/gpu
+        NoSchedule taint. Changing it moves those pods. discover fails on a bare key; write a label with an
+        empty value as key=.
+      type: string
+      section: Node Pools
     - variable: minGPUs
       label: Minimum Allocatable GPUs
       description: How many GPUs the scheduler must advertise before the gpuready gate passes and NVSentinel starts.
@@ -65,6 +90,19 @@ spec:
       defaultValue: '1'
       min: 1
       section: Node Pools
+    - variable: gpuDriverMode
+      label: GPU Driver Mode
+      description: How Kubernetes consumes GPUs. device-plugin runs the GPU Operator's ClusterPolicy stack and
+        pods request nvidia.com/gpu. dra runs its experimental GPUCluster stack, where the NVIDIA DRA driver
+        publishes GPUs as ResourceSlices and pods request them through ResourceClaims; it needs Kubernetes
+        1.34 or later. auto keeps the mode of a GPU Operator already in the cluster and installs
+        device-plugin otherwise. NVSentinel always follows the GPU Operator.
+      options:
+        - auto
+        - device-plugin
+        - dra
+      defaultValue: auto
+      section: GPU Operator
     - variable: driverPreinstalled
       label: NVIDIA Driver Preinstalled
       description: Enable when the node OS image already contains the NVIDIA driver. GPU Operator then skips the
@@ -74,10 +112,10 @@ spec:
       section: GPU Operator
     - variable: waitForClusterPolicy
       label: Gate On ClusterPolicy As Well As GPU Capacity
-      description: Off by default. The gpuready gate verifies allocatable GPU capacity, which is the signal that
-        actually decides whether a GPU pod can be scheduled. ClusterPolicy aggregates every GPU Operator operand,
-        including dcgm-exporter, so gating on it makes the Stack wait on components no downstream task needs.
-        Enable it only if you want the Stack to hold until the whole operand set is healthy.
+      description: Off by default. The gpuready gate verifies GPU capacity, which is the signal that actually
+        decides whether a GPU pod can be scheduled. ClusterPolicy (GPUCluster with dra) aggregates every GPU
+        Operator operand, including dcgm-exporter, so gating on it makes the Stack wait on components no
+        downstream task needs. Enable it only if you want the Stack to hold until the whole operand set is healthy.
       type: boolean
       defaultValue: 'false'
       section: GPU Operator
@@ -97,6 +135,10 @@ spec:
       defaultValue: v1.32.0
   # Values the gate publishes, readable from the StackInstance outputs subresource.
   publishedOutputs:
+    - name: gpudrivermode
+      fromTask:
+        task: discover
+        output: mode
     - name: gpucount
       fromTask:
         task: gpuready
@@ -105,6 +147,10 @@ spec:
       fromTask:
         task: gpuready
         output: gpupool
+    - name: gpunodeselector
+      fromTask:
+        task: gpuready
+        output: gpunodeselector
     - name: dcgmhost
       fromTask:
         task: gpuready
@@ -114,49 +160,142 @@ spec:
         task: gpuready
         output: dcgmport
   tasks:
+    # Resolves gpuDriverMode before the GPU Operator installs, so auto can see a GPU Operator that
+    # an earlier install left behind. Its outputs are the only place the rest of the graph learns
+    # the mode; the mode-specific names come with it so no task repeats the mapping.
+    - name: discover
+      timeout: 6m0s
+      app:
+        templateRef:
+          name: nvidia-gpu-operator-discover
+        parameters:
+          gpuDriverMode: '{{ .Values.gpuDriverMode }}'
+          # The selectors in effect: the parameter, or the pool label when it is empty. discover
+          # checks them and publishes them, and every other task takes them from its outputs. A
+          # selector that fails the check then never reaches a workload: the tasks keep the last
+          # one that passed.
+          cpuNodeSelector: '{{ .Values.cpuNodeSelector | default (printf "workload.example.com/pool=%s" .Values.cpuNodePool) }}'
+          gpuNodeSelector: '{{ .Values.gpuNodeSelector | default "workload.example.com/pool=gpu-compute" }}'
+      outputs:
+        - name: cpunodeselector
+          fromResource:
+            apiVersion: v1
+            kind: ConfigMap
+            namespace: gpu-stack
+            name: gpu-driver-mode
+            jsonPath: '{.data.cpuNodeSelector}'
+        - name: gpunodeselector
+          fromResource:
+            apiVersion: v1
+            kind: ConfigMap
+            namespace: gpu-stack
+            name: gpu-driver-mode
+            jsonPath: '{.data.gpuNodeSelector}'
+        - name: mode
+          fromResource:
+            apiVersion: v1
+            kind: ConfigMap
+            namespace: gpu-stack
+            name: gpu-driver-mode
+            jsonPath: '{.data.mode}'
+        - name: dcgmhost
+          fromResource:
+            apiVersion: v1
+            kind: ConfigMap
+            namespace: gpu-stack
+            name: gpu-driver-mode
+            jsonPath: '{.data.dcgmHost}'
+        - name: dcgmdaemonset
+          fromResource:
+            apiVersion: v1
+            kind: ConfigMap
+            namespace: gpu-stack
+            name: gpu-driver-mode
+            jsonPath: '{.data.dcgmDaemonSet}'
+        - name: operatorresource
+          fromResource:
+            apiVersion: v1
+            kind: ConfigMap
+            namespace: gpu-stack
+            name: gpu-driver-mode
+            jsonPath: '{.data.operatorResource}'
+        - name: operatorresources
+          fromResource:
+            apiVersion: v1
+            kind: ConfigMap
+            namespace: gpu-stack
+            name: gpu-driver-mode
+            jsonPath: '{.data.operatorResources}'
+        - name: capacitysource
+          fromResource:
+            apiVersion: v1
+            kind: ConfigMap
+            namespace: gpu-stack
+            name: gpu-driver-mode
+            jsonPath: '{.data.capacitySource}'
+        - name: capacityresource
+          fromResource:
+            apiVersion: v1
+            kind: ConfigMap
+            namespace: gpu-stack
+            name: gpu-driver-mode
+            jsonPath: '{.data.capacityResource}'
     - name: gpu-operator
+      dependsOn:
+        - discover
       timeout: 45m0s
       argoCDApplication:
         templateRef:
           name: nvidia-gpu-operator-gpu-operator
         parameters:
           cpuNodePool: '{{ .Values.cpuNodePool }}'
+          cpuNodeSelector: '{{ .Outputs.discover.cpunodeselector }}'
+          gpuNodeSelector: '{{ .Outputs.discover.gpunodeselector }}'
           version: '{{ .Values.gpuOperatorVersion }}'
           project: '{{ .Values.argoProject }}'
           driverPreinstalled: '{{ .Values.driverPreinstalled | toString }}'
+          gpuDriverMode: '{{ .Outputs.discover.mode }}'
     # The GPU Operator Application goes Healthy as soon as its resources are created, long
-    # before a driver is built and a GPU is schedulable. This gate holds until the scheduler
-    # advertises minGPUs, then marks the contract ready for the tasks that read its outputs.
+    # before a driver is built and a GPU is schedulable. This gate holds until minGPUs GPUs are
+    # there, then marks the contract ready for the tasks that read its outputs. With device-plugin
+    # it sums nvidia.com/gpu in node allocatable; with dra it counts whole GPUs (type gpu) that
+    # the gpu.nvidia.com driver publishes in ResourceSlices, since DRA never touches allocatable.
     #
     # The name has no hyphen on purpose: a task that declares outputs is referenced as
     # {{ .Outputs.task.name }}, and the template syntax cannot address a name with "-".
     - name: gpuready
       dependsOn:
+        - discover
         - gpu-operator
       timeout: 28m0s
       app:
         templateRef:
           name: nvidia-gpu-operator-gate
         parameters:
-          cpuNodeSelector: 'workload.example.com/pool={{ .Values.cpuNodePool }}'
+          cpuNodeSelector: '{{ .Outputs.discover.cpunodeselector }}'
           gateName: gpuready
-          # Off by default. Allocatable GPU capacity is the stronger signal and is checked
-          # regardless; ClusterPolicy only adds a wait on operands, such as dcgm-exporter,
-          # that nothing downstream depends on.
+          # Off by default. GPU capacity is the stronger signal and is checked regardless; the
+          # ClusterPolicy (GPUCluster with dra) only adds a wait on operands, such as
+          # dcgm-exporter, that nothing downstream depends on.
           waitEnabled: '{{ .Values.waitForClusterPolicy | toString }}'
-          waitResource: clusterpolicy/cluster-policy
+          waitResource: '{{ .Outputs.discover.operatorresource }}'
           waitCondition: jsonpath={.status.state}=ready
           watchAPIGroup: nvidia.com
-          watchResources: clusterpolicies
-          capacityResource: nvidia.com/gpu
+          watchResources: '{{ .Outputs.discover.operatorresources }}'
+          capacitySource: '{{ .Outputs.discover.capacitysource }}'
+          capacityResource: '{{ .Outputs.discover.capacityresource }}'
+          # Whole GPUs only. Ignored with allocatable.
+          capacityDeviceType: gpu
           capacityMin: '{{ .Values.minGPUs }}'
-          capacityNodeSelector: workload.example.com/pool=gpu-compute
+          capacityNodeSelector: '{{ .Outputs.discover.gpunodeselector }}'
           contractName: gpu-stack-contract
           # The gate App is workload-agnostic. The GPU keys belong here, with the Stack that
-          # publishes them.
+          # publishes them. gpuPool is the pool label's value, empty once gpuNodeSelector
+          # replaces it; gpuNodeSelector is the selector in effect either way.
           contractData: |
-            gpuPool: gpu-compute
-            dcgmHost: nvidia-dcgm.gpu-operator.svc
+            gpuPool: {{ if .Values.gpuNodeSelector }}""{{ else }}gpu-compute{{ end }}
+            gpuNodeSelector: {{ .Outputs.discover.gpunodeselector | quote }}
+            dcgmHost: {{ .Outputs.discover.dcgmhost }}
             dcgmPort: "5555"
           timeoutSeconds: "1380"
       outputs:
@@ -174,6 +313,13 @@ spec:
             namespace: gpu-stack
             name: gpu-stack-contract
             jsonPath: '{.data.gpuPool}'
+        - name: gpunodeselector
+          fromResource:
+            apiVersion: v1
+            kind: ConfigMap
+            namespace: gpu-stack
+            name: gpu-stack-contract
+            jsonPath: '{.data.gpuNodeSelector}'
         - name: dcgmhost
           fromResource:
             apiVersion: v1
@@ -195,15 +341,16 @@ spec:
     # already finished rolling out. rollout covers any number of GPU workers.
     - name: dcgmready
       dependsOn:
+        - discover
         - gpuready
       timeout: 15m0s
       app:
         templateRef:
           name: nvidia-gpu-operator-gate
         parameters:
-          cpuNodeSelector: 'workload.example.com/pool={{ .Values.cpuNodePool }}'
+          cpuNodeSelector: '{{ .Outputs.discover.cpunodeselector }}'
           gateName: dcgmready
-          waitResource: daemonset/nvidia-dcgm
+          waitResource: 'daemonset/{{ .Outputs.discover.dcgmdaemonset }}'
           waitNamespace: gpu-operator
           waitCondition: rollout
           watchAPIGroup: apps
@@ -214,16 +361,19 @@ spec:
     # dcgmready gate and NVSentinel, and occupies one GPU for the few seconds it takes.
     - name: gpu-smoke-test
       dependsOn:
+        - discover
         - gpuready
       timeout: 12m0s
       app:
         templateRef:
           name: nvidia-gpu-operator-gpu-smoke-test
         parameters:
-          gpuNodeSelector: 'workload.example.com/pool={{ .Outputs.gpuready.gpupool }}'
+          gpuNodeSelector: '{{ .Outputs.gpuready.gpunodeselector }}'
           gpuCount: "1"
+          gpuDriverMode: '{{ .Outputs.discover.mode }}'
     - name: nvsentinel
       dependsOn:
+        - discover
         - gpuready
         - dcgmready
       timeout: 20m0s
@@ -232,9 +382,12 @@ spec:
           name: nvidia-gpu-operator-nvsentinel
         parameters:
           cpuNodePool: '{{ .Values.cpuNodePool }}'
+          cpuNodeSelector: '{{ .Outputs.discover.cpunodeselector }}'
+          gpuNodeSelector: '{{ .Outputs.discover.gpunodeselector }}'
           version: '{{ .Values.nvsentinelVersion }}'
           project: '{{ .Values.argoProject }}'
           driverPreinstalled: '{{ .Values.driverPreinstalled | toString }}'
+          gpuDriverMode: '{{ .Outputs.discover.mode }}'
           # Read from the contract the gate published rather than hard-coded here.
           dcgmHost: '{{ .Outputs.gpuready.dcgmhost }}'
           dcgmPort: '{{ .Outputs.gpuready.dcgmport }}'
