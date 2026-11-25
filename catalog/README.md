@@ -113,3 +113,4 @@ python3 -B -m unittest discover -s catalog
 ```
 
 `-B` stops Python from writing a `__pycache__` folder into `catalog/`. Git does not ignore that folder.
+
