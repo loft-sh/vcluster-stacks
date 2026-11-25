@@ -75,10 +75,12 @@ spec:
         fi
       }
 
-      # A node selector is comma-separated key=value labels. A bare key is rejected: kubectl reads it
-      # as "the label exists", while the pod nodeSelectors the tasks render turn it into key="", so
-      # the gate would count nodes that no NVSentinel agent can schedule on.
+      # A node selector is comma-separated key=value labels. The Stack has no default for it, so an
+      # empty one is rejected. A bare key is rejected too: kubectl reads it as "the label exists",
+      # while the pod nodeSelectors the tasks render turn it into key="", so the gate would count
+      # nodes that no NVSentinel agent can schedule on.
       check_selector() {
+        [ -n "$2" ] || fail "the $1 node selector is empty. Set it to the key=value labels of the $1 workers."
         for pair in $(printf '%s' "$2" | tr ',' ' '); do
           printf '%s\n' "$pair" | grep -Eq '^([a-z0-9]([-a-z0-9.]*[a-z0-9])?/)?[A-Za-z0-9]([-A-Za-z0-9_.]*[A-Za-z0-9])?=([A-Za-z0-9]([-A-Za-z0-9_.]*[A-Za-z0-9])?)?$' \
             || fail "$1 node selector '$2': '${pair}' is not a key=value label. Write a label with an empty value as key="
@@ -416,12 +418,13 @@ spec:
       defaultValue: 'false'
     - variable: cpuNodeSelector
       label: CPU node selector
-      description: Optional comma-separated key=value labels for the node that runs the Job.
+      description: Comma-separated key=value labels that select the CPU workers, where the Job runs. The Job
+        fails on an empty selector and on a bare key.
       type: string
     - variable: gpuNodeSelector
       label: GPU node selector
-      description: Optional comma-separated key=value labels that select the GPU workers. The Job only checks
-        the format, and fails on a bare key.
+      description: Comma-separated key=value labels that select the GPU workers. The Job only checks the
+        format, and fails on an empty selector and on a bare key.
       type: string
     - variable: pinnedVolumeNamespace
       label: Pinned volume namespace

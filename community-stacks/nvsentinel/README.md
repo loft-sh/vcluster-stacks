@@ -128,16 +128,16 @@ under this Stack's names, so either Stack installs without the other.
 | NVSentinel health monitors, metadata collector, `platformConnector` | GPU node selector, with the `nvidia.com/gpu` taint toleration |
 | `discover` and gate Jobs, Slinky drainer | CPU node selector |
 
-CPU workloads select `workload.example.com/pool=<cpuNodePool>`, and GPU workloads select
-`workload.example.com/pool=gpu-compute`. Those are the labels the
-[NVIDIA GPU Operator Stack's NodeProfiles](../nvidia-gpu-operator/nodeprofiles.yaml) set. On
-nodes with other labels, set `cpuNodeSelector` and `gpuNodeSelector` to comma-separated
-`key=value` pairs, such as `foo.acme.corp/gpu-node=true`. Each replaces its pool label everywhere.
-Use the same GPU selector as the GPU Operator, so NVSentinel's agents run where the GPUs are.
+Both selectors are required and have no default. Set `cpuNodeSelector` and `gpuNodeSelector` to
+comma-separated `key=value` pairs, such as `foo.acme.corp/gpu-node=true`. Use the same GPU
+selector as the GPU Operator, so NVSentinel's agents run where the GPUs are. The
+[NVIDIA GPU Operator Stack's cluster template](../nvidia-gpu-operator/virtualclustertemplate.yaml)
+passes the labels its NodeProfiles set.
 
-Both selectors take `key=value` pairs only, and `discover` fails on anything else. A bare key such
-as `foo.acme.corp/gpu-node` is rejected, because the pod node selectors built from it would match
-only an empty label value. For a label that has an empty value, write `foo.acme.corp/gpu-node=`.
+Both selectors take `key=value` pairs only, and `discover` fails on anything else, including an
+empty selector. A bare key such as `foo.acme.corp/gpu-node` is rejected, because the pod node
+selectors built from it would match only an empty label value. For a label that has an empty
+value, write `foo.acme.corp/gpu-node=`.
 
 `discover` also publishes the selectors it checked, and every other task takes them from there.
 A selector that fails the check never reaches a workload: the tasks keep the last one that
@@ -456,9 +456,8 @@ label `app.kubernetes.io/part-of: nvsentinel-stack`.
 | Parameter | Default | Purpose |
 | --- | --- | --- |
 | `argoProject` | required | Argo CD project for the NVSentinel Application |
-| `cpuNodePool` | `cpu-services` | Value of `workload.example.com/pool` on CPU workers |
-| `cpuNodeSelector` | empty | Comma-separated `key=value` labels that select CPU workers instead of the pool label |
-| `gpuNodeSelector` | empty | Comma-separated `key=value` labels that select GPU workers instead of `workload.example.com/pool=gpu-compute` |
+| `cpuNodeSelector` | required | Comma-separated `key=value` labels that select the CPU workers |
+| `gpuNodeSelector` | required | Comma-separated `key=value` labels that select the GPU workers |
 | `gpuDriverMode` | `auto` | `auto` follows the GPU Operator in the cluster. `device-plugin` or `dra` skips detection. See [GPU driver mode](#gpu-driver-mode). |
 | `gpuOperatorNamespace` | `gpu-operator` | Namespace the GPU Operator runs DCGM in |
 | `dcgmHost` | empty | DCGM endpoint, when it is not the GPU Operator's Service. See [DCGM endpoint](#dcgm-endpoint). |
@@ -564,7 +563,7 @@ kubectl get namespace nvsentinel -L resource.kubernetes.io/admin-access
 
 ### Change the CPU node selector
 
-Changing `cpuNodePool` or `cpuNodeSelector` on a running Stack moves every CPU workload of this
+Changing `cpuNodeSelector` on a running Stack moves every CPU workload of this
 Stack: the NVSentinel controllers, MongoDB, the `discover` and gate Jobs and, with `slinkyDrain`,
 the Slinky drainer.
 
@@ -682,13 +681,14 @@ kubectl delete apps,argocdapplicationtemplates,stacktemplates -l app.kubernetes.
 - **`discover` failed with "both a ClusterPolicy and a GPUCluster exist".** The cluster is in a
   state the GPU Operator rejects, usually after a switch from DRA. Delete the CR for the mode you
   do not use, or set `gpuDriverMode` explicitly.
+- **`discover` failed with "node selector is empty".** Set `cpuNodeSelector` and `gpuNodeSelector`;
+  neither has a default.
 - **`discover` failed with "is not a key=value label".** `cpuNodeSelector` or `gpuNodeSelector`
   holds a bare key. Write a label with an empty value as `key=`.
 - **`discover` failed with "no node matching the CPU node selector".** The new selector would
   leave a volume in `nvsentinel`, MongoDB's, with no node to run on. See
   [Change the CPU node selector](#change-the-cpu-node-selector).
-- **`discover` or a gate Job Pending.** No CPU worker matches the CPU node selector: the
-  `cpuNodePool` label, or `cpuNodeSelector` when set.
+- **`discover` or a gate Job Pending.** No CPU worker matches `cpuNodeSelector`.
 - **`gpuready` stuck Progressing or failed.** Read the gate log,
   `kubectl -n nvsentinel-stack logs -l app.kubernetes.io/component=gpuready --tail=-1`. A count of
   0 means no GPU is available on the GPU node selector: `kubectl get nodes -l <selector>` shows

@@ -874,6 +874,20 @@ for name, providers in {"one provider": ("provider-a", "provider-a"), "two provi
         got = yaml.safe_load(t2["helmRelease"]["values"])["deploy"]["stacks"][1]["parameters"].get("gpuDriverMode")
         if got != want:
             fail(f"virtualclustertemplate.yaml ({name}): gpuDriverMode={requested} gives the {NVS_STACK} Stack {got!r}, expected {want!r}")
+    # The nvsentinel Stack requires both selectors and has no default for them. Left empty in the
+    # form, they must arrive as the labels the NodeProfiles set, not as empty strings.
+    for case, extra, want_cpu, want_gpu in (
+        ("NodeProfile labels", {}, cpu_selector_raw(values), gpu_selector_raw(values)),
+        ("own labels", {"cpuNodeSelector": "foo.acme.corp/cpu-node=true", "gpuNodeSelector": "foo.acme.corp/gpu-node=true"},
+         "foo.acme.corp/cpu-node=true", "foo.acme.corp/gpu-node=true"),
+    ):
+        t2 = render(vct["spec"]["template"], {**values, **extra}, f"virtualclustertemplate.yaml ({name}, {case})")
+        if not t2:
+            continue
+        got = yaml.safe_load(t2["helmRelease"]["values"])["deploy"]["stacks"][1]["parameters"]
+        if (got.get("cpuNodeSelector"), got.get("gpuNodeSelector")) != (want_cpu, want_gpu):
+            fail(f"virtualclustertemplate.yaml ({name}, {case}): the {NVS_STACK} Stack gets selectors "
+                 f"{got.get('cpuNodeSelector')!r} and {got.get('gpuNodeSelector')!r}, expected {want_cpu!r} and {want_gpu!r}")
 
 # --- Examples ------------------------------------------------------------------------------------
 for path in sorted((root / "example").glob("*.yaml")):

@@ -59,31 +59,24 @@ spec:
         nvsentinel namespace.
       type: string
       required: true
-    - variable: cpuNodePool
-      label: CPU Service Pool Label
-      description: Value of workload.example.com/pool on the CPU workers that run NVSentinel's controllers,
-        MongoDB and the Stack's Jobs.
-      type: string
-      required: true
-      defaultValue: cpu-services
-      section: Node Pools
     - variable: cpuNodeSelector
       label: CPU Node Selector
-      description: Comma-separated key=value labels that select the CPU service workers, replacing
-        workload.example.com/pool=<cpuNodePool>. Leave empty to keep that selector. Changing it moves every CPU
-        workload; discover fails on a selector that would strand NVSentinel's MongoDB volume, but cannot stop
-        the change. Check before changing it. discover also fails on a bare key; write a label with an empty
+      description: Comma-separated key=value labels that select the CPU workers that run NVSentinel's
+        controllers, MongoDB and the Stack's Jobs. Changing it moves every CPU workload; discover fails on a
+        selector that would strand NVSentinel's MongoDB volume, but cannot stop the change. Check before
+        changing it. discover also fails on an empty selector and on a bare key; write a label with an empty
         value as key=.
       type: string
+      required: true
       section: Node Pools
     - variable: gpuNodeSelector
       label: GPU Node Selector
-      description: Comma-separated key=value labels that select the GPU workers, replacing
-        workload.example.com/pool=gpu-compute. Leave empty to keep that selector. NVSentinel's GPU agents run
+      description: Comma-separated key=value labels that select the GPU workers. NVSentinel's GPU agents run
         on these nodes, tolerating the nvidia.com/gpu NoSchedule taint, and the gpuready gate looks for a GPU
-        only there. Use the GPU Operator's selector. discover fails on a bare key; write a label with an empty
-        value as key=.
+        only there. Use the GPU Operator's selector. discover fails on an empty selector and on a bare key;
+        write a label with an empty value as key=.
       type: string
+      required: true
       section: Node Pools
     - variable: gpuDriverMode
       label: GPU Driver Mode
@@ -286,12 +279,11 @@ spec:
           gpuOperatorNamespace: '{{ .Values.gpuOperatorNamespace }}'
           dcgmHost: '{{ .Values.dcgmHost }}'
           dcgmPort: '{{ .Values.dcgmPort }}'
-          # The selectors in effect: the parameter, or the pool label when it is empty. discover
-          # checks them and publishes them, and every other task takes them from its outputs. A
-          # selector that fails the check then never reaches a workload: the tasks keep the last
-          # one that passed.
-          cpuNodeSelector: '{{ .Values.cpuNodeSelector | default (printf "workload.example.com/pool=%s" .Values.cpuNodePool) }}'
-          gpuNodeSelector: '{{ .Values.gpuNodeSelector | default "workload.example.com/pool=gpu-compute" }}'
+          # discover checks the selectors and publishes them, and every other task takes them from
+          # its outputs. A selector that fails the check then never reaches a workload: the tasks
+          # keep the last one that passed.
+          cpuNodeSelector: '{{ .Values.cpuNodeSelector }}'
+          gpuNodeSelector: '{{ .Values.gpuNodeSelector }}'
           # cordon needs cert-manager, for the MongoDB store's certificates. discover fails with
           # that reason when it is missing.
           requireCertManager: '{{ ne (toString .Values.cordon) "false" }}'
@@ -431,7 +423,6 @@ spec:
           enabled: '{{ and (eq (toString .Values.cordon) "true") (eq (toString .Values.drain) "true") (eq (toString .Values.slinkyDrain) "true") }}'
           version: '{{ .Values.version }}'
           slinkyNamespace: '{{ .Values.slinkyNamespace }}'
-          cpuNodePool: '{{ .Values.cpuNodePool }}'
           cpuNodeSelector: '{{ .Outputs.discover.cpunodeselector }}'
     - name: nvsentinel
       dependsOn:
@@ -445,7 +436,6 @@ spec:
         templateRef:
           name: nvsentinel-nvsentinel
         parameters:
-          cpuNodePool: '{{ .Values.cpuNodePool }}'
           cpuNodeSelector: '{{ .Outputs.discover.cpunodeselector }}'
           gpuNodeSelector: '{{ .Outputs.discover.gpunodeselector }}'
           version: '{{ .Values.version }}'

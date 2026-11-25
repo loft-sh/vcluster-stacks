@@ -7,9 +7,7 @@
 #   - the NVIDIA GPU Operator running, with DCGM, from the nvidia-gpu-operator Stack or any other
 #     install,
 #   - cert-manager, unless cordon is "false",
-#   - at least one CPU worker labeled workload.example.com/pool=cpu-services, and
-#   - GPU workers labeled workload.example.com/pool=gpu-compute.
-# Set cpuNodeSelector and gpuNodeSelector when the nodes carry other labels.
+#   - at least one CPU worker and the GPU workers, each group with a label to select it by.
 #
 # spec.owner is required and, like spec.destination, immutable: to move the Stack, delete and
 # recreate it.
@@ -32,7 +30,9 @@ spec:
   prunePolicy: Prune
   parameters:
     argoProject: default
-    cpuNodePool: cpu-services
+    # Labels your nodes carry, as comma-separated key=value pairs. Use the GPU Operator's GPU selector.
+    cpuNodeSelector: foo.acme.corp/cpu-node=true
+    gpuNodeSelector: foo.acme.corp/gpu-node=true
     # auto follows the GPU Operator already in the cluster. Set "device-plugin" or "dra" when the
     # GPU Operator is installed at the same time as this Stack.
     gpuDriverMode: auto

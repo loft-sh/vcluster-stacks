@@ -252,14 +252,19 @@ def parse_selector(raw):
     return dict(p.strip().split("=", 1) for p in str(raw or "").split(",") if p.strip())
 
 
+# The selectors are required and have no default, so every variant starts from these.
+POOL = "pool=cpu"
+GPU_POOL = "pool=gpu"
+
+
 def cpu_selector_raw(values):
-    """The CPU node selector in effect, as the Stack hands it to discover: cpuNodeSelector, or the pool label."""
-    return str(values.get("cpuNodeSelector") or "") or f"workload.example.com/pool={values['cpuNodePool']}"
+    """The CPU node selector, as the Stack hands it to discover."""
+    return str(values["cpuNodeSelector"])
 
 
 def gpu_selector_raw(values):
-    """The GPU node selector in effect: gpuNodeSelector, or the GPU pool label."""
-    return str(values.get("gpuNodeSelector") or "") or "workload.example.com/pool=gpu-compute"
+    """The GPU node selector, as the Stack hands it to discover."""
+    return str(values["gpuNodeSelector"])
 
 
 def check_refs(where, node, declared, extra_ok=()):
@@ -442,10 +447,17 @@ if "dcgmready" in tasks and "gpuready" not in ancestors("dcgmready"):
 if (str(defaults(stack_params).get("cordon")), str(defaults(stack_params).get("dryRun")),
         str(defaults(stack_params).get("drain"))) != ("true", "false", "false"):
     fail("stacktemplate.yaml: NVSentinel must default to cordoning without draining (cordon=true, dryRun=false, drain=false)")
-if defaults(stack_params).get("cpuNodeSelector"):
-    fail("stacktemplate.yaml: cpuNodeSelector must default to empty, which selects workload.example.com/pool=<cpuNodePool>")
-if defaults(stack_params).get("gpuNodeSelector"):
-    fail("stacktemplate.yaml: gpuNodeSelector must default to empty, which selects workload.example.com/pool=gpu-compute")
+# The node selectors are plain label selectors the user must give: no default, and no pool label
+# the Stack builds one from.
+for name in ("cpuNodeSelector", "gpuNodeSelector"):
+    param = stack_params.get(name)
+    if not param or param.get("required") is not True or param.get("defaultValue"):
+        fail(f"stacktemplate.yaml: {name} must be required and have no default")
+for path in [root / "stacktemplate.yaml", root / "example" / "stackinstance.yaml", *sorted((root / "apps").glob("*.yaml"))]:
+    text = path.read_text()
+    for banned in ("cpuNodePool", "example.com/pool"):
+        if banned in text:
+            fail(f"{path.relative_to(root)}: mentions {banned}; the Stack takes cpuNodeSelector and gpuNodeSelector only")
 if defaults(stack_params).get("mongodbStorageClass"):
     fail("stacktemplate.yaml: mongodbStorageClass must default to empty; the StatefulSet's volume claims cannot change on upgrade")
 if str(defaults(stack_params).get("circuitBreakerEnabled")) != "true":
@@ -469,7 +481,6 @@ if defaults(stack_params).get("dcgmHost"):
 NVS = f"{PREFIX}-nvsentinel"
 for stack_var, app, app_var in [
     ("version", NVS, "version"), ("version", SLINKY, "version"),
-    ("cpuNodePool", NVS, "cpuNodePool"), ("cpuNodePool", SLINKY, "cpuNodePool"),
     ("slinkyNamespace", SLINKY, "slinkyNamespace"),
     ("gpuDriverMode", DISCOVER, "gpuDriverMode"), ("gpuOperatorNamespace", DISCOVER, "gpuOperatorNamespace"),
     ("dcgmPort", DISCOVER, "dcgmPort"), ("dcgmPort", NVS, "dcgmPort"),
@@ -513,7 +524,7 @@ VARIANTS = {
 }
 chart_runs = []
 for variant, overrides in VARIANTS.items():
-    values = {**defaults(stack_params), **overrides}
+    values = {**defaults(stack_params), "cpuNodeSelector": POOL, "gpuNodeSelector": GPU_POOL, **overrides}
     on = lambda k: str(values[k]) == "true"
     slinky = on("cordon") and on("drain") and on("slinkyDrain")
     cpu_sel = parse_selector(cpu_selector_raw(values))
@@ -807,13 +818,13 @@ for variant, overrides in VARIANTS.items():
 # A Job spec is immutable, so a changed selector must name a new Job, or the upgrade fails.
 for ref in (GATE, DISCOVER):
     names = []
-    for sel in ("workload.example.com/pool=cpu-services", "foo.acme.corp/cpu-node=true"):
+    for sel in (POOL, "foo.acme.corp/cpu-node=true"):
         docs = render_app(apps[ref], {"cpuNodeSelector": sel, "pinnedVolumeNamespace": "nvsentinel"}, "hash", f"{ref} hash")
         names.append([d["metadata"]["name"] for d in docs or [] if d.get("kind") == "Job"])
     if names[0] == names[1]:
         fail(f"apps/: {ref} keeps Job name {names[0]} when cpuNodeSelector changes; Helm cannot patch a Job's pod template")
 names = []
-for sel in ("workload.example.com/pool=gpu-compute", "foo.acme.corp/gpu-node=true"):
+for sel in (GPU_POOL, "foo.acme.corp/gpu-node=true"):
     docs = render_app(apps[GATE], {"capacityNodeSelector": sel}, "hash", f"{GATE} hash")
     names.append([d["metadata"]["name"] for d in docs or [] if d.get("kind") == "Job"])
 if names[0] == names[1]:
@@ -889,8 +900,6 @@ echo "fake kubectl: unexpected $*" >&2; exit 1
 docs = render_app(apps[DISCOVER], {"cpuNodeSelector": "x=y", "pinnedVolumeNamespace": "nvsentinel"}, "guard", "discover guard")
 script = next(d for d in docs if d.get("kind") == "Job")["spec"]["template"]["spec"]["containers"][0]["args"][0]
 HOST = "kubernetes.io/hostname In node-a|"
-POOL = "workload.example.com/pool=cpu-services"
-GPU_POOL = "workload.example.com/pool=gpu-compute"
 patch_file = work / "discover-patch.json"
 
 
@@ -939,6 +948,9 @@ for case, sel, pv, terms, match, ok, says in [
     expect(f"guard, {case}", {"CPU_NODE_SELECTOR": sel, "FAKE_PV": pv, "FAKE_TERMS": terms, "FAKE_MATCH": match}, ok, says,
            {"cpuNodeSelector": sel, "gpuNodeSelector": GPU_POOL})
 expect("bare GPU key", {"GPU_NODE_SELECTOR": "tier=gpu,foo"}, False, "GPU node selector 'tier=gpu,foo': 'foo' is not a key=value label")
+# No default to fall back to: an empty selector fails instead of selecting every node.
+expect("empty CPU selector", {"CPU_NODE_SELECTOR": ""}, False, "the CPU node selector is empty")
+expect("empty GPU selector", {"GPU_NODE_SELECTOR": ""}, False, "the GPU node selector is empty")
 
 # Mode detection and the DCGM endpoint, read from the patch: every DISCOVER_FACTS key, so swapped
 # names for the two modes fail here.

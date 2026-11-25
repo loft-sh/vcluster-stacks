@@ -48,9 +48,9 @@ spec:
     manifests: |-
       {{- if eq (.Values.enabled | toString) "true" }}
       {{- $version := .Values.version }}
-      {{- /* cpuNodeSelector (comma-separated key=value), or workload.example.com/pool=<cpuNodePool> when empty. */}}
+      {{- /* cpuNodeSelector is comma-separated key=value labels. */}}
       {{- $cpuNodeSelector := dict "kubernetes.io/os" "linux" }}
-      {{- range splitList "," (.Values.cpuNodeSelector | default (printf "workload.example.com/pool=%s" (.Values.cpuNodePool | default "cpu-services"))) }}
+      {{- range splitList "," (.Values.cpuNodeSelector | default "") }}
       {{- if trim . }}
       {{- $kv := splitn "=" 2 (trim .) }}
       {{- $_ := set $cpuNodeSelector $kv._0 ($kv._1 | default "") }}
@@ -407,13 +407,8 @@ spec:
         controller deletes every pod in it.
       type: string
       defaultValue: slurm
-    - variable: cpuNodePool
-      label: CPU Service Pool Label
-      description: Value of workload.example.com/pool on CPU service workers, where the controller runs.
-      type: string
-      defaultValue: cpu-services
     - variable: cpuNodeSelector
       label: CPU Node Selector
-      description: Comma-separated key=value labels that select the CPU service workers. Empty selects
-        workload.example.com/pool=<cpuNodePool>.
+      description: Comma-separated key=value labels that select the CPU workers, where the controller runs.
       type: string
+      required: true

@@ -365,9 +365,9 @@ spec:
               prunePolicy: Prune
               parameters:
                 argoProject: {{ .Values.argoProject | quote }}
-                cpuNodePool: {{ .Values.cpuNodePool | quote }}
-                cpuNodeSelector: {{ .Values.cpuNodeSelector | default "" | quote }}
-                gpuNodeSelector: {{ .Values.gpuNodeSelector | default "" | quote }}
+                # The NVSentinel Stack has no default selectors. Empty here means the labels the NodeProfiles set.
+                cpuNodeSelector: {{ .Values.cpuNodeSelector | default (printf "workload.example.com/pool=%s" .Values.cpuNodePool) | quote }}
+                gpuNodeSelector: {{ .Values.gpuNodeSelector | default "workload.example.com/pool=gpu-compute" | quote }}
                 # The GPU Operator installs alongside, so there is no CR to detect the mode from yet.
                 gpuDriverMode: {{ if eq (.Values.gpuDriverMode | default "auto") "auto" }}device-plugin{{ else }}{{ .Values.gpuDriverMode }}{{ end }}
                 # The GPU Stack always installs the GPU Operator here, with DCGM on its default port.
