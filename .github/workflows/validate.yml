@@ -23,7 +23,11 @@ on:
       - 'community-stacks/openclaw/**'
       - 'community-stacks/metered-inference/**'
       - 'community-stacks/nvidia-gpu-operator/**'
+      - 'certified-stacks/**'
+      - 'community-stacks/**'
+      - 'catalog/**'
       - '.github/workflows/validate.yml'
+      - '.github/stackcatalog-matcher.json'
   pull_request:
     branches: [main]
     paths:
@@ -34,7 +38,11 @@ on:
       - 'community-stacks/openclaw/**'
       - 'community-stacks/metered-inference/**'
       - 'community-stacks/nvidia-gpu-operator/**'
+      - 'certified-stacks/**'
+      - 'community-stacks/**'
+      - 'catalog/**'
       - '.github/workflows/validate.yml'
+      - '.github/stackcatalog-matcher.json'
 
 permissions:
   contents: read
@@ -44,6 +52,26 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  catalog:
+    name: Check catalog
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install catalog tool prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes python3-yaml python3-jsonschema
+      - name: Run catalog tool unit tests
+        run: python3 -B -m unittest discover -s catalog
+      - name: Check stack.json files
+        run: |
+          # Turns the tool's "error: <file>: ..." and "warning: <file>: ..." lines into annotations.
+          echo "::add-matcher::.github/stackcatalog-matcher.json"
+          python3 catalog/stackcatalog.py check
+
   validate:
     name: Render and validate
     runs-on: large-8_32
