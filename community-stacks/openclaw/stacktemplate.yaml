@@ -739,3 +739,4 @@ spec:
       fromTask: { task: modelready, output: toolcalls }
     - name: personaVersion
       fromTask: { task: persona, output: applied }
+# a5b fork test
