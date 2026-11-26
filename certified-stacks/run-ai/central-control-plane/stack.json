@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "name": "run-ai-central-control-plane",
+  "displayName": "NVIDIA Run:ai central-control-plane tenant (shared control plane and GPU Operator)",
+  "description": "Central control-plane tenancy shares one NVIDIA Run:ai control plane and one NVIDIA GPU Operator among the tenants' clusters.",
+  "author": "vCluster Labs",
+  "readme": "README.md",
+  "platformVersion": ">=5.1.0",
+  "members": [
+    "stacktemplate*.yaml",
+    "apps/*.yaml",
+    "example/vcluster-template-with-runai-stack.yaml"
+  ]
+}

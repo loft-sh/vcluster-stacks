@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "name": "run-ai-dedicated-control-plane",
+  "displayName": "NVIDIA Run:ai self-hosted (full infra, nip.io, real GPU operator)",
+  "description": "This Stack installs a self-hosted NVIDIA Run:ai control plane and cluster components.",
+  "author": "vCluster Labs",
+  "readme": "README.md",
+  "platformVersion": ">=5.1.0",
+  "members": [
+    "stacktemplate*.yaml",
+    "apps/*.yaml",
+    "example/vcluster-template-with-runai-stack.yaml"
+  ]
+}

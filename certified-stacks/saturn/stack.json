@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "name": "saturn-enterprise",
+  "displayName": "Saturn Cloud Enterprise",
+  "description": "This integration installs Saturn Cloud Enterprise through a native vCluster Platform Stack.",
+  "author": "vCluster Labs",
+  "readme": "README.md",
+  "platformVersion": ">=5.1.0",
+  "members": [
+    "stacktemplate.yaml",
+    "virtualclustertemplate.yaml",
+    "apps/*.yaml"
+  ]
+}
