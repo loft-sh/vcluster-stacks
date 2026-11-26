@@ -38,7 +38,7 @@ spec:
       type: string
       required: true
       # renovate: datasource=github-releases depName=NVIDIA/NVSentinel
-      defaultValue: v1.32.0
+      defaultValue: v1.33.0
     - variable: project
       label: Argo CD Project
       type: string

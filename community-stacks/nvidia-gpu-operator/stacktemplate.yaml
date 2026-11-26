@@ -132,7 +132,7 @@ spec:
       required: true
       section: Versions
       # renovate: datasource=github-releases depName=NVIDIA/NVSentinel
-      defaultValue: v1.32.0
+      defaultValue: v1.33.0
   # Values the gate publishes, readable from the StackInstance outputs subresource.
   publishedOutputs:
     - name: gpudrivermode
