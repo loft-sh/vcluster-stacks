@@ -1,0 +1,21 @@
+# Installs Radar into an existing tenant cluster. Apply it in the project namespace that owns
+# the tenant cluster, for example `kubectl apply -n p-default -f example/stackinstance.yaml`.
+#
+# spec.owner is required and, like spec.destination, immutable: to move the Stack, delete and
+# recreate it.
+apiVersion: management.loft.sh/v1
+kind: StackInstance
+metadata:
+  name: radar
+  labels:
+    app.kubernetes.io/part-of: radar-stack
+spec:
+  displayName: Radar
+  owner:
+    user: admin
+  destination:
+    virtualCluster:
+      name: my-tenant-cluster
+  templateRef:
+    name: radar
+  prunePolicy: Prune

@@ -23,6 +23,7 @@ on:
       - 'community-stacks/openclaw/**'
       - 'community-stacks/metered-inference/**'
       - 'community-stacks/nvidia-gpu-operator/**'
+      - 'community-stacks/radar/**'
       - '.github/workflows/validate.yml'
   pull_request:
     branches: [main]
@@ -34,6 +35,7 @@ on:
       - 'community-stacks/openclaw/**'
       - 'community-stacks/metered-inference/**'
       - 'community-stacks/nvidia-gpu-operator/**'
+      - 'community-stacks/radar/**'
       - '.github/workflows/validate.yml'
 
 permissions:
@@ -89,6 +91,8 @@ jobs:
         run: ./community-stacks/metered-inference/test-manifests.sh
       - name: Check NVIDIA GPU Operator manifests
         run: ./community-stacks/nvidia-gpu-operator/test-manifests.sh
+      - name: Check Radar manifests
+        run: ./community-stacks/radar/test-manifests.sh
       - name: Start vCluster Platform
         env:
           # Fail inside the job's timeout so the diagnostics step below can run. Default is 10m.
@@ -145,6 +149,7 @@ jobs:
             community-stacks/openclaw
             community-stacks/metered-inference
             community-stacks/nvidia-gpu-operator
+            community-stacks/radar
           )
           # NUL-separated *.yaml/*.yml files under $1 whose top-level documents are Platform
           # objects (apiVersion <group>.loft.sh/...). Supporting plain Kubernetes manifests, such

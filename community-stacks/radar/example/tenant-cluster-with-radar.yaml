@@ -1,0 +1,19 @@
+# A tenant cluster created from the radar-tenant template. Radar is installed with no extra step.
+# Apply it in a project namespace, for example
+# `kubectl apply -n p-default -f example/tenant-cluster-with-radar.yaml`.
+apiVersion: management.loft.sh/v1
+kind: VirtualClusterInstance
+metadata:
+  name: my-tenant-cluster
+spec:
+  displayName: My tenant cluster
+  owner:
+    user: admin
+  templateRef:
+    name: radar-tenant
+  clusterRef:
+    cluster: loft-cluster
+  # Set every template parameter: a tenant cluster created with kubectl does not get the
+  # template's defaults.
+  parameters: |
+    radarValues: ""
