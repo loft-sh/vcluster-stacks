@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "name": "invalid-path-dotdot",
+  "displayName": "NVIDIA Run:ai central control plane",
+  "description": "Fixture for the stack.json schema. A copy of the Run:ai example, reduced to one member.",
+  "author": "NVIDIA",
+  "maintainers": [
+    "vCluster Labs"
+  ],
+  "platformVersion": ">=5.1.0",
+  "members": [
+    "stacktemplate.yaml"
+  ],
+  "readme": "../README.md"
+}

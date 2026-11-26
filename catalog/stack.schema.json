@@ -1,0 +1,87 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "stack.json",
+  "description": "Describes one catalog entry: the stack directory that holds this stack.json. Paths are relative to that directory.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "name",
+    "displayName",
+    "description",
+    "author",
+    "platformVersion",
+    "members"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "description": "Version of this file format. Only 1 exists.",
+      "const": 1
+    },
+    "name": {
+      "description": "Name of the entry. It becomes the API object name, so it follows the Kubernetes name rules and must not change once released.",
+      "type": "string",
+      "maxLength": 63,
+      "pattern": "^(?![\\s\\S]*\\n)[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
+    },
+    "displayName": {
+      "description": "Name shown in the UI.",
+      "type": "string",
+      "minLength": 1
+    },
+    "description": {
+      "description": "Text shown on the card and the detail view.",
+      "type": "string",
+      "minLength": 1
+    },
+    "author": {
+      "description": "One name: a person, a team or a company.",
+      "type": "string",
+      "minLength": 1
+    },
+    "maintainers": {
+      "description": "Names or GitHub handles of the people who maintain the entry.",
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "icon": {
+      "description": "An SVG or PNG file in the stack directory. A URL is not allowed. Without an icon the UI shows the default one.",
+      "allOf": [
+        { "$ref": "#/definitions/relativePath" },
+        { "pattern": "\\.([sS][vV][gG]|[pP][nN][gG])$" }
+      ]
+    },
+    "readme": {
+      "description": "A Markdown file in the stack directory.",
+      "allOf": [
+        { "$ref": "#/definitions/relativePath" },
+        { "pattern": "\\.[mM][dD]$" }
+      ]
+    },
+    "platformVersion": {
+      "description": "Platform versions that can run the entry: one or more comparisons, each an operator and a full X.Y.Z version, separated by a space or a comma. Example: \">=5.1.0 <6.0.0\". The syntax is kept narrow so that every value is also a valid range for the Platform.",
+      "type": "string",
+      "pattern": "^(?![\\s\\S]*\\n)(>=|<=|>|<|=)(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)((, ?| )(>=|<=|>|<|=)(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*))*$"
+    },
+    "members": {
+      "description": "Paths or globs of the manifest files the entry installs. Only files listed here are installed.",
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/definitions/relativePath" }
+    },
+    "version": {
+      "description": "Reserved for a later version mechanism. Accepted with any value and ignored, so that a Platform that is already shipped does not reject it."
+    }
+  },
+  "definitions": {
+    "relativePath": {
+      "description": "A path relative to the stack directory, with / as separator. It must not start with /, contain a .. segment, a backslash, a colon or a control character. The colon rule also rejects URLs.",
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?![\\s\\S]*\\n)(?!/)(?!\\.\\.(/|$))(?![\\s\\S]*/\\.\\.(/|$))[^\\\\:\\x00-\\x1f\\x7f]+$"
+    }
+  }
+}
