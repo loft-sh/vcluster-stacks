@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "name": "fixture-content-hash",
+  "displayName": "Content hash fixture",
+  "description": "Fixture for the content hash. The catalog tool and the Platform must both compute the value in ../expected-content-hash.txt for this folder.",
+  "author": "vCluster Labs",
+  "icon": "icon.svg",
+  "readme": "README.md",
+  "platformVersion": ">=5.1.0",
+  "members": [
+    "stacktemplate.yaml",
+    "apps/*.yaml",
+    "apps-extra.yaml"
+  ]
+}
