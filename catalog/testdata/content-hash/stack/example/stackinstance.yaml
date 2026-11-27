@@ -1,0 +1,7 @@
+# Not a member: stack.json does not list it.
+apiVersion: management.loft.sh/v1
+kind: StackInstance
+metadata:
+  name: fixture-content-hash
+spec:
+  stackTemplate: fixture-content-hash

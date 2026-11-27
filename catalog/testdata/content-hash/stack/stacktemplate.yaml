@@ -1,0 +1,8 @@
+# Fixture for the content hash. It is never installed.
+apiVersion: management.loft.sh/v1
+kind: StackTemplate
+metadata:
+  name: fixture-content-hash
+spec:
+  displayName: fixture-content-hash
+  description: Fixture member of the content hash fixture.
