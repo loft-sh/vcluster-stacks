@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "name": "metered-inference",
+  "displayName": "Metered inference",
+  "description": "Three Stacks that deploy a batteries-included metered inference service through vCluster Platform.",
+  "author": "vCluster Labs",
+  "icon": "icon.svg",
+  "readme": "README.md",
+  "platformVersion": ">=5.1.0",
+  "members": [
+    "gateway/stacktemplate.yaml",
+    "gateway/apps/*.yaml",
+    "platform/stacktemplate.yaml",
+    "platform/apps/*.yaml",
+    "tenant/stacktemplate.yaml",
+    "tenant/apps/*.yaml"
+  ]
+}

@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "name": "nvidia-gpu-operator",
+  "displayName": "NVIDIA GPU Operator and NVSentinel",
+  "description": "This Stack turns a cluster with private GPU nodes into a working NVIDIA GPU cluster.",
+  "author": "vCluster Labs",
+  "readme": "README.md",
+  "platformVersion": ">=5.1.0",
+  "members": [
+    "stacktemplate.yaml",
+    "virtualclustertemplate.yaml",
+    "nodeprofiles.yaml",
+    "apps/*.yaml"
+  ]
+}
