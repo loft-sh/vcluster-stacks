@@ -1,0 +1,8 @@
+# Fixture for catalog/stack.schema.json. It is never installed.
+apiVersion: management.loft.sh/v1
+kind: StackTemplate
+metadata:
+  name: fixture-invalid-missing-platform-version
+spec:
+  displayName: fixture-invalid-missing-platform-version
+  description: Fixture member of the invalid-missing-platform-version fixture.

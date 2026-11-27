@@ -1,0 +1,8 @@
+# Fixture for catalog/stack.schema.json. It is never installed.
+apiVersion: management.loft.sh/v1
+kind: StackTemplate
+metadata:
+  name: fixture-invalid-unknown-key
+spec:
+  displayName: fixture-invalid-unknown-key
+  description: Fixture member of the invalid-unknown-key fixture.

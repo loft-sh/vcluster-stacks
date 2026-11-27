@@ -1,0 +1,8 @@
+# Fixture for catalog/stack.schema.json. It is never installed.
+apiVersion: management.loft.sh/v1
+kind: StackTemplate
+metadata:
+  name: fixture-invalid-entries-list
+spec:
+  displayName: fixture-invalid-entries-list
+  description: Fixture member of the invalid-entries-list fixture.
