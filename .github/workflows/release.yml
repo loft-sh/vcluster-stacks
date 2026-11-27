@@ -1,0 +1,171 @@
+name: Release files
+
+# Maintainers publish a release in the GitHub web page. This workflow then builds
+# index.json and one archive per catalog entry, and attaches them to that release.
+# A manual run repeats it for an existing release, for example after a failed run.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag of an existing release to build again, for example v1.3.0'
+        required: true
+
+permissions:
+  contents: read
+
+# Releases are built one after the other, so each run sees the files of the one before.
+# GitHub keeps one pending run per group: a third release published while one runs
+# cancels the pending one, and the gap check below says how to recover.
+concurrency:
+  group: release-files
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  release:
+    name: Build and attach release files
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Check the tag and its release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # A release trigger has no tag filter, so the format is checked here.
+          if [[ ! "$TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::Release tag $TAG is not vMAJOR.MINOR.PATCH"
+            exit 1
+          fi
+          if ! draft=$(gh release view "$TAG" --json isDraft --jq .isDraft); then
+            echo "::error::$TAG has no release. Publish the release for $TAG first."
+            exit 1
+          fi
+          if [ "$draft" = true ]; then
+            echo "::error::The release for $TAG is a draft. Publish it first."
+            exit 1
+          fi
+
+      - name: List the releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # One line per published release: its tag, and whether it has index.json.
+          gh api --paginate "repos/$GH_REPO/releases" \
+            --jq '.[] | select(.draft | not) | [.tag_name, ([.assets[].name] | any(. == "index.json"))] | @tsv' \
+            > "$RUNNER_TEMP/releases.tsv"
+
+      - name: Find the previous release
+        id: order
+        run: |
+          pattern='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+          # A tag stays new until its release has index.json. A release made in the
+          # web page already exists when this runs, and must still be checked.
+          is_new=true
+          others=()
+          declare -A has_index
+          while IFS=$'\t' read -r tag index; do
+            [[ "$tag" =~ $pattern ]] || continue
+            if [ "$tag" = "$TAG" ]; then
+              if [ "$index" = true ]; then is_new=false; fi
+              continue
+            fi
+            others+=("$tag")
+            has_index[$tag]=$index
+          done < "$RUNNER_TEMP/releases.tsv"
+
+          highest=""
+          previous=""
+          if [ "${#others[@]}" -gt 0 ]; then
+            highest=$(printf '%s\n' "${others[@]}" | sort -V | tail -n 1)
+            mapfile -t below < <(printf '%s\n' "${others[@]}" "$TAG" | sort -V | awk -v t="$TAG" '$0 == t { exit } { print }')
+            if [ "${#below[@]}" -gt 0 ]; then
+              previous=${below[-1]}
+              if [ "${has_index[$previous]}" != true ]; then
+                # Without the previous index every entry would look changed. That is
+                # right only for the first release with files. A run for $previous
+                # would now be refused as lower than $TAG, so it cannot be repaired.
+                for tag in "${below[@]}"; do
+                  if [ "${has_index[$tag]}" = true ]; then
+                    echo "::error::$previous has no index.json, but the older release $tag has one. If a run for $previous is still going, wait for it, then run this workflow for $TAG again. Otherwise delete the release $previous and its tag, then run this workflow for $TAG again."
+                    exit 1
+                  fi
+                done
+                previous=""
+              fi
+            fi
+          fi
+          echo "Tag $TAG: new=$is_new, highest other release=${highest:-none}, previous index from ${previous:-none}"
+          {
+            echo "is_new=$is_new"
+            echo "highest=$highest"
+            echo "previous=$previous"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Compare the tag with the highest other release
+        id: semver
+        if: steps.order.outputs.is_new == 'true' && steps.order.outputs.highest != ''
+        uses: loft-sh/github-actions/.github/actions/semver-validation@semver-validation/v4
+        with:
+          version: ${{ env.TAG }}
+          compare_to: ${{ steps.order.outputs.highest }}
+
+      - name: Refuse a tag that is not higher
+        if: steps.semver.outcome == 'success'
+        env:
+          HIGHEST: ${{ steps.order.outputs.highest }}
+          IS_GREATER: ${{ steps.semver.outputs.is_greater }}
+        run: |
+          # The Platform never applies a catalog older than the one an entry came from.
+          if [ "$IS_GREATER" != true ]; then
+            echo "::error::$TAG is not higher than the release $HIGHEST. No file was built. Delete the release $TAG and its tag."
+            exit 1
+          fi
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ env.TAG }}
+          persist-credentials: false
+
+      - name: Install catalog tool prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes python3-yaml python3-jsonschema
+
+      - name: Download the previous index
+        if: steps.order.outputs.previous != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PREVIOUS: ${{ steps.order.outputs.previous }}
+        run: gh release download "$PREVIOUS" --pattern index.json --dir "$RUNNER_TEMP/previous"
+
+      - name: Build the release files
+        env:
+          PREVIOUS: ${{ steps.order.outputs.previous }}
+        run: |
+          # The date of the tagged commit, so a repeated run builds the same files.
+          date=$(TZ=UTC git log -1 --format=%cd --date=format-local:%Y-%m-%d)
+          args=(--catalog-version "$TAG" --date "$date" --output "$RUNNER_TEMP/release")
+          if [ -n "$PREVIOUS" ]; then
+            args+=(--previous-index "$RUNNER_TEMP/previous/index.json")
+          fi
+          echo "::add-matcher::.github/stackcatalog-matcher.json"
+          python3 catalog/stackcatalog.py build "${args[@]}"
+
+      - name: Attach the files to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # index.json goes last: a release with index.json counts as complete, both
+          # here and for the Platform. --clobber replaces files of an earlier run.
+          gh release upload "$TAG" "$RUNNER_TEMP"/release/*.tgz --clobber
+          gh release upload "$TAG" "$RUNNER_TEMP/release/index.json" --clobber
