@@ -1,0 +1,15 @@
+{
+  "problemMatcher": [
+    {
+      "owner": "stackcatalog",
+      "pattern": [
+        {
+          "regexp": "^(error|warning): ([^:]+): (.+)$",
+          "severity": 1,
+          "file": 2,
+          "message": 3
+        }
+      ]
+    }
+  ]
+}
