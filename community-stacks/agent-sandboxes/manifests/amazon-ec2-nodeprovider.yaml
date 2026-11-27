@@ -1,0 +1,67 @@
+# Served by the platform's aggregated API, so it can only be applied once
+# vCluster Platform is running:
+#   vcluster platform connect management
+#   kubectl apply -f amazon-ec2-nodeprovider.yaml
+#
+# The nodes this provider creates are built by the Terraform node provider, which
+# authenticates through the EKS Pod Identity association in infra/ — no static
+# credentials are configured here.
+apiVersion: management.loft.sh/v1
+kind: NodeProvider
+metadata:
+  name: aws-ec2
+spec:
+  displayName: AWS EC2
+  properties:
+    region: eu-central-1
+    vcluster.com/ccm-enabled: "true"
+  terraform:
+    nodeTemplate:
+      git:
+        repository: https://github.com/loft-sh/vcluster-auto-nodes-aws.git
+        tag: v0.1.1
+        subPath: node
+    nodeEnvironmentTemplate:
+      infrastructure:
+        git:
+          repository: https://github.com/loft-sh/vcluster-auto-nodes-aws.git
+          tag: v0.1.1
+          subPath: environment/infrastructure
+      kubernetes:
+        git:
+          repository: https://github.com/loft-sh/vcluster-auto-nodes-aws.git
+          tag: v0.1.1
+          subPath: environment/kubernetes
+    nodeTypes:
+      - name: t3.small
+        metadata: {}
+        properties:
+          instance-type: t3.small
+          terraform.vcluster.com/credentials: "*"
+        resources:
+          cpu: "2"
+          memory: 2Gi
+      - name: t3.medium
+        metadata: {}
+        properties:
+          instance-type: t3.medium
+          terraform.vcluster.com/credentials: "*"
+        resources:
+          cpu: "2"
+          memory: 4Gi
+      - name: t3.large
+        metadata: {}
+        properties:
+          instance-type: t3.large
+          terraform.vcluster.com/credentials: "*"
+        resources:
+          cpu: "2"
+          memory: 8Gi
+      - name: g5.2xlarge
+        metadata: {}
+        properties:
+          instance-type: g5.2xlarge
+          terraform.vcluster.com/credentials: "*"
+        resources:
+          cpu: "8"
+          memory: 32Gi
