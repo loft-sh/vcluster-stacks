@@ -52,7 +52,7 @@ jobs:
     timeout-minutes: 10
     env:
       # renovate: datasource=github-releases depName=loft-sh/vcluster
-      VCLUSTER_VERSION: ${{ github.event.inputs.vcluster_version || 'v0.37.7' }}
+      VCLUSTER_VERSION: ${{ github.event.inputs.vcluster_version || 'v0.38.0' }}
       # renovate: datasource=github-releases depName=loft-sh/loft extractVersion=^v(?<version>.+)$
       PLATFORM_VERSION: ${{ github.event.inputs.platform_version || '4.12.6' }}
     steps:
