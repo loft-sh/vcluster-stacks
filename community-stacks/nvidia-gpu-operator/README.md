@@ -1,12 +1,18 @@
 # NVIDIA GPU Operator Community Stack
 
+> [!NOTE]
+> [NVSentinel](https://github.com/NVIDIA/NVSentinel) has moved out of this Stack into the
+> [NVSentinel Stack](../nvsentinel/). If your instance still runs the NVSentinel that earlier
+> versions of this Stack installed, follow
+> [Upgrade from a version that included NVSentinel](#upgrade-from-a-version-that-included-nvsentinel)
+> before you apply this version.
+
 This Stack turns a tenant cluster with private GPU nodes into a working NVIDIA GPU cluster. It
 installs these components in dependency order:
 
 - The [NVIDIA GPU Operator](https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/latest/),
   through Argo CD, with either the device plugin or Dynamic Resource Allocation (DRA). See
   [GPU driver mode](#gpu-driver-mode).
-- [NVSentinel](https://github.com/NVIDIA/NVSentinel) in dry-run monitoring mode, through Argo CD.
 - A task that resolves the GPU driver mode, two readiness gates and a CUDA smoke test, as
   vCluster Platform Apps.
 
@@ -40,9 +46,7 @@ The files in this directory are the source manifests, an example and the checks 
 ## Architecture
 
 ```text
-discover (00) ---> gpu-operator (01) ---> gpuready (02) --+--> dcgmready (02) ---+
-                                                          |                       +--> nvsentinel (03)
-                                                          +-----------------------+
+discover (00) ---> gpu-operator (01) ---> gpuready (02) --+--> dcgmready (02)
                                                           |
                                                           +--> gpu-smoke-test (03)
 ```
@@ -57,10 +61,9 @@ mode from `discover`'s outputs. The diagram leaves those edges out.
 | `gpuready` | `app` | `nvidia-gpu-operator-gate` | `discover`, `gpu-operator` | `28m0s` | Gate. Waits until `minGPUs` GPUs are available, then marks ConfigMap `gpu-stack-contract` ready. |
 | `dcgmready` | `app` | `nvidia-gpu-operator-gate` | `discover`, `gpuready` | `15m0s` | Gate. Waits for the DCGM DaemonSet (`nvidia-dcgm`, or `nvidia-dcgm-dra` with DRA) to finish rolling out on every GPU node. Publishes nothing. |
 | `gpu-smoke-test` | `app` | `nvidia-gpu-operator-gpu-smoke-test` | `discover`, `gpuready` | `12m0s` | Runs NVIDIA's CUDA VectorAdd sample on the GPU pool. |
-| `nvsentinel` | `argoCDApplication` | `nvidia-gpu-operator-nvsentinel` | `discover`, `gpuready`, `dcgmready` | `20m0s` | Installs NVSentinel in dry-run mode, in the resolved mode. Reads its DCGM address from the gate's contract. |
 
-The Stack mixes two task types. **The workloads are Argo CD Applications**: once the Stack has
-ordered the rollout, Argo CD owns their reconciliation and drift correction. **The gates and the
+The Stack mixes two task types. **The GPU Operator is an Argo CD Application**: once the Stack has
+ordered the rollout, Argo CD owns its reconciliation and drift correction. **The gates and the
 smoke test are Platform Apps**, and so is `discover`: their manifests, a Job with its RBAC, live
 inline in `apps/`.
 
@@ -85,12 +88,7 @@ one, and every task follows it:
 | What `gpuready` counts | `nvidia.com/gpu` in node allocatable | Devices of type `gpu` that driver `gpu.nvidia.com` publishes in ResourceSlices |
 | DCGM DaemonSet and Service | `nvidia-dcgm` | `nvidia-dcgm-dra` |
 | Smoke test | Requests `nvidia.com/gpu` | Requests a GPU through a ResourceClaimTemplate |
-| NVSentinel | `global.gpuDraEnabled: false`. The metadata collector uses the `nvidia` RuntimeClass. | `global.gpuDraEnabled: true`. The metadata collector holds a DRA admin-access claim on the node's GPUs. Namespace `nvsentinel` is labeled `resource.kubernetes.io/admin-access=true`. |
 | Kubernetes | Any supported version | 1.34 or later (`resource.k8s.io/v1`) |
-
-NVSentinel must run in the same mode as the GPU Operator. In DRA mode there is no `nvidia`
-RuntimeClass, so a device-plugin NVSentinel never collects GPU metadata. In device-plugin mode
-there are no ResourceSlices to claim.
 
 `auto`, the default, decides at install time:
 
@@ -139,8 +137,6 @@ screenshot is from an earlier version of this Stack that also installed cert-man
 of hard-coding values:
 
 ```yaml
-# nvsentinel
-dcgmHost: '{{ .Outputs.gpuready.dcgmhost }}'
 # gpu-smoke-test
 gpuNodeSelector: '{{ .Outputs.gpuready.gpunodeselector }}'
 ```
@@ -159,8 +155,8 @@ to `true` to hold for the whole operand set. In DRA mode it waits on the `GPUClu
 ### The dcgmready gate
 
 The GPU Operator creates `dcgm-exporter` and `nvidia-dcgm` at the same time, with nothing
-ordering them. Without this gate, NVSentinel can start before the DCGM host engine is serving
-and report `GpuDcgmConnectivityFailure`.
+ordering them. Without this gate, the Stack can report healthy before the DCGM host engine is
+serving, and a DCGM client that reads the published `dcgmhost` fails to connect.
 
 `dcgmready` runs the same gate App with different parameters: `kubectl rollout status` on
 `daemonset/nvidia-dcgm` (`nvidia-dcgm-dra` with DRA), which covers any number of GPU workers. It depends on `gpuready`
@@ -210,8 +206,6 @@ Pods reach a pool through a `nodeSelector` on `workload.example.com/pool`. Pods 
 | NVIDIA driver, toolkit, device plugin, validators, DCGM. With DRA: driver, DRA kubelet plugin, DRA validator, DCGM. | Operator-managed GPU selectors, with the GPU taint toleration |
 | `discover` and gate Jobs | CPU pool. They only talk to the API server. |
 | CUDA smoke test | GPU pool, with the GPU taint toleration and a GPU request or ResourceClaim |
-| NVSentinel labeler | CPU pool |
-| NVSentinel health monitors, metadata collector, `platformConnector` | GPU pool, with the GPU taint toleration |
 
 CPU workloads select `workload.example.com/pool=<cpuNodePool>`. To select CPU workers by other
 labels, for example on a cluster whose nodes do not come from these NodeProfiles, set
@@ -220,8 +214,8 @@ labels, for example on a cluster whose nodes do not come from these NodeProfiles
 is placed.
 
 GPU workloads select `workload.example.com/pool=gpu-compute`. To select GPU workers by other
-labels, set `gpuNodeSelector`, for example to `foo.acme.corp/gpu-node=true`. The NFD workers,
-NVSentinel's GPU agents and the smoke test then run only on matching nodes, and `gpuready` counts
+labels, set `gpuNodeSelector`, for example to `foo.acme.corp/gpu-node=true`. The NFD workers
+and the smoke test then run only on matching nodes, and `gpuready` counts
 only their GPUs. These pods also tolerate the `nvidia.com/gpu` taint, so GPU workers can be
 tainted or not.
 
@@ -247,8 +241,7 @@ readiness at the Stack level.
 - For `gpuDriverMode: dra`, Kubernetes 1.34 or later, which serves `resource.k8s.io/v1`. The GPU
   Operator chart refuses to deploy a `GPUCluster` on a cluster without a DRA API.
 - An Argo CD connector in the Platform. You also need an Argo CD project that permits the GPU
-  Operator and NVSentinel chart sources and the destination namespaces `gpu-operator` and
-  `nvsentinel`.
+  Operator chart source and the destination namespace `gpu-operator`.
 - A node provider with at least one NVIDIA GPU machine, and a provider with a CPU machine. One
   provider can serve both.
 - Platform Private Nodes, with the VPN reachable by the workers. The control plane cluster needs
@@ -261,31 +254,19 @@ readiness at the Stack level.
   | Source | Used by |
   | --- | --- |
   | `https://helm.ngc.nvidia.com/nvidia`, `nvcr.io` | GPU Operator chart and images, CUDA sample |
-  | `oci://ghcr.io/nvidia/nvsentinel`, `ghcr.io/nvidia` | NVSentinel chart and images |
   | The vCluster Platform image, `ghcr.io/loft-sh/vcluster-platform` or your mirror | Gate Jobs, on the CPU pool |
-
-### cert-manager for production NVSentinel
-
-cert-manager is not part of this Stack, and the Stack does not need it. NVSentinel runs here in
-dry-run mode, and that configuration renders no cert-manager resources.
-
-A production NVSentinel does need it. MongoDB store, which quarantine, draining and remediation
-depend on, needs cert-manager for its certificates. So do Janitor, janitor-provider, preflight
-and PostgreSQL. Install cert-manager in the tenant cluster before you enable any of them, and
-add the dependency to your Stack if you manage cert-manager there.
 
 ## Files
 
 | File | Purpose |
 | --- | --- |
-| [stacktemplate.yaml](stacktemplate.yaml) | StackTemplate `nvidia-gpu-operator`: six tasks, parameters and published outputs |
+| [stacktemplate.yaml](stacktemplate.yaml) | StackTemplate `nvidia-gpu-operator`: five tasks, parameters and published outputs |
 | [apps/00-discover.yaml](apps/00-discover.yaml) | App `nvidia-gpu-operator-discover`, which resolves the GPU driver mode |
 | [apps/01-gpu-operator.yaml](apps/01-gpu-operator.yaml) | ArgoCDApplicationTemplate `nvidia-gpu-operator-gpu-operator` |
 | [apps/02-gate.yaml](apps/02-gate.yaml) | App `nvidia-gpu-operator-gate`, the reusable readiness gate |
 | [apps/03-gpu-smoke-test.yaml](apps/03-gpu-smoke-test.yaml) | App `nvidia-gpu-operator-gpu-smoke-test` |
-| [apps/03-nvsentinel.yaml](apps/03-nvsentinel.yaml) | ArgoCDApplicationTemplate `nvidia-gpu-operator-nvsentinel` |
 | [nodeprofiles.yaml](nodeprofiles.yaml) | NodeProfiles for the CPU services pool and the GPU pool |
-| [virtualclustertemplate.yaml](virtualclustertemplate.yaml) | VirtualClusterTemplate `nvidia-gpu-operator-private-nodes`: both pools, the Argo CD integration and the Stack through `deploy.stacks` |
+| [virtualclustertemplate.yaml](virtualclustertemplate.yaml) | VirtualClusterTemplate `nvidia-gpu-operator-private-nodes`: both pools, the Argo CD integration, and this Stack and the [NVSentinel Stack](../nvsentinel/) through `deploy.stacks` |
 | [example/stackinstance.yaml](example/stackinstance.yaml) | StackInstance for an existing tenant cluster |
 | [test-manifests.sh](test-manifests.sh) | Static and render checks |
 
@@ -295,13 +276,13 @@ label `app.kubernetes.io/part-of: nvidia-gpu-operator-stack`.
 ## Configure parameters
 
 Set these on the tenant cluster template when you create a tenant cluster. The template passes
-the Stack parameters through `deploy.stacks`.
+the Stack parameters through `deploy.stacks`, to this Stack and to the NVSentinel Stack.
 
 | Parameter | Default | Purpose |
 | --- | --- | --- |
 | `kubernetesVersion` | `v1.36.4` | Tenant cluster control plane version |
 | `argoConnector` | required | Existing Platform Argo CD connector |
-| `argoProject` | `default` | Argo CD project for the GPU Operator and NVSentinel Applications |
+| `argoProject` | `default` | Argo CD project for the Argo CD Applications |
 | `gpuNodeProvider` | required | Node provider for the GPU pool |
 | `gpuNodeType` | `xlarge-gpu` | The provider's `vcluster.com/profile` node type for GPU machines |
 | `gpuNodeCount` | `1` | GPU workers to provision |
@@ -312,19 +293,20 @@ the Stack parameters through `deploy.stacks`.
 | `gpuNodeSelector` | empty | Comma-separated `key=value` labels that select GPU workers instead of `workload.example.com/pool=gpu-compute`. Leave empty with the NodeProfiles. |
 | `minGPUs` | `1` | GPUs that must be available before `gpuready` passes |
 | `gpuDriverMode` | `auto` | `device-plugin`, `dra`, or `auto` to keep an existing GPU Operator's mode. See [GPU driver mode](#gpu-driver-mode). |
-| `driverPreinstalled` | `false` | `true` when the node image has the NVIDIA driver. GPU Operator skips the driver, and NVSentinel labels in preinstalled-driver mode. |
+| `driverPreinstalled` | `false` | `true` when the node image has the NVIDIA driver. GPU Operator skips the driver. |
 | `waitForClusterPolicy` | `false` | `true` also waits for every GPU Operator operand (`ClusterPolicy`, or `GPUCluster` with DRA) |
 | `gpuOperatorVersion` | `v26.7.2` | GPU Operator chart version. DRA mode needs v26.7.0 or later. |
-| `nvsentinelVersion` | `v1.32.0` | NVSentinel chart and image version |
+| `nvsentinel*` | | Parameters of the [NVSentinel Stack](../nvsentinel/), which the template also installs. `nvsentinelCordon` is its `cordon`, and so on. |
 
 The StackTemplate declares the Stack parameters: `argoProject`, `cpuNodePool`, `cpuNodeSelector`,
-`gpuNodeSelector`, `minGPUs`, `gpuDriverMode`, `driverPreinstalled`, `waitForClusterPolicy`, `gpuOperatorVersion` and
-`nvsentinelVersion`. The others shape the tenant cluster.
+`gpuNodeSelector`, `minGPUs`, `gpuDriverMode`, `driverPreinstalled`, `waitForClusterPolicy` and
+`gpuOperatorVersion`. The `nvsentinel*` parameters go to the NVSentinel Stack, whose README
+covers them and its requirements. The others shape the tenant cluster.
 
 Notes:
 
 - **Size the CPU pool for about a dozen pods.** That covers the GPU Operator controller, NFD
-  master and garbage collector, the NVSentinel labeler, the gate Jobs and the system pods. On a
+  master and garbage collector, the gate Jobs and the system pods. On a
   2 cpu / 4Gi node with cert-manager also running, the GPU Operator controller lost its leader
   election lease during image extraction and restarted three times. 4 cpu / 8Gi had enough
   headroom.
@@ -348,7 +330,10 @@ with `vcluster platform connect management`.
 kubectl apply -f community-stacks/nvidia-gpu-operator/nodeprofiles.yaml \
   -f community-stacks/nvidia-gpu-operator/apps/ \
   -f community-stacks/nvidia-gpu-operator/stacktemplate.yaml
-# 2. The tenant cluster template that provisions both pools and installs the Stack.
+# 2. Only for the cluster template, which also installs NVSentinel: the NVSentinel Stack.
+kubectl apply -f community-stacks/nvsentinel/apps/ \
+  -f community-stacks/nvsentinel/stacktemplate.yaml
+# 3. The cluster template that provisions both pools and installs both Stacks.
 kubectl apply -f community-stacks/nvidia-gpu-operator/virtualclustertemplate.yaml
 ```
 
@@ -363,7 +348,7 @@ CD integration and nodes labeled and tainted as the NodeProfiles describe. Set
 kubectl apply -n p-default -f community-stacks/nvidia-gpu-operator/example/stackinstance.yaml
 ```
 
-UI: **tenant cluster > Stacks > Install Stack > "NVIDIA GPU Operator and NVSentinel"**.
+UI: **tenant cluster > Stacks > Install Stack > "NVIDIA GPU Operator"**.
 
 ## Verify
 
@@ -400,16 +385,13 @@ Check placement and the GPUs the scheduler advertises:
 kubectl get nodes -L workload.example.com/pool
 kubectl get pods -n gpu-operator -o wide
 kubectl get pods -n gpu-stack -o wide
-kubectl get pods -n nvsentinel -o wide
 kubectl get nodes -o json | jq '.items[] | {name: .metadata.name, pool: .metadata.labels["workload.example.com/pool"], gpus: (.status.allocatable["nvidia.com/gpu"] // "0")}'
 ```
 
-In DRA mode, node allocatable shows no `nvidia.com/gpu`. Check the ResourceSlices and the
-namespace label NVSentinel needs instead:
+In DRA mode, node allocatable shows no `nvidia.com/gpu`. Check the ResourceSlices instead:
 
 ```bash
 kubectl get resourceslices -o custom-columns=NODE:.spec.nodeName,DRIVER:.spec.driver,DEVICES:.spec.devices[*].name
-kubectl get namespace nvsentinel -L resource.kubernetes.io/admin-access
 ```
 
 To run your own GPU workload in device-plugin mode, select the pool, tolerate the taint and
@@ -457,7 +439,7 @@ containers:
 
 ## Upgrade
 
-- **Chart versions.** Change `gpuOperatorVersion` or `nvsentinelVersion`. Argo CD upgrades the
+- **Chart version.** Change `gpuOperatorVersion`. Argo CD upgrades the
   release in place. Renovate tracks the defaults in this directory.
 - **Gate image.** The gate Jobs follow the Platform image. A Platform upgrade changes it, with
   nothing to do here.
@@ -473,16 +455,14 @@ containers:
   `workload.example.com/pool=<cpuNodePool>`. A tenant cluster that has not synced its template yet
   also passes it empty. Either way an upgrade renders the same node selectors and moves nothing.
   Changing `cpuNodePool` or `cpuNodeSelector` moves every CPU workload: the GPU Operator
-  controller, the NFD master and garbage collector, NVSentinel's CPU components and the Jobs.
+  controller, the NFD master and garbage collector, and the Jobs.
   Label the target CPU workers first, then change the parameter. Until a node matches, those pods
   stay Pending.
 - **GPU node selector.** An empty `gpuNodeSelector`, its default, keeps
   `workload.example.com/pool=gpu-compute`, and an upgrade moves nothing. The version that added it
   also adds `gpuNodeSelector` to the gate's contract, so `gpuready` runs once more. Changing it
-  moves the NFD workers and NVSentinel's GPU agents, and re-runs `gpuready` and the smoke test
-  against the new nodes. Label the GPU workers first: until enough GPUs match, `gpuready` holds and
-  then fails, while NVSentinel's agents already move, because the Stack re-syncs changed tasks
-  without waiting for the gate.
+  moves the NFD workers, and re-runs `gpuready` and the smoke test against the new nodes. Label
+  the GPU workers first: until enough GPUs match, `gpuready` holds and then fails.
 - **Switching the GPU driver mode.** Change `gpuDriverMode` to `device-plugin` or `dra`.
   `discover` decides again, and every task follows. Plan for downtime: the GPU Operator replaces
   its whole node stack, including the driver DaemonSet, so GPU workloads on the nodes are
@@ -494,18 +474,74 @@ containers:
     `kubectl get gpuclusters`, and if `gpu-cluster` is still there, run `kubectl delete gpucluster
     gpu-cluster`.
 
+### Upgrade from a version that included NVSentinel
+
+Earlier versions of this Stack installed NVSentinel themselves, as an `nvsentinel` task in
+dry-run monitoring mode. That task is gone, and NVSentinel is now the
+[NVSentinel Stack](../nvsentinel/).
+
+Applying the new StackTemplate does not remove the old NVSentinel by itself. A StackInstance
+keeps the application of a removed task unless its `prunePolicy` is `Prune`, and instances
+created from earlier versions of this directory do not set it. The NVSentinel Stack does not
+adopt the old installation either: it creates its own Argo CD Application for the same resources
+in the `nvsentinel` namespace, and two Applications managing them would overwrite each other. So
+remove the old one first:
+
+1. Set `prunePolicy: Prune` on the StackInstance, on the management API:
+
+   ```bash
+   kubectl -n <project-namespace> patch stackinstance <name> --type merge -p '{"spec":{"prunePolicy":"Prune"}}'
+   ```
+
+2. Apply the new Apps and StackTemplate:
+
+   ```bash
+   kubectl apply -f community-stacks/nvidia-gpu-operator/apps/ \
+     -f community-stacks/nvidia-gpu-operator/stacktemplate.yaml
+   ```
+
+3. Wait until the Platform has deleted the old application. This prints nothing once it is gone:
+
+   ```bash
+   kubectl -n <project-namespace> get stackinstance <name> -o jsonpath='{.status.orphanedApplications}'
+   ```
+
+   The Platform deletes the Argo CD Application with cascade, so Argo CD removes NVSentinel's
+   resources from the cluster. The `nvsentinel` namespace stays. If you prefer not to change the
+   prune policy, delete the application named in `orphanedApplications` yourself, with
+   `kubectl -n <project-namespace> delete argocdapplications.management.loft.sh <applicationName>`.
+
+   Once no instance has the old application left, delete the template the Stack no longer uses:
+
+   ```bash
+   kubectl delete argocdapplicationtemplate nvidia-gpu-operator-nvsentinel
+   ```
+
+4. Install the [NVSentinel Stack](../nvsentinel/README.md#install). It cordons faulty GPU nodes
+   by default, which the old dry-run installation never did, and that needs cert-manager. Set
+   `cordon: "false"` to keep monitoring only.
+
+GPU health monitoring stops between steps 2 and 4.
+
+A cluster created from **NVIDIA GPU Stack - Private Nodes** gets its StackInstance from the
+template, so set nothing on it by hand. The new StackTemplate in step 2 reaches it at once
+and leaves the old application running. Delete that application yourself, with the command in
+step 3, and only then use **Sync Template** on the instance. The synced template sets
+`prunePolicy: Prune` on this Stack and adds the NVSentinel Stack, which would otherwise start
+while the old NVSentinel is still there.
+
 ## Remove
 
 ```bash
 kubectl -n <project-namespace> delete stackinstance <name>
 ```
 
-The Platform deletes each child Argo CD Application with cascade, so Argo CD prunes the GPU
-Operator and NVSentinel resources. It deletes the gate and smoke test AppInstances, which
-uninstalls their Helm releases. These remain:
+The Platform deletes the GPU Operator's Argo CD Application with cascade, so Argo CD prunes the
+GPU Operator resources. It deletes the gate and smoke test AppInstances, which uninstalls their
+Helm releases. These remain:
 
-- The namespaces `gpu-operator` and `nvsentinel`, which Argo CD creates through
-  `CreateNamespace=true`, and `gpu-stack`.
+- The namespace `gpu-operator`, which Argo CD creates through `CreateNamespace=true`, and
+  `gpu-stack`.
 - In DRA mode, possibly the `GPUCluster`. The chart marks it `helm.sh/resource-policy: keep` and
   deletes it from a Helm `pre-delete` hook. Whether Argo CD runs that hook depends on your Argo CD
   version. Check with `kubectl get gpuclusters`.
@@ -513,11 +549,9 @@ uninstalls their Helm releases. These remain:
   is `false`.
 - A preinstalled NVIDIA driver in the node image.
 
-Removal has not been exercised end to end for this Stack.
-
 A tenant cluster created from **NVIDIA GPU Stack - Private Nodes** gets its StackInstance from
 `deploy.stacks`, and the cluster itself does not carry this Stack's label. Delete the tenant
-cluster instead, which removes its Stack and releases its nodes back to the node provider.
+cluster instead, which removes both of its Stacks and releases its nodes back to the node provider.
 
 When no instance or tenant cluster references them, remove the templates and profiles from the
 Platform:
@@ -529,10 +563,6 @@ kubectl delete apps,argocdapplicationtemplates,stacktemplates,virtualclustertemp
 
 ## Known limitations
 
-- NVSentinel runs in dry-run mode. Quarantine, draining, remediation, Janitor and MongoDB are
-  disabled, so the Stack does not demonstrate automatic fault recovery. Enabling them requires
-  cert-manager; see [cert-manager for production NVSentinel](#cert-manager-for-production-nvsentinel).
-  Prometheus PodMonitor and ServiceMonitor creation is disabled.
 - The `gpuready` gate has a 1380 second budget, because Platform App deploys stop at 30 minutes.
   The slowest measured run, with an in-cluster driver build, passed the gate 9m21s after the GPU
   node joined. A driver build slower than about 23 minutes fails the gate.
@@ -554,7 +584,7 @@ kubectl delete apps,argocdapplicationtemplates,stacktemplates,virtualclustertemp
 - **GPU Operator controller, `discover` or a gate Job Pending.** No CPU worker matches the CPU
   node selector: the `cpuNodePool` label, or `cpuNodeSelector` when set. These pods cannot use the
   GPU pool.
-- **`gpuready` counts 0 GPUs, or NVSentinel's GPU agents and the NFD workers schedule nowhere.**
+- **`gpuready` counts 0 GPUs, or the NFD workers schedule nowhere.**
   No GPU worker matches the GPU node selector: `workload.example.com/pool=gpu-compute`, or
   `gpuNodeSelector` when set. `kubectl get nodes -l <selector>` shows what matches.
 - **`discover` failed with "is not a key=value label".** `cpuNodeSelector` or `gpuNodeSelector`
@@ -574,17 +604,11 @@ kubectl delete apps,argocdapplicationtemplates,stacktemplates,virtualclustertemp
 - **Gate Job in `ImagePullBackOff`.** The CPU workers cannot pull the Platform image. In an
   air-gapped installation, the Platform's image mirror must be reachable from tenant cluster
   workers as well.
-- **NVSentinel reports `GpuDcgmConnectivityFailure`.** NVSentinel started before DCGM was
-  serving. Confirm that `dcgmready` ran and passed.
-- **NVSentinel `metadata-collector` cannot start in DRA mode.** Kubernetes admits its
-  admin-access ResourceClaim only in a namespace labeled `resource.kubernetes.io/admin-access=true`.
-  Argo CD sets the label through `managedNamespaceMetadata`. Check it with `kubectl get namespace
-  nvsentinel --show-labels`.
 - **`gpu-smoke-test` Pending.** The gate passed, so a GPU was allocatable, but another pod now
   holds it.
 - **`gpu-smoke-test` failing.** Read its log. A pull failure points at `nvcr.io` access. A CUDA
   error points at the driver or toolkit.
-- **`gpuready` healthy but `nvsentinel` still waiting.** A task that declares outputs is not
+- **`gpuready` healthy but `dcgmready` or `gpu-smoke-test` still waiting.** A task that declares outputs is not
   ready until it captures them, reported as `CapturingOutputs`. Confirm that `gpu-stack-contract`
   exists and holds the keys the outputs read.
 - **Chart or image download failures.** Check registry and repository access from Argo CD and
@@ -599,8 +623,9 @@ From the repository root (bash 4 or later, python3 with PyYAML, helm and jq):
 ```
 
 The script renders the Stack for several parameter sets, in both driver modes, and checks what
-the Platform does not validate for you: names, parameters, how the tasks are wired, the cluster
-template, and the `discover` and gate scripts against a fake `kubectl`.
+the Platform does not validate for you: names, parameters, how the tasks are wired, and the
+`discover` and gate scripts against a fake `kubectl`. It also checks the cluster template, which
+deploys this Stack and the NVSentinel Stack.
 
 CI runs the script, and a server-side dry run of every manifest against vCluster Platform.
 
@@ -608,13 +633,13 @@ CI runs the script, and a server-side dry run of every manifest against vCluster
 
 Tested on GCE private nodes:
 
-- DRA mode end to end, with 2x T4 (vCluster Platform 4.12, Kubernetes 1.36).
-- Device-plugin mode, with one T4 (vCluster Platform 5.0, Kubernetes 1.36): the
-  upgrade from the previous version with default parameters. `auto` kept the device plugin, the
-  gates ran once more, and no workload moved.
+- DRA mode end to end, with 2x T4 (vCluster Platform 4.12, Kubernetes 1.36), in a version that
+  still installed NVSentinel.
+- Device-plugin mode, with one T4 (vCluster Platform 5.0, Kubernetes 1.36): install with `auto`,
+  the upgrade from the version that included NVSentinel, and removal.
 
 Not tested: switching the driver mode on a running cluster, `waitForClusterPolicy: true`, more
-than one GPU worker, the cluster template's provider parameters, and removal.
+than one GPU worker, and the cluster template's provider parameters.
 
 ## License
 

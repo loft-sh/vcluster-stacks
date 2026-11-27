@@ -8,7 +8,7 @@
 #                  ResourceSlice; pods request GPUs through ResourceClaims (DeviceClass
 #                  gpu.nvidia.com). No device plugin, no toolkit, no RuntimeClass, and the DCGM
 #                  operands are named *-dra.
-# NVSentinel, the readiness gates and the smoke test must all follow the same mode, so this task
+# The readiness gates and the smoke test must follow the same mode as the GPU Operator, so this task
 # decides it once and the rest of the Stack reads the outputs.
 #
 # gpuDriverMode=auto keeps whatever the cluster already runs: an existing GPUCluster means dra, an

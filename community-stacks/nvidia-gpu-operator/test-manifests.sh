@@ -331,6 +331,10 @@ for mode, facts in DISCOVER_FACTS.items():
         if value not in discover_manifests:
             fail(f"apps/: {DISCOVER} never writes {key}={value!r} for {mode}; the test's DISCOVER_FACTS and the Job disagree")
 
+# NVSentinel moved to the nvsentinel Stack. A template for it here would deploy a second copy.
+if any("nvsentinel" in name for name in apps):
+    fail("apps/: NVSentinel belongs to community-stacks/nvsentinel, not to this Stack")
+
 # --- StackTemplate -------------------------------------------------------------------------------
 st_path = root / "stacktemplate.yaml"
 st = (load(st_path) or [{}])[0]
@@ -389,7 +393,7 @@ for name, task in tasks.items():
     passed = (task.get("app") or task.get("argoCDApplication") or {}).get("parameters") or {}
     if name != "discover" and "gpuDriverMode" in passed and passed["gpuDriverMode"] != "{{ .Outputs.discover.mode }}":
         fail(f"stacktemplate.yaml task {name}: gpuDriverMode must be '{{{{ .Outputs.discover.mode }}}}'")
-for name in ("gpu-operator", "gpu-smoke-test", "nvsentinel"):
+for name in ("gpu-operator", "gpu-smoke-test"):
     if name in tasks and "gpuDriverMode" not in ((tasks[name].get("app") or tasks[name].get("argoCDApplication") or {}).get("parameters") or {}):
         fail(f"stacktemplate.yaml task {name}: does not pass gpuDriverMode; it would stay on its default mode")
 
@@ -404,7 +408,7 @@ for name, task in tasks.items():
         value = str(passed.get(param, ""))
         if param in passed and (".Values." in value or ".Outputs." not in value):
             fail(f"stacktemplate.yaml task {name}: {param} must come from a task output, not from a parameter: {value!r}")
-for name in ("gpu-operator", "nvsentinel"):
+for name in ("gpu-operator",):
     passed = (tasks.get(name, {}).get("argoCDApplication") or {}).get("parameters") or {}
     if name in tasks and not {"cpuNodeSelector", "gpuNodeSelector"} <= set(passed):
         fail(f"stacktemplate.yaml task {name}: must pass cpuNodeSelector and gpuNodeSelector from discover's outputs")
@@ -423,9 +427,7 @@ if defaults(stack_params).get("gpuNodeSelector"):
 # template default only bites when someone deploys the template on its own.
 for stack_var, app, app_var in [
     ("gpuOperatorVersion", f"{PREFIX}-gpu-operator", "version"),
-    ("nvsentinelVersion", f"{PREFIX}-nvsentinel", "version"),
     ("cpuNodePool", f"{PREFIX}-gpu-operator", "cpuNodePool"),
-    ("cpuNodePool", f"{PREFIX}-nvsentinel", "cpuNodePool"),
 ]:
     a = defaults(stack_params).get(stack_var)
     b = defaults(apps.get(app, {}).get("params", {})).get(app_var)
@@ -623,36 +625,6 @@ for variant, overrides in VARIANTS.items():
                 fail(f"task gpu-smoke-test ({variant}): requests nvidia.com/gpu, which the DRA stack never advertises")
         elif "nvidia.com/gpu" not in (res.get("limits") or {}) or pod.get("resourceClaims"):
             fail(f"task gpu-smoke-test ({variant}): must request nvidia.com/gpu with the device plugin")
-    if "nvsentinel" in rendered:
-        hv = rendered["nvsentinel"]["values"]
-        if hv["global"]["dcgm"]["service"]["endpoint"] != contract.get("dcgmHost"):
-            fail(f"task nvsentinel ({variant}): DCGM endpoint does not come from the gate's contract")
-        if str(hv["labeler"]["assumeDriverInstalled"]).lower() != str(values["driverPreinstalled"]):
-            fail(f"task nvsentinel ({variant}): labeler.assumeDriverInstalled disagrees with driverPreinstalled")
-        # The chart fails on anything but a YAML boolean here.
-        if hv["global"].get("gpuDraEnabled") is not dra:
-            fail(f"task nvsentinel ({variant}): global.gpuDraEnabled={hv['global'].get('gpuDraEnabled')!r} for mode {mode}")
-        label = rendered["nvsentinel"]["syncPolicy"].get("managedNamespaceMetadata", {}).get("labels", {}).get("resource.kubernetes.io/admin-access")
-        if label != ("true" if dra else "false"):
-            fail(f"task nvsentinel ({variant}): namespace label resource.kubernetes.io/admin-access={label!r} for mode {mode}; DRA admin-access claims need 'true'")
-        # cert-manager is a production prerequisite, not part of this Stack: every NVSentinel
-        # component that needs it stays off.
-        g = hv["global"]
-        for component in ("mongodbStore", "janitor", "janitorProvider", "preflight"):
-            if (g.get(component) or {}).get("enabled") is True:
-                fail(f"task nvsentinel ({variant}): global.{component} needs cert-manager, which this Stack does not install")
-        for path in (("global", "systemNodeSelector"), ("nodeConditionCleanup", "nodeSelector")):
-            got = hv
-            for k in path:
-                got = (got or {}).get(k)
-            if got != cpu_pod_sel:
-                fail(f"task nvsentinel ({variant}): {'.'.join(path)} is {got}, expected the CPU node selector {cpu_pod_sel}")
-        if g.get("nodeSelector") != gpu_pod_sel:
-            fail(f"task nvsentinel ({variant}): global.nodeSelector is {g.get('nodeSelector')}, expected the GPU node selector {gpu_pod_sel}")
-        terms = hv["platformConnector"]["affinity"]["nodeAffinity"]["requiredDuringSchedulingIgnoredDuringExecution"]["nodeSelectorTerms"]
-        exprs = {e["key"]: (e["operator"], e["values"]) for t in terms for e in t.get("matchExpressions") or []}
-        if len(terms) != 1 or exprs != {k: ("In", [v]) for k, v in gpu_sel.items()}:
-            fail(f"task nvsentinel ({variant}): platformConnector affinity {terms} does not require exactly the GPU node selector {gpu_sel}")
 
 # --- Job names, and the discover and gate scripts ------------------------------------------------
 # A Job spec is immutable, so a changed setting must name a new Job, or the upgrade fails. A new
@@ -842,6 +814,19 @@ check_refs("virtualclustertemplate.yaml", vct["spec"]["template"], vct_params)
 for stack_var, p in stack_params.items():
     if stack_var in vct_params and "defaultValue" in p and str(p["defaultValue"]) != str(vct_params[stack_var].get("defaultValue")):
         fail(f"virtualclustertemplate.yaml: default {stack_var}={vct_params[stack_var].get('defaultValue')!r} disagrees with the StackTemplate's {p['defaultValue']!r}")
+# The template also deploys the nvsentinel Stack, from the directory next to this one. Its
+# parameters appear in the tenant form with an nvsentinel prefix, except the ones both Stacks share.
+NVS_STACK = "nvsentinel"
+nvs_path = root.parent / NVS_STACK / "stacktemplate.yaml"
+nvs_params = check_parameters(f"../{NVS_STACK}/stacktemplate.yaml", ((load(nvs_path) or [{}])[0].get("spec") or {}).get("parameters")) if nvs_path.exists() else {}
+if not nvs_params:
+    fail(f"virtualclustertemplate.yaml: deploys the {NVS_STACK} Stack, but ../{NVS_STACK}/stacktemplate.yaml is missing")
+nvs_form = lambda v: "nvsentinel" + v[0].upper() + v[1:]
+for stack_var, p in nvs_params.items():
+    form = stack_var if stack_var in stack_params else nvs_form(stack_var)
+    if form in vct_params and "defaultValue" in p and stack_var != "gpuDriverMode" \
+            and str(p["defaultValue"]) != str(vct_params[form].get("defaultValue")):
+        fail(f"virtualclustertemplate.yaml: default {form}={vct_params[form].get('defaultValue')!r} disagrees with the {NVS_STACK} StackTemplate's {stack_var}={p['defaultValue']!r}")
 for name, providers in {"one provider": ("provider-a", "provider-a"), "two providers": ("provider-a", "provider-b")}.items():
     values = {**defaults(vct_params), "argoConnector": "argocd", "gpuNodeProvider": providers[0], "cpuNodeProvider": providers[1]}
     t = render(vct["spec"]["template"], values, f"virtualclustertemplate.yaml ({name})")
@@ -864,15 +849,45 @@ for name, providers in {"one provider": ("provider-a", "provider-a"), "two provi
     if str(pools.get("gpu", {}).get("quantity")) != str(values["gpuNodeCount"]):
         fail(f"virtualclustertemplate.yaml ({name}): GPU pool quantity does not follow gpuNodeCount")
     stacks = cfg["deploy"]["stacks"]
-    if [s["templateRef"]["name"] for s in stacks] != [STACK]:
-        fail(f"virtualclustertemplate.yaml ({name}): deploy.stacks must reference {STACK}")
-    passed = stacks[0].get("parameters") or {}
-    for p in passed:
-        if p not in stack_params:
-            fail(f"virtualclustertemplate.yaml: passes {p!r} to the Stack, which does not declare it")
-    for p in stack_params:
-        if p not in passed:
-            fail(f"virtualclustertemplate.yaml: does not pass Stack parameter {p!r}; the tenant form cannot set it")
+    if [s["templateRef"]["name"] for s in stacks] != [STACK, NVS_STACK]:
+        fail(f"virtualclustertemplate.yaml ({name}): deploy.stacks must reference {STACK} and {NVS_STACK}")
+        continue
+    for stack, declared in zip(stacks, (stack_params, nvs_params)):
+        ref = stack["templateRef"]["name"]
+        if stack.get("prunePolicy") != "Prune":
+            fail(f"virtualclustertemplate.yaml ({name}): Stack {ref} needs prunePolicy: Prune, or a task removed by a template update leaves its application running")
+        passed = stack.get("parameters") or {}
+        for p, value in passed.items():
+            if p not in declared:
+                fail(f"virtualclustertemplate.yaml: passes {p!r} to Stack {ref}, which does not declare it")
+            elif not isinstance(value, str):
+                fail(f"virtualclustertemplate.yaml ({name}): Stack {ref} parameter {p} renders as {type(value).__name__}; quote it")
+        for p in declared:
+            if p not in passed:
+                fail(f"virtualclustertemplate.yaml: does not pass parameter {p!r} to Stack {ref}; the tenant form cannot set it")
+    # The two Stacks install together, so nvsentinel cannot detect the mode: it must get the one
+    # the GPU Stack resolves on a new cluster.
+    for requested, want in (("auto", "device-plugin"), ("device-plugin", "device-plugin"), ("dra", "dra")):
+        t2 = render(vct["spec"]["template"], {**values, "gpuDriverMode": requested}, f"virtualclustertemplate.yaml ({name}, {requested})")
+        if not t2:
+            continue
+        got = yaml.safe_load(t2["helmRelease"]["values"])["deploy"]["stacks"][1]["parameters"].get("gpuDriverMode")
+        if got != want:
+            fail(f"virtualclustertemplate.yaml ({name}): gpuDriverMode={requested} gives the {NVS_STACK} Stack {got!r}, expected {want!r}")
+    # The nvsentinel Stack requires both selectors and has no default for them. Left empty in the
+    # form, they must arrive as the labels the NodeProfiles set, not as empty strings.
+    for case, extra, want_cpu, want_gpu in (
+        ("NodeProfile labels", {}, cpu_selector_raw(values), gpu_selector_raw(values)),
+        ("own labels", {"cpuNodeSelector": "foo.acme.corp/cpu-node=true", "gpuNodeSelector": "foo.acme.corp/gpu-node=true"},
+         "foo.acme.corp/cpu-node=true", "foo.acme.corp/gpu-node=true"),
+    ):
+        t2 = render(vct["spec"]["template"], {**values, **extra}, f"virtualclustertemplate.yaml ({name}, {case})")
+        if not t2:
+            continue
+        got = yaml.safe_load(t2["helmRelease"]["values"])["deploy"]["stacks"][1]["parameters"]
+        if (got.get("cpuNodeSelector"), got.get("gpuNodeSelector")) != (want_cpu, want_gpu):
+            fail(f"virtualclustertemplate.yaml ({name}, {case}): the {NVS_STACK} Stack gets selectors "
+                 f"{got.get('cpuNodeSelector')!r} and {got.get('gpuNodeSelector')!r}, expected {want_cpu!r} and {want_gpu!r}")
 
 # --- Examples ------------------------------------------------------------------------------------
 for path in sorted((root / "example").glob("*.yaml")):
@@ -882,6 +897,8 @@ for path in sorted((root / "example").glob("*.yaml")):
             fail(f"{rel(path)}: expected a StackInstance of {STACK}")
         if not doc["spec"].get("owner"):
             fail(f"{rel(path)}: spec.owner is required; every task fails with MissingOwner without it")
+        if doc["spec"].get("prunePolicy") != "Prune":
+            fail(f"{rel(path)}: set prunePolicy: Prune, or a task removed by a template update leaves its application running")
         for p, v in (doc["spec"].get("parameters") or {}).items():
             if p not in stack_params:
                 fail(f"{rel(path)}: parameter {p!r} is not declared by the template")
